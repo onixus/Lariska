@@ -1,93 +1,61 @@
-use std::process::Command;
+mod app;
+mod config;
+mod identity;
+mod inventory;
 
-#[derive(Debug, PartialEq, Eq)]
-struct ScanResult {
-    asset_id: String,
-    software_list: Vec<String>,
+use std::env;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+const DEFAULT_CONFIG_PATH: &str = "lariska.toml";
+
+fn main() -> ExitCode {
+    match dispatch(env::args().skip(1).collect()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
-fn main() {
-    println!("Lariska Endpoint Agent started...");
+fn dispatch(args: Vec<String>) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("run") => app::run(&config_path(&args[1..])),
+        Some("check-config") => app::check_config(&config_path(&args[1..])),
+        Some("inventory") => {
+            ensure_inventory_args(&args[1..])?;
+            app::print_inventory();
+            Ok(())
+        }
+        Some("help" | "--help" | "-h") | None => {
+            print_usage();
+            Ok(())
+        }
+        Some(command) => Err(format!("unknown command: {command}")),
+    }
+}
 
-    let result = ScanResult {
-        asset_id: "node-001".to_string(),
-        software_list: collect_software(),
-    };
+fn config_path(args: &[String]) -> PathBuf {
+    args.windows(2)
+        .find(|pair| pair[0] == "--config")
+        .map(|pair| PathBuf::from(&pair[1]))
+        .or_else(|| env::var("LARISKA_CONFIG").ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+}
 
+fn ensure_inventory_args(args: &[String]) -> Result<(), String> {
+    match args {
+        [] => Ok(()),
+        [flag, value] if flag == "--output" && value == "json" => Ok(()),
+        _ => Err("usage: lariska inventory [--output json]".to_string()),
+    }
+}
+
+fn print_usage() {
     println!(
-        "Collected {} software entries; gateway submission is not implemented yet.",
-        result.software_list.len()
+        "Usage:\n  lariska run [--config path]\n  lariska check-config [--config path]\n  lariska inventory [--output json]"
     );
-}
-
-fn collect_software() -> Vec<String> {
-    platform_software().unwrap_or_else(|error| {
-        eprintln!("Software inventory collection failed: {error}");
-        Vec::new()
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn platform_software() -> Result<Vec<String>, String> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-ItemProperty HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* | Select-Object -ExpandProperty DisplayName",
-        ])
-        .output()
-        .map_err(|error| format!("failed to execute PowerShell: {error}"))?;
-
-    if !output.status.success() {
-        return Err(format!("PowerShell exited with status {}", output.status));
-    }
-
-    Ok(parse_lines(&output.stdout))
-}
-
-#[cfg(target_os = "linux")]
-fn platform_software() -> Result<Vec<String>, String> {
-    let output = Command::new("dpkg-query")
-        .args(["-f", "${binary:Package}\n", "-W"])
-        .output()
-        .map_err(|error| format!("failed to execute dpkg-query: {error}"))?;
-
-    if !output.status.success() {
-        return Err(format!("dpkg-query exited with status {}", output.status));
-    }
-
-    Ok(parse_lines(&output.stdout))
-}
-
-#[cfg(target_os = "macos")]
-fn platform_software() -> Result<Vec<String>, String> {
-    let output = Command::new("ls")
-        .args(["/Applications"])
-        .output()
-        .map_err(|error| format!("failed to list /Applications: {error}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "ls /Applications exited with status {}",
-            output.status
-        ));
-    }
-
-    Ok(parse_lines(&output.stdout))
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn platform_software() -> Result<Vec<String>, String> {
-    Err("software collection is not supported on this operating system".to_string())
-}
-
-fn parse_lines(output: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(output)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 #[cfg(test)]
@@ -95,23 +63,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_lines_trims_and_skips_empty_lines() {
-        let packages = parse_lines(b" bash \n\n coreutils\n\tserde-json\t\n");
+    fn config_path_uses_cli_override() {
+        let args = vec!["--config".to_string(), "custom.toml".to_string()];
 
-        assert_eq!(packages, vec!["bash", "coreutils", "serde-json"]);
+        assert_eq!(config_path(&args), PathBuf::from("custom.toml"));
     }
 
     #[test]
-    fn scan_result_debug_output_has_no_token_fields() {
-        let result = ScanResult {
-            asset_id: "node-001".to_string(),
-            software_list: vec!["bash".to_string()],
-        };
+    fn inventory_args_accept_json_output() {
+        let args = vec!["--output".to_string(), "json".to_string()];
 
-        let output = format!("{result:?}").to_lowercase();
-
-        assert!(output.contains("node-001"));
-        assert!(!output.contains("token"));
-        assert!(!output.contains("authorization"));
+        assert!(ensure_inventory_args(&args).is_ok());
     }
 }
