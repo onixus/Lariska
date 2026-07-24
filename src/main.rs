@@ -1,4 +1,6 @@
-use lariska::{app, service};
+use lariska::app;
+#[cfg(windows)]
+use lariska::service;
 
 use std::env;
 use std::path::PathBuf;

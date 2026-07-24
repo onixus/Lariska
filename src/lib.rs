@@ -1,5 +1,11 @@
+pub mod api;
 pub mod app;
+pub mod auth;
 pub mod config;
+pub mod delivery;
+pub mod heartbeat;
 pub mod identity;
 pub mod inventory;
 pub mod model;
+pub mod service;
+pub mod telemetry;
