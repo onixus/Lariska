@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+            cross_linker: aarch64-linux-gnu-gcc
+            cross_apt_package: gcc-aarch64-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compiler (aarch64 Linux)
+        if: matrix.cross_apt_package != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross_apt_package }}
+
+      - name: Configure cross linker (aarch64 Linux)
+        if: matrix.cross_linker != ''
+        run: |
+          mkdir -p .cargo
+          echo "[target.${{ matrix.target }}]" >> .cargo/config.toml
+          echo "linker = \"${{ matrix.cross_linker }}\"" >> .cargo/config.toml
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          bin_name=lariska
+          out_dir=dist
+          mkdir -p "$out_dir"
+          archive="$out_dir/lariska-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$archive" "$bin_name"
+          echo "ARCHIVE_PATH=$archive" >> "$GITHUB_ENV"
+
+      - name: Package (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: bash
+        run: |
+          out_dir=dist
+          mkdir -p "$out_dir"
+          archive="$out_dir/lariska-${GITHUB_REF_NAME}-${{ matrix.target }}.zip"
+          (cd "target/${{ matrix.target }}/release" && 7z a "../../../../$archive" lariska.exe)
+          echo "ARCHIVE_PATH=$archive" >> "$GITHUB_ENV"
+
+      - name: Checksum
+        shell: bash
+        run: |
+          cd dist
+          for f in *; do
+            shasum -a 256 "$f" > "$f.sha256"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lariska-${{ matrix.target }}
+          path: dist/*
+
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+      - name: Generate SBOM
+        run: cargo cyclonedx --format json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: lariska-sbom
+          path: "*.cdx.json"
+
+  release:
+    name: Publish release
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: true

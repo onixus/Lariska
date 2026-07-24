@@ -12,6 +12,13 @@ const MIN_INTERVAL_SECS: u64 = 10;
 const MAX_INTERVAL_SECS: u64 = 86_400;
 const MIN_TIMEOUT_SECS: u64 = 1;
 const MAX_TIMEOUT_SECS: u64 = 300;
+/// Matches the server's `endpoint_inventory_max_snapshot_age_seconds`
+/// default (24h) so an unchanged snapshot is never resent later than the
+/// server's own staleness tolerance.
+const DEFAULT_FULL_REFRESH_INTERVAL_SECS: u64 = 86_400;
+const DEFAULT_MAX_SPOOL_ENTRIES: u64 = 200;
+const MIN_MAX_SPOOL_ENTRIES: u64 = 1;
+const MAX_MAX_SPOOL_ENTRIES: u64 = 10_000;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
@@ -24,6 +31,8 @@ pub struct Config {
     pub tls_ca_file: Option<PathBuf>,
     pub log_level: String,
     pub allow_plain_http: bool,
+    pub inventory_full_refresh_interval: Duration,
+    pub max_spool_entries: usize,
 }
 
 impl fmt::Debug for Config {
@@ -39,6 +48,11 @@ impl fmt::Debug for Config {
             .field("tls_ca_file", &self.tls_ca_file)
             .field("log_level", &self.log_level)
             .field("allow_plain_http", &self.allow_plain_http)
+            .field(
+                "inventory_full_refresh_interval",
+                &self.inventory_full_refresh_interval,
+            )
+            .field("max_spool_entries", &self.max_spool_entries)
             .finish()
     }
 }
@@ -75,6 +89,16 @@ impl Config {
         apply_env_override(&mut values, "tls_ca_file", "LARISKA_TLS_CA_FILE");
         apply_env_override(&mut values, "log_level", "LARISKA_LOG_LEVEL");
         apply_env_override(&mut values, "allow_plain_http", "LARISKA_ALLOW_PLAIN_HTTP");
+        apply_env_override(
+            &mut values,
+            "inventory_full_refresh_interval_secs",
+            "LARISKA_INVENTORY_FULL_REFRESH_INTERVAL_SECS",
+        );
+        apply_env_override(
+            &mut values,
+            "max_spool_entries",
+            "LARISKA_MAX_SPOOL_ENTRIES",
+        );
 
         let server_url = required_string(&values, "server_url")?;
         let provisioning_key_file = required_path(&values, "provisioning_key_file")?;
@@ -100,6 +124,18 @@ impl Config {
             .cloned()
             .unwrap_or_else(|| "info".to_string());
         let allow_plain_http = parse_bool(&values, "allow_plain_http")?;
+        let inventory_full_refresh_interval = parse_duration(
+            &values,
+            "inventory_full_refresh_interval_secs",
+            DEFAULT_FULL_REFRESH_INTERVAL_SECS,
+        )?;
+        let max_spool_entries = parse_bounded_u64(
+            &values,
+            "max_spool_entries",
+            DEFAULT_MAX_SPOOL_ENTRIES,
+            MIN_MAX_SPOOL_ENTRIES,
+            MAX_MAX_SPOOL_ENTRIES,
+        )? as usize;
 
         let config = Self {
             server_url,
@@ -111,6 +147,8 @@ impl Config {
             tls_ca_file,
             log_level,
             allow_plain_http,
+            inventory_full_refresh_interval,
+            max_spool_entries,
         };
         config.validate()?;
         Ok(config)
@@ -145,6 +183,10 @@ impl Config {
         validate_interval("inventory_interval", self.inventory_interval)?;
         validate_interval("heartbeat_interval", self.heartbeat_interval)?;
         validate_timeout("request_timeout", self.request_timeout)?;
+        validate_interval(
+            "inventory_full_refresh_interval",
+            self.inventory_full_refresh_interval,
+        )?;
 
         Ok(())
     }
@@ -240,6 +282,29 @@ fn parse_duration(
     };
 
     Ok(Duration::from_secs(seconds))
+}
+
+fn parse_bounded_u64(
+    values: &HashMap<String, String>,
+    key: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, ConfigError> {
+    let value = match values.get(key) {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| ConfigError::Invalid(format!("{key} must be an integer")))?,
+        None => default,
+    };
+
+    if !(min..=max).contains(&value) {
+        return Err(ConfigError::Invalid(format!(
+            "{key} must be between {min} and {max}"
+        )));
+    }
+
+    Ok(value)
 }
 
 fn parse_bool(values: &HashMap<String, String>, key: &str) -> Result<bool, ConfigError> {

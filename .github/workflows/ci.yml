@@ -26,3 +26,54 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo test --all-features
+
+  security:
+    name: Dependency audit and license policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+      - name: cargo audit (vulnerability advisories)
+        run: cargo audit
+      - name: cargo deny (advisories/licenses/bans/sources)
+        run: cargo deny check
+
+  secret-scan:
+    name: Secret scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  contract-fixture:
+    name: Cross-repo contract fixture validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Lariska
+        uses: actions/checkout@v4
+        with:
+          path: lariska
+      - name: Checkout Shapoclyack
+        uses: actions/checkout@v4
+        with:
+          repository: onixus/Shapoclyack
+          path: shapoclyack
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Validate Shapoclyack's golden fixture against Lariska's wire model
+        working-directory: lariska
+        env:
+          SHAPOCLYACK_FIXTURE_PATH: ${{ github.workspace }}/shapoclyack/tests/fixtures/endpoint_inventory_v1_valid.json
+        run: cargo test shapoclyack_fixture_is_schema_compatible -- --nocapture

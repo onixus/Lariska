@@ -1,0 +1,21 @@
+#!/bin/sh
+# Runs after package files are unpacked. Creates the dedicated non-login
+# service account the systemd unit (packaging/systemd/lariska.service) runs
+# as, per docs/hardening.md.
+set -e
+
+if ! getent passwd lariska >/dev/null 2>&1; then
+    adduser --system --no-create-home --shell /usr/sbin/nologin \
+        --group lariska
+fi
+
+mkdir -p /etc/lariska /var/lib/lariska
+chown root:lariska /etc/lariska
+chown lariska:lariska /var/lib/lariska
+chmod 0750 /etc/lariska /var/lib/lariska
+
+systemctl daemon-reload || true
+
+#DEBHELPER#
+
+exit 0

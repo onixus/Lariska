@@ -1,0 +1,45 @@
+[Unit]
+Description=Lariska endpoint inventory agent for Shapoclyack
+Documentation=https://github.com/onixus/Lariska
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lariska run --config /etc/lariska/lariska.toml --service
+Restart=on-failure
+RestartSec=5
+
+# Dedicated non-login service account (create with: useradd --system
+# --no-create-home --shell /usr/sbin/nologin lariska).
+User=lariska
+Group=lariska
+
+# Filesystem layout. ConfigurationDirectory/StateDirectory create and own
+# /etc/lariska and /var/lib/lariska respectively (0750, owned by User/Group
+# above) on service start — no manual mkdir/chown needed.
+ConfigurationDirectory=lariska
+StateDirectory=lariska
+UMask=0027
+
+# Hardening. Collectors here (dpkg-query/rpm/pacman) only need normal read
+# access to package-manager state and /proc — nothing here requires a
+# capability grant.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/lariska
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

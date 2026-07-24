@@ -1,0 +1,19 @@
+#!/bin/sh
+# Runs after package removal. Deliberately does NOT delete
+# /var/lib/lariska (identity + delivery spool) or /etc/lariska (config) on a
+# plain `remove` — only on `purge`, matching Debian convention, so a
+# reinstall preserves agent identity and any queued-but-unsent inventory.
+set -e
+
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/lariska /etc/lariska
+    if getent passwd lariska >/dev/null 2>&1; then
+        deluser --system lariska || true
+    fi
+fi
+
+systemctl daemon-reload || true
+
+#DEBHELPER#
+
+exit 0

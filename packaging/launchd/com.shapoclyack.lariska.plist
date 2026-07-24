@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.shapoclyack.lariska</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/lariska</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>/Library/Application Support/Lariska/lariska.toml</string>
+        <string>--service</string>
+    </array>
+
+    <!-- Absolute state_dir is required by --service; keep it under the same
+         Application Support tree as the config for a single install root. -->
+    <key>WorkingDirectory</key>
+    <string>/Library/Application Support/Lariska</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/Lariska/lariska.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/Lariska/lariska.log</string>
+
+    <!-- Runs as root by default when loaded as a LaunchDaemon (required to
+         read /Library/Application Support paths owned by root and to enroll
+         once as a system-wide agent); switch to a dedicated service user via
+         UserName/GroupName here once one is provisioned for the target
+         fleet. -->
+</dict>
+</plist>

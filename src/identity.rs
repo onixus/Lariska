@@ -1,6 +1,8 @@
+use crate::model::{EndpointIdentifier, IdentifierType};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const IDENTITY_FILE: &str = "agent_id";
@@ -70,17 +72,30 @@ fn temp_identity_path(path: &Path) -> PathBuf {
 }
 
 fn generate_agent_id() -> Result<String, IdentityError> {
+    random_hex_id("agent")
+}
+
+/// Generates a fresh, opaque snapshot ID (Plan.md §7: "generated once and
+/// retained across retries"). The server treats it as an opaque string with
+/// no format requirement — only uniqueness matters.
+pub fn generate_snapshot_id() -> Result<String, IdentityError> {
+    random_hex_id("snap")
+}
+
+fn random_hex_id(prefix: &str) -> Result<String, IdentityError> {
     let mut bytes = [0_u8; 16];
     fill_random(&mut bytes)?;
-    Ok(format!(
-        "agent_{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
-        bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
-    ))
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("{prefix}_{hex}"))
 }
 
 #[cfg(unix)]
 fn fill_random(bytes: &mut [u8]) -> Result<(), IdentityError> {
+    use std::io::Read;
+
     let mut file = fs::File::open("/dev/urandom")
         .map_err(|error| IdentityError::Io(format!("failed to open /dev/urandom: {error}")))?;
     file.read_exact(bytes)
@@ -96,6 +111,89 @@ fn fill_random(bytes: &mut [u8]) -> Result<(), IdentityError> {
     let pid = u128::from(std::process::id());
     bytes.copy_from_slice(&(now ^ pid).to_le_bytes());
     Ok(())
+}
+
+/// Platform evidence supplementing the random `agent_id` — never a
+/// replacement for it (Plan.md §8 rule 3: never derive identity from MAC
+/// address or hostname alone; here the primary key is `agent_id`, and these
+/// are additional matching evidence the server can use for reconciliation).
+///
+/// None of Linux's `/etc/machine-id`, Windows' `MachineGuid`, or macOS'
+/// `IOPlatformUUID` is literally a MAC address, hardware serial, or TPM
+/// endorsement key — the four identifier types the server accepts. Of those,
+/// `bios_uuid_hash` is the closest semantic fit for "the platform's
+/// software/hardware-assigned unique ID", so all three are reported under
+/// that type. This is a documented policy choice, not a hard contract
+/// guarantee from the server.
+pub fn platform_identifiers() -> Vec<EndpointIdentifier> {
+    let mut identifiers = Vec::new();
+
+    if let Some(raw) = platform_uuid_raw() {
+        identifiers.push(EndpointIdentifier {
+            identifier_type: IdentifierType::BiosUuidHash,
+            value_hash: hash_identifier(&raw),
+        });
+    }
+
+    identifiers
+}
+
+/// SHA-256 over the lowercased, trimmed identifier — no salt. A salt would
+/// make the same physical machine hash differently per agent install, which
+/// would break the server's `(tenant_id, identifier_type, value_hash)`
+/// dedup/reconciliation matching across reinstalls.
+fn hash_identifier(raw: &str) -> String {
+    let normalized = raw.trim().to_lowercase();
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(target_os = "linux")]
+fn platform_uuid_raw() -> Option<String> {
+    fs::read_to_string("/etc/machine-id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "windows")]
+fn platform_uuid_raw() -> Option<String> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let key = hklm.open_subkey("SOFTWARE\\Microsoft\\Cryptography").ok()?;
+    let guid: String = key.get_value("MachineGuid").ok()?;
+    let trimmed = guid.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_uuid_raw() -> Option<String> {
+    let output = std::process::Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find(|line| line.contains("IOPlatformUUID"))
+        .and_then(|line| line.split('"').nth(3))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn platform_uuid_raw() -> Option<String> {
+    None
 }
 
 fn is_valid_agent_id(agent_id: &str) -> bool {
@@ -125,6 +223,22 @@ impl std::error::Error for IdentityError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_identifier_is_deterministic_and_case_insensitive() {
+        let lower = hash_identifier("abc123-def456");
+        let upper = hash_identifier("ABC123-DEF456");
+        let padded = hash_identifier("  abc123-def456  ");
+
+        assert_eq!(lower, upper);
+        assert_eq!(lower, padded);
+        assert_eq!(lower.len(), 64); // hex-encoded SHA-256
+    }
+
+    #[test]
+    fn hash_identifier_differs_for_different_input() {
+        assert_ne!(hash_identifier("machine-a"), hash_identifier("machine-b"));
+    }
 
     #[test]
     fn load_or_create_reuses_existing_identity() {
