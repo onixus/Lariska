@@ -6,10 +6,12 @@ of installed software, and deliver versioned inventory snapshots to Shapoclyack.
 
 ## Current status
 
-This repository is in the project-foundation stage. The binary currently starts,
-collects a basic local software list on supported platforms, and reports the
-number of collected entries. Authentication, registration, heartbeat, durable
-spooling, and gateway submission are planned but not implemented yet.
+This repository is in the early agent implementation stage. The binary currently
+starts, validates configuration, preserves a persistent agent identity, collects
+a basic local software list on supported platforms, and emits deterministic
+inventory diagnostics. Authentication exchange, registration, heartbeat, and
+inventory request wire models have contract fixtures, but the HTTP lifecycle,
+durable spooling, and gateway submission are not implemented yet.
 
 ## Development commands
 
