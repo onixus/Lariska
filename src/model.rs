@@ -3,21 +3,18 @@ use std::fmt;
 pub const INVENTORY_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct AuthExchangeRequest {
     pub provisioning_key: String,
     pub agent_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct AuthExchangeResponse {
     pub access_token: String,
     pub expires_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct AgentRegistrationRequest {
     pub agent_id: String,
     pub hostname: String,
@@ -26,7 +23,6 @@ pub struct AgentRegistrationRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct HeartbeatRequest {
     pub agent_id: String,
     pub status: HeartbeatStatus,
@@ -34,7 +30,6 @@ pub struct HeartbeatRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum HeartbeatStatus {
     Idle,
     Busy,
@@ -42,7 +37,6 @@ pub enum HeartbeatStatus {
 }
 
 impl AuthExchangeRequest {
-    #[allow(dead_code)]
     pub fn to_canonical_json(&self) -> String {
         format!(
             r#"{{"provisioning_key":"{}","agent_id":"{}"}}"#,
@@ -53,7 +47,6 @@ impl AuthExchangeRequest {
 }
 
 impl AgentRegistrationRequest {
-    #[allow(dead_code)]
     pub fn to_canonical_json(&self) -> String {
         let labels = self
             .labels
@@ -78,7 +71,6 @@ impl AgentRegistrationRequest {
 }
 
 impl HeartbeatRequest {
-    #[allow(dead_code)]
     pub fn to_canonical_json(&self) -> String {
         format!(
             r#"{{"agent_id":"{}","status":"{}","detail":{}}}"#,
@@ -90,7 +82,6 @@ impl HeartbeatRequest {
 }
 
 impl HeartbeatStatus {
-    #[allow(dead_code)]
     fn as_str(&self) -> &'static str {
         match self {
             Self::Idle => "idle",

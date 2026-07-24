@@ -1,8 +1,4 @@
-mod app;
-mod config;
-mod identity;
-mod inventory;
-mod model;
+use lariska::app;
 
 use std::env;
 use std::path::PathBuf;
