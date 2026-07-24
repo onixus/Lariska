@@ -1,0 +1,6 @@
+/target/
+*.pdb
+*.log
+.env
+.env.*
+!.env.example
