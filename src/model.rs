@@ -333,17 +333,22 @@ fn optional_json_string(value: Option<&str>) -> String {
 }
 
 fn escape_json(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|character| match character {
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '"' => "\\\"".chars().collect::<Vec<_>>(),
-            '\n' => "\\n".chars().collect::<Vec<_>>(),
-            '\r' => "\\r".chars().collect::<Vec<_>>(),
-            '\t' => "\\t".chars().collect::<Vec<_>>(),
-            other => vec![other],
-        })
-        .collect()
+    value.chars().fold(String::new(), |mut escaped, character| {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            control if control.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            other => escaped.push(other),
+        }
+        escaped
+    })
 }
 
 #[cfg(test)]
@@ -383,6 +388,20 @@ mod tests {
         assert_eq!(
             heartbeat.to_canonical_json(),
             include_str!("../tests/fixtures/heartbeat_request_v1.json").trim()
+        );
+    }
+
+    #[test]
+    fn canonical_json_escapes_all_json_control_characters() {
+        let request = HeartbeatRequest {
+            agent_id: "agent_0123456789abcdef0123456789abcdef".to_string(),
+            status: HeartbeatStatus::Error,
+            detail: Some("quote \" slash \\ newline\n backspace \u{08} unit \u{1f}".to_string()),
+        };
+
+        assert_eq!(
+            request.to_canonical_json(),
+            r#"{"agent_id":"agent_0123456789abcdef0123456789abcdef","status":"error","detail":"quote \" slash \\ newline\n backspace \b unit \u001f"}"#
         );
     }
 
