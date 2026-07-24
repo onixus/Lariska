@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::identity;
 use crate::inventory;
+use crate::model::{AgentInfo, EndpointIdentifier, InventorySnapshot, OsInfo, SoftwareEntry};
 use std::path::Path;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -35,27 +36,44 @@ pub fn check_config(config_path: &Path) -> Result<(), String> {
 }
 
 pub fn print_inventory() {
-    let software = inventory::collect_software();
-    println!("[");
-    for (index, item) in software.iter().enumerate() {
-        let comma = if index + 1 == software.len() { "" } else { "," };
-        println!("  \"{}\"{}", escape_json(item), comma);
+    let snapshot = diagnostic_snapshot(inventory::collect_software());
+    if let Err(error) = snapshot.validate() {
+        eprintln!("Inventory snapshot validation failed: {error}");
+        return;
     }
-    println!("]");
+
+    println!("{}", snapshot.to_canonical_json());
 }
 
-fn escape_json(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|character| match character {
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '"' => "\\\"".chars().collect::<Vec<_>>(),
-            '\n' => "\\n".chars().collect::<Vec<_>>(),
-            '\r' => "\\r".chars().collect::<Vec<_>>(),
-            '\t' => "\\t".chars().collect::<Vec<_>>(),
-            other => vec![other],
-        })
-        .collect()
+fn diagnostic_snapshot(software_names: Vec<String>) -> InventorySnapshot {
+    InventorySnapshot::new(
+        "diagnostic-snapshot".to_string(),
+        "agent_00000000000000000000000000000000".to_string(),
+        "1970-01-01T00:00:00Z".to_string(),
+        AgentInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            hostname: "localhost".to_string(),
+            labels: Vec::new(),
+        },
+        OsInfo {
+            family: std::env::consts::OS.to_string(),
+            name: std::env::consts::OS.to_string(),
+            version: None,
+            architecture: std::env::consts::ARCH.to_string(),
+        },
+        Vec::<EndpointIdentifier>::new(),
+        software_names
+            .into_iter()
+            .map(|name| SoftwareEntry {
+                name,
+                version: None,
+                publisher: None,
+                architecture: None,
+                source: "platform".to_string(),
+                install_location: None,
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -63,8 +81,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn escape_json_escapes_control_characters() {
-        assert_eq!(escape_json("a\\b\"c\n"), "a\\\\b\\\"c\\n");
+    fn diagnostic_snapshot_normalizes_inventory_names() {
+        let snapshot = diagnostic_snapshot(vec![" bash ".to_string(), "".to_string()]);
+
+        assert_eq!(snapshot.software.len(), 1);
+        assert_eq!(snapshot.software[0].name, "bash");
     }
 
     #[test]

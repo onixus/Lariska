@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod identity;
 mod inventory;
+mod model;
 
 use std::env;
 use std::path::PathBuf;
