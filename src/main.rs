@@ -1,14 +1,4 @@
-mod api;
-mod app;
-mod auth;
-mod config;
-mod delivery;
-mod heartbeat;
-mod identity;
-mod inventory;
-mod model;
-mod service;
-mod telemetry;
+use lariska::{app, service};
 
 use std::env;
 use std::path::PathBuf;
