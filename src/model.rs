@@ -2,16 +2,36 @@ use std::fmt;
 
 pub const INVENTORY_SCHEMA_VERSION: u16 = 1;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthExchangeRequest {
     pub provisioning_key: String,
     pub agent_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthExchangeResponse {
     pub access_token: String,
     pub expires_at: String,
+}
+
+impl fmt::Debug for AuthExchangeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthExchangeRequest")
+            .field("provisioning_key", &"<redacted>")
+            .field("agent_id", &self.agent_id)
+            .finish()
+    }
+}
+
+impl fmt::Debug for AuthExchangeResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthExchangeResponse")
+            .field("access_token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -403,6 +423,26 @@ mod tests {
             request.to_canonical_json(),
             r#"{"agent_id":"agent_0123456789abcdef0123456789abcdef","status":"error","detail":"quote \" slash \\ newline\n backspace \b unit \u001f"}"#
         );
+    }
+
+    #[test]
+    fn auth_model_debug_output_redacts_secrets() {
+        let request = AuthExchangeRequest {
+            provisioning_key: "bootstrap-secret".to_string(),
+            agent_id: "agent_0123456789abcdef0123456789abcdef".to_string(),
+        };
+        let response = AuthExchangeResponse {
+            access_token: "jwt-token-value".to_string(),
+            expires_at: "2026-07-24T09:00:00Z".to_string(),
+        };
+
+        let output = format!("{request:?} {response:?}");
+
+        assert!(output.contains("<redacted>"));
+        assert!(output.contains("agent_0123456789abcdef0123456789abcdef"));
+        assert!(output.contains("2026-07-24T09:00:00Z"));
+        assert!(!output.contains("bootstrap-secret"));
+        assert!(!output.contains("jwt-token-value"));
     }
 
     #[test]
