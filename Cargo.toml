@@ -5,5 +5,53 @@ edition = "2021"
 description = "Cross-platform endpoint inventory agent for Shapoclyack"
 license = "UNLICENSED"
 repository = "https://github.com/onixus/Lariska"
+publish = false
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process"] }
+jsonwebtoken = "9"
+rand = "0.8"
+thiserror = "1"
+sha2 = "0.10"
+gethostname = "0.5"
+time = { version = "0.3", features = ["formatting"] }
+fd-lock = "4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-service = "0.7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+
+[dev-dependencies]
+wiremock = "0.6"
+
+# Packaging metadata for `cargo deb` / `cargo generate-rpm` (Plan.md §13,
+# sequenced after the binary workflow is stable). Unverified: this sandbox
+# has no `dpkg-deb`/`rpmbuild`, so neither has actually been run — verify on
+# a real Linux packaging toolchain before relying on it. See
+# packaging/systemd/lariska.service for the unit both package types install.
+[package.metadata.deb]
+maintainer = "Shapoclyack"
+copyright = "2026, Shapoclyack"
+extended-description = "Cross-platform endpoint inventory agent for the Shapoclyack platform."
+depends = "$auto"
+section = "admin"
+priority = "optional"
+assets = [
+    ["target/release/lariska", "usr/bin/", "755"],
+    ["packaging/systemd/lariska.service", "lib/systemd/system/", "644"],
+]
+maintainer-scripts = "packaging/deb/"
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/lariska", dest = "/usr/bin/lariska", mode = "755" },
+    { source = "packaging/systemd/lariska.service", dest = "/usr/lib/systemd/system/lariska.service", mode = "644" },
+]

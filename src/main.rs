@@ -1,4 +1,6 @@
 use lariska::app;
+#[cfg(windows)]
+use lariska::service;
 
 use std::env;
 use std::path::PathBuf;
@@ -18,7 +20,23 @@ fn main() -> ExitCode {
 
 fn dispatch(args: Vec<String>) -> Result<(), String> {
     match args.first().map(String::as_str) {
-        Some("run") => app::run(&config_path(&args[1..])),
+        Some("run") => {
+            let running_as_service = args[1..].iter().any(|arg| arg == "--service");
+            app::run(&config_path(&args[1..]), running_as_service)
+        }
+        // Registered as the Windows service binPath target (e.g. `sc.exe
+        // create Lariska binPath= "...lariska.exe --winservice"`). Blocks in
+        // the SCM dispatcher loop instead of the normal CLI flow.
+        Some("--winservice") => {
+            #[cfg(windows)]
+            {
+                service::windows_scm::run_as_service()
+            }
+            #[cfg(not(windows))]
+            {
+                Err("--winservice is only supported when running on Windows".to_string())
+            }
+        }
         Some("check-config") => app::check_config(&config_path(&args[1..])),
         Some("inventory") => {
             ensure_inventory_args(&args[1..])?;
@@ -51,7 +69,7 @@ fn ensure_inventory_args(args: &[String]) -> Result<(), String> {
 
 fn print_usage() {
     println!(
-        "Usage:\n  lariska run [--config path]\n  lariska check-config [--config path]\n  lariska inventory [--output json]"
+        "Usage:\n  lariska run [--config path] [--service]\n  lariska check-config [--config path]\n  lariska inventory [--output json]"
     );
 }
 
