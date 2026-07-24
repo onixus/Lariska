@@ -2,6 +2,115 @@ use std::fmt;
 
 pub const INVENTORY_SCHEMA_VERSION: u16 = 1;
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthExchangeRequest {
+    pub provisioning_key: String,
+    pub agent_id: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthExchangeResponse {
+    pub access_token: String,
+    pub expires_at: String,
+}
+
+impl fmt::Debug for AuthExchangeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthExchangeRequest")
+            .field("provisioning_key", &"<redacted>")
+            .field("agent_id", &self.agent_id)
+            .finish()
+    }
+}
+
+impl fmt::Debug for AuthExchangeResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthExchangeResponse")
+            .field("access_token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentRegistrationRequest {
+    pub agent_id: String,
+    pub hostname: String,
+    pub agent_version: String,
+    pub labels: Vec<Label>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeartbeatRequest {
+    pub agent_id: String,
+    pub status: HeartbeatStatus,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeartbeatStatus {
+    Idle,
+    Busy,
+    Error,
+}
+
+impl AuthExchangeRequest {
+    pub fn to_canonical_json(&self) -> String {
+        format!(
+            r#"{{"provisioning_key":"{}","agent_id":"{}"}}"#,
+            escape_json(&self.provisioning_key),
+            escape_json(&self.agent_id)
+        )
+    }
+}
+
+impl AgentRegistrationRequest {
+    pub fn to_canonical_json(&self) -> String {
+        let labels = self
+            .labels
+            .iter()
+            .map(|label| {
+                format!(
+                    r#"{{"key":"{}","value":"{}"}}"#,
+                    escape_json(&label.key),
+                    escape_json(&label.value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"agent_id":"{}","hostname":"{}","agent_version":"{}","labels":[{}]}}"#,
+            escape_json(&self.agent_id),
+            escape_json(&self.hostname),
+            escape_json(&self.agent_version),
+            labels
+        )
+    }
+}
+
+impl HeartbeatRequest {
+    pub fn to_canonical_json(&self) -> String {
+        format!(
+            r#"{{"agent_id":"{}","status":"{}","detail":{}}}"#,
+            escape_json(&self.agent_id),
+            self.status.as_str(),
+            optional_json_string(self.detail.as_deref())
+        )
+    }
+}
+
+impl HeartbeatStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Busy => "busy",
+            Self::Error => "error",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InventorySnapshot {
     pub schema_version: u16,
@@ -39,6 +148,8 @@ impl InventorySnapshot {
     }
 
     pub fn normalize(&mut self) {
+        self.agent.labels.sort();
+        self.agent.labels.dedup();
         self.identifiers
             .retain(|identifier| !identifier.value.trim().is_empty());
         self.identifiers.sort_by(|left, right| {
@@ -90,7 +201,7 @@ impl InventorySnapshot {
             .iter()
             .map(|label| {
                 format!(
-                    "{{\"key\":\"{}\",\"value\":\"{}\"}}",
+                    r#"{{"key":"{}","value":"{}"}}"#,
                     escape_json(&label.key),
                     escape_json(&label.value)
                 )
@@ -102,7 +213,7 @@ impl InventorySnapshot {
             .iter()
             .map(|identifier| {
                 format!(
-                    "{{\"type\":\"{}\",\"value\":\"{}\"}}",
+                    r#"{{"type":"{}","value":"{}"}}"#,
                     escape_json(&identifier.identifier_type),
                     escape_json(&identifier.value)
                 )
@@ -115,9 +226,8 @@ impl InventorySnapshot {
             .map(SoftwareEntry::to_canonical_json)
             .collect::<Vec<_>>()
             .join(",");
-
         format!(
-            "{{\"schema_version\":{},\"snapshot_id\":\"{}\",\"agent_id\":\"{}\",\"collected_at\":\"{}\",\"agent\":{{\"version\":\"{}\",\"hostname\":\"{}\",\"labels\":[{}]}},\"os\":{{\"family\":\"{}\",\"name\":\"{}\",\"version\":{},\"architecture\":\"{}\"}},\"identifiers\":[{}],\"software\":[{}]}}",
+            r#"{{"schema_version":{},"snapshot_id":"{}","agent_id":"{}","collected_at":"{}","agent":{{"version":"{}","hostname":"{}","labels":[{}]}},"os":{{"family":"{}","name":"{}","version":{},"architecture":"{}"}},"identifiers":[{}],"software":[{}]}}"#,
             self.schema_version,
             escape_json(&self.snapshot_id),
             escape_json(&self.agent_id),
@@ -185,7 +295,7 @@ impl SoftwareEntry {
 
     fn to_canonical_json(&self) -> String {
         format!(
-            "{{\"name\":\"{}\",\"version\":{},\"publisher\":{},\"architecture\":{},\"source\":\"{}\",\"install_location\":{}}}",
+            r#"{{"name":"{}","version":{},"publisher":{},"architecture":{},"source":"{}","install_location":{}}}"#,
             escape_json(&self.name),
             optional_json_string(self.version.as_deref()),
             optional_json_string(self.publisher.as_deref()),
@@ -238,27 +348,102 @@ fn normalize_architecture(value: &str) -> String {
 
 fn optional_json_string(value: Option<&str>) -> String {
     value
-        .map(|value| format!("\"{}\"", escape_json(value)))
+        .map(|value| format!(r#""{}""#, escape_json(value)))
         .unwrap_or_else(|| "null".to_string())
 }
 
 fn escape_json(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|character| match character {
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '"' => "\\\"".chars().collect::<Vec<_>>(),
-            '\n' => "\\n".chars().collect::<Vec<_>>(),
-            '\r' => "\\r".chars().collect::<Vec<_>>(),
-            '\t' => "\\t".chars().collect::<Vec<_>>(),
-            other => vec![other],
-        })
-        .collect()
+    value.chars().fold(String::new(), |mut escaped, character| {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            control if control.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            other => escaped.push(other),
+        }
+        escaped
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_models_serialize_to_contract_json() {
+        let exchange = AuthExchangeRequest {
+            provisioning_key: "bootstrap-secret".to_string(),
+            agent_id: "agent_0123456789abcdef0123456789abcdef".to_string(),
+        };
+        assert_eq!(
+            exchange.to_canonical_json(),
+            include_str!("../tests/fixtures/auth_exchange_request_v1.json").trim()
+        );
+
+        let registration = AgentRegistrationRequest {
+            agent_id: "agent_0123456789abcdef0123456789abcdef".to_string(),
+            hostname: "workstation-17".to_string(),
+            agent_version: "0.1.0".to_string(),
+            labels: vec![Label {
+                key: "site".to_string(),
+                value: "helsinki".to_string(),
+            }],
+        };
+        assert_eq!(
+            registration.to_canonical_json(),
+            include_str!("../tests/fixtures/agent_register_request_v1.json").trim()
+        );
+
+        let heartbeat = HeartbeatRequest {
+            agent_id: "agent_0123456789abcdef0123456789abcdef".to_string(),
+            status: HeartbeatStatus::Idle,
+            detail: None,
+        };
+        assert_eq!(
+            heartbeat.to_canonical_json(),
+            include_str!("../tests/fixtures/heartbeat_request_v1.json").trim()
+        );
+    }
+
+    #[test]
+    fn canonical_json_escapes_all_json_control_characters() {
+        let request = HeartbeatRequest {
+            agent_id: "agent_0123456789abcdef0123456789abcdef".to_string(),
+            status: HeartbeatStatus::Error,
+            detail: Some("quote \" slash \\ newline\n backspace \u{08} unit \u{1f}".to_string()),
+        };
+
+        assert_eq!(
+            request.to_canonical_json(),
+            r#"{"agent_id":"agent_0123456789abcdef0123456789abcdef","status":"error","detail":"quote \" slash \\ newline\n backspace \b unit \u001f"}"#
+        );
+    }
+
+    #[test]
+    fn auth_model_debug_output_redacts_secrets() {
+        let request = AuthExchangeRequest {
+            provisioning_key: "bootstrap-secret".to_string(),
+            agent_id: "agent_0123456789abcdef0123456789abcdef".to_string(),
+        };
+        let response = AuthExchangeResponse {
+            access_token: "jwt-token-value".to_string(),
+            expires_at: "2026-07-24T09:00:00Z".to_string(),
+        };
+
+        let output = format!("{request:?} {response:?}");
+
+        assert!(output.contains("<redacted>"));
+        assert!(output.contains("agent_0123456789abcdef0123456789abcdef"));
+        assert!(output.contains("2026-07-24T09:00:00Z"));
+        assert!(!output.contains("bootstrap-secret"));
+        assert!(!output.contains("jwt-token-value"));
+    }
 
     #[test]
     fn snapshot_normalizes_sorts_and_deduplicates_entries() {
