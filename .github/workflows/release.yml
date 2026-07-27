@@ -76,7 +76,7 @@ jobs:
           out_dir=dist
           mkdir -p "$out_dir"
           archive="$out_dir/lariska-${GITHUB_REF_NAME}-${{ matrix.target }}.zip"
-          (cd "target/${{ matrix.target }}/release" && 7z a "../../../../$archive" lariska.exe)
+          (cd "target/${{ matrix.target }}/release" && 7z a "../../../$archive" lariska.exe)
           echo "ARCHIVE_PATH=$archive" >> "$GITHUB_ENV"
 
       - name: Checksum
@@ -98,6 +98,7 @@ jobs:
         with:
           name: lariska-${{ matrix.target }}
           path: dist/*
+          if-no-files-found: error
 
   sbom:
     name: Generate SBOM
