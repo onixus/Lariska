@@ -19,6 +19,17 @@ Known gaps: no MSI/code-signing yet, and the Windows Service integration has
 never run against a real Windows Service Control Manager (verified only via
 cross-compilation) — see `packaging/windows/README.md`.
 
+## Install and connect
+
+Download the archive for your platform from the
+[latest GitHub release](https://github.com/onixus/Lariska/releases/latest),
+create a tenant provisioning key in Shapoclyack, and configure Lariska with
+the Shapoclyack server URL and the path to that key.
+
+See [Installation and Shapoclyack connection](docs/INSTALL.md) for complete
+Linux, macOS, and Windows instructions, service setup, verification, and
+troubleshooting.
+
 ## Development commands
 
 ```bash
