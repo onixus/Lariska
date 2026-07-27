@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 - 2026-07-27
+
+- Fix the Windows archive output path so the `.zip` and checksum are
+  attached to the GitHub release.
+- Fail the release build when a platform produces no uploadable artifacts.
+
 ## 0.1.1 - 2026-07-27
 
 - Publish the initial cross-platform Lariska agent release.
