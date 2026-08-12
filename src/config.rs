@@ -79,7 +79,8 @@ impl Config {
 
     fn from_file_config(values: FileConfig) -> Result<Self, ConfigError> {
         let server_url = required_string(values.server_url, "server_url")?;
-        let provisioning_key_file = required_path(values.provisioning_key_file, "provisioning_key_file")?;
+        let provisioning_key_file =
+            required_path(values.provisioning_key_file, "provisioning_key_file")?;
         let state_dir = required_path(values.state_dir, "state_dir")?;
         let inventory_interval = Duration::from_secs(
             values
@@ -220,10 +221,7 @@ fn apply_env_overrides(values: &mut FileConfig) -> Result<(), ConfigError> {
         &mut values.inventory_full_refresh_interval_secs,
         "LARISKA_INVENTORY_FULL_REFRESH_INTERVAL_SECS",
     )?;
-    override_u64(
-        &mut values.max_spool_entries,
-        "LARISKA_MAX_SPOOL_ENTRIES",
-    )?;
+    override_u64(&mut values.max_spool_entries, "LARISKA_MAX_SPOOL_ENTRIES")?;
     Ok(())
 }
 
@@ -331,8 +329,8 @@ mod tests {
 
     #[test]
     fn parse_toml_rejects_unknown_keys() {
-        let error = parse_toml("heartbeat_intervl_secs = 30")
-            .expect_err("unknown key should be rejected");
+        let error =
+            parse_toml("heartbeat_intervl_secs = 30").expect_err("unknown key should be rejected");
 
         assert!(error.to_string().contains("unknown field"));
     }
