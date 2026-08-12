@@ -1,0 +1,141 @@
+name: Release v0.1.3 once
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.event.head_commit.message == 'Release v0.1.3 (#13)'
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+            cross_linker: aarch64-linux-gnu-gcc
+            cross_apt_package: gcc-aarch64-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compiler (aarch64 Linux)
+        if: matrix.cross_apt_package != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross_apt_package }}
+
+      - name: Configure cross linker (aarch64 Linux)
+        if: matrix.cross_linker != ''
+        run: |
+          mkdir -p .cargo
+          echo "[target.${{ matrix.target }}]" >> .cargo/config.toml
+          echo "linker = \"${{ matrix.cross_linker }}\"" >> .cargo/config.toml
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p dist
+          archive="dist/lariska-v0.1.3-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$archive" lariska
+
+      - name: Package (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: bash
+        run: |
+          mkdir -p dist
+          archive="dist/lariska-v0.1.3-${{ matrix.target }}.zip"
+          (cd "target/${{ matrix.target }}/release" && 7z a "../../../$archive" lariska.exe)
+
+      - name: Checksum
+        shell: python
+        run: |
+          import hashlib
+          from pathlib import Path
+          for artifact in Path('dist').iterdir():
+              if artifact.is_file() and artifact.suffix != '.sha256':
+                  digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                  artifact.with_name(f'{artifact.name}.sha256').write_text(
+                      f'{digest}  {artifact.name}\n', encoding='utf-8'
+                  )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lariska-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  sbom:
+    if: github.event.head_commit.message == 'Release v0.1.3 (#13)'
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+      - name: Generate SBOM
+        run: cargo cyclonedx --format json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: lariska-sbom
+          path: '*.cdx.json'
+
+  release:
+    if: github.event.head_commit.message == 'Release v0.1.3 (#13)'
+    name: Publish v0.1.3
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.3
+          target_commitish: main
+          name: v0.1.3
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
