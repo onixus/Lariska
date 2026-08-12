@@ -3,7 +3,7 @@ name: Sync Cargo.lock
 on:
   push:
     branches:
-      - hardening/config-toml
+      - release/v0.1.3-prep
 
 permissions:
   contents: write
@@ -16,7 +16,7 @@ jobs:
       - name: Checkout branch
         uses: actions/checkout@v4
         with:
-          ref: hardening/config-toml
+          ref: release/v0.1.3-prep
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -34,5 +34,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.lock
-          git commit -m "build: refresh Cargo.lock for TOML parser"
-          git push origin HEAD:hardening/config-toml
+          git commit -m "build: refresh Cargo.lock for v0.1.3"
+          git push origin HEAD:release/v0.1.3-prep
