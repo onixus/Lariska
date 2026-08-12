@@ -7,16 +7,19 @@ use std::time::SystemTime;
 
 const SPOOL_SUBDIR: &str = "spool";
 const QUARANTINE_SUBDIR: &str = "spool/quarantine";
+const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SPOOL_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum SpoolError {
     Io(String),
+    Capacity(String),
 }
 
 impl fmt::Display for SpoolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(message) => formatter.write_str(message),
+            Self::Io(message) | Self::Capacity(message) => formatter.write_str(message),
         }
     }
 }
@@ -54,6 +57,14 @@ impl Spool {
         let path = self.entry_path(&snapshot.snapshot_id);
         let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
         let payload = snapshot.to_canonical_json();
+        if payload.len() > MAX_SNAPSHOT_BYTES {
+            return Err(SpoolError::Capacity(format!(
+                "snapshot {} is {} bytes; maximum is {} bytes",
+                snapshot.snapshot_id,
+                payload.len(),
+                MAX_SNAPSHOT_BYTES
+            )));
+        }
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -69,6 +80,7 @@ impl Spool {
 
         fs::rename(&temp_path, &path)
             .map_err(|error| SpoolError::Io(format!("failed to persist spool entry: {error}")))?;
+        sync_parent_dir(&path)?;
         Ok(())
     }
 
@@ -99,8 +111,10 @@ impl Spool {
             return Ok(());
         };
         let destination = self.quarantine_dir.join(file_name);
-        fs::rename(path, destination)
-            .map_err(|error| SpoolError::Io(format!("failed to quarantine spool entry: {error}")))
+        fs::rename(path, &destination)
+            .map_err(|error| SpoolError::Io(format!("failed to quarantine spool entry: {error}")))?;
+        sync_parent_dir(&destination)?;
+        Ok(())
     }
 
     /// Pending snapshots, oldest first by file modification time. Entries
@@ -139,34 +153,80 @@ impl Spool {
         Ok(pending)
     }
 
-    /// Evicts the oldest pending entries beyond `max_entries`, never the
-    /// newest unsent snapshot (Plan.md §11: "cap disk usage without
-    /// deleting the newest unsent snapshot"). Returns the evicted snapshot
-    /// IDs so the caller can log what was dropped.
+    /// Evicts the oldest pending entries until both the configured entry
+    /// count and the global byte ceiling are satisfied, while preserving the
+    /// newest unsent snapshot. Returns evicted snapshot IDs for logging.
     pub fn enforce_limit(&self, max_entries: usize) -> Result<Vec<String>, SpoolError> {
+        self.enforce_limits(max_entries, MAX_SPOOL_BYTES)
+    }
+
+    fn enforce_limits(
+        &self,
+        max_entries: usize,
+        max_bytes: u64,
+    ) -> Result<Vec<String>, SpoolError> {
         let pending = self.list_pending()?;
-        if pending.len() <= max_entries {
-            return Ok(Vec::new());
-        }
+        let mut total_bytes = pending.iter().try_fold(0_u64, |total, (path, _)| {
+            let length = fs::metadata(path)
+                .map_err(|error| SpoolError::Io(format!("failed to stat spool entry: {error}")))?
+                .len();
+            Ok::<u64, SpoolError>(total.saturating_add(length))
+        })?;
 
-        let overflow = pending.len() - max_entries;
-        let mut evicted = Vec::with_capacity(overflow);
-        for (path, snapshot) in pending.into_iter().take(overflow) {
-            fs::remove_file(&path)
+        let mut remaining = pending.len();
+        let mut evicted = Vec::new();
+        for (path, snapshot) in pending.iter().take(pending.len().saturating_sub(1)) {
+            if remaining <= max_entries && total_bytes <= max_bytes {
+                break;
+            }
+
+            let length = fs::metadata(path)
+                .map_err(|error| SpoolError::Io(format!("failed to stat spool entry: {error}")))?
+                .len();
+            fs::remove_file(path)
                 .map_err(|error| SpoolError::Io(format!("failed to evict spool entry: {error}")))?;
-            evicted.push(snapshot.snapshot_id);
+            remaining = remaining.saturating_sub(1);
+            total_bytes = total_bytes.saturating_sub(length);
+            evicted.push(snapshot.snapshot_id.clone());
         }
 
+        if !evicted.is_empty() {
+            sync_parent_dir(&self.dir.join("placeholder"))?;
+        }
         Ok(evicted)
     }
 }
 
 fn read_entry(path: &Path) -> Result<InventorySnapshot, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if metadata.len() > MAX_SNAPSHOT_BYTES as u64 {
+        return Err(format!(
+            "spool entry is {} bytes; maximum is {} bytes",
+            metadata.len(),
+            MAX_SNAPSHOT_BYTES
+        ));
+    }
+
     let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
     let snapshot: InventorySnapshot =
         serde_json::from_str(&content).map_err(|error| error.to_string())?;
     snapshot.validate().map_err(|error| error.to_string())?;
     Ok(snapshot)
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), SpoolError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| SpoolError::Io(format!("failed to sync spool directory: {error}")))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), SpoolError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -217,7 +277,26 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].1.snapshot_id, "snap-1");
 
-        fs::remove_dir_all(&state_dir).ok();
+        fs::remove_dir_all(state_dir).ok();
+    }
+
+    #[test]
+    fn oversized_snapshot_is_rejected_before_write() {
+        let state_dir = temp_state_dir("oversized");
+        let spool = Spool::open(&state_dir).expect("spool should open");
+        let mut snapshot = sample_snapshot("snap-large");
+        snapshot.hostname = "x".repeat(MAX_SNAPSHOT_BYTES);
+
+        let error = spool
+            .write(&snapshot)
+            .expect_err("oversized snapshot should fail");
+
+        assert!(matches!(error, SpoolError::Capacity(_)));
+        assert!(!state_dir
+            .join(SPOOL_SUBDIR)
+            .join("snap-large.json")
+            .exists());
+        fs::remove_dir_all(state_dir).ok();
     }
 
     #[test]
@@ -233,7 +312,7 @@ mod tests {
 
         assert!(pending.is_empty());
 
-        fs::remove_dir_all(&state_dir).ok();
+        fs::remove_dir_all(state_dir).ok();
     }
 
     #[test]
@@ -248,7 +327,7 @@ mod tests {
         assert!(pending.is_empty());
         assert!(state_dir.join(QUARANTINE_SUBDIR).join("bad.json").exists());
 
-        fs::remove_dir_all(&state_dir).ok();
+        fs::remove_dir_all(state_dir).ok();
     }
 
     #[test]
@@ -275,5 +354,33 @@ mod tests {
             .any(|(_, snapshot)| snapshot.snapshot_id == "snap-4"));
 
         fs::remove_dir_all(&state_dir).ok();
+    }
+
+    #[test]
+    fn enforce_byte_limit_evicts_oldest_first() {
+        let state_dir = temp_state_dir("evict-bytes");
+        let spool = Spool::open(&state_dir).expect("spool should open");
+
+        for index in 0..3 {
+            spool
+                .write(&sample_snapshot(&format!("snap-{index}")))
+                .expect("write should succeed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let pending = spool.list_pending().expect("list should succeed");
+        let newest_size = fs::metadata(&pending[2].0)
+            .expect("metadata should exist")
+            .len();
+        let evicted = spool
+            .enforce_limits(10, newest_size)
+            .expect("byte limit should be enforced");
+        let remaining = spool.list_pending().expect("list should succeed");
+
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].1.snapshot_id, "snap-2");
+
+        fs::remove_dir_all(state_dir).ok();
     }
 }
