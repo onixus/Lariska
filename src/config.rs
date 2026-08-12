@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use serde::Deserialize;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -12,9 +12,6 @@ const MIN_INTERVAL_SECS: u64 = 10;
 const MAX_INTERVAL_SECS: u64 = 86_400;
 const MIN_TIMEOUT_SECS: u64 = 1;
 const MAX_TIMEOUT_SECS: u64 = 300;
-/// Matches the server's `endpoint_inventory_max_snapshot_age_seconds`
-/// default (24h) so an unchanged snapshot is never resent later than the
-/// server's own staleness tolerance.
 const DEFAULT_FULL_REFRESH_INTERVAL_SECS: u64 = 86_400;
 const DEFAULT_MAX_SPOOL_ENTRIES: u64 = 200;
 const MIN_MAX_SPOOL_ENTRIES: u64 = 1;
@@ -57,82 +54,60 @@ impl fmt::Debug for Config {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    server_url: Option<String>,
+    provisioning_key_file: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    inventory_interval_secs: Option<u64>,
+    heartbeat_interval_secs: Option<u64>,
+    request_timeout_secs: Option<u64>,
+    tls_ca_file: Option<PathBuf>,
+    log_level: Option<String>,
+    allow_plain_http: Option<bool>,
+    inventory_full_refresh_interval_secs: Option<u64>,
+    max_spool_entries: Option<u64>,
+}
+
 impl Config {
     pub fn from_file_and_env(path: &Path) -> Result<Self, ConfigError> {
-        let file_values = parse_config_file(path)?;
-        Self::from_values_and_env(file_values)
+        let mut file_config = parse_config_file(path)?;
+        apply_env_overrides(&mut file_config)?;
+        Self::from_file_config(file_config)
     }
 
-    fn from_values_and_env(mut values: HashMap<String, String>) -> Result<Self, ConfigError> {
-        apply_env_override(&mut values, "server_url", "LARISKA_SERVER_URL");
-        apply_env_override(
-            &mut values,
-            "provisioning_key_file",
-            "LARISKA_PROVISIONING_KEY_FILE",
+    fn from_file_config(values: FileConfig) -> Result<Self, ConfigError> {
+        let server_url = required_string(values.server_url, "server_url")?;
+        let provisioning_key_file = required_path(values.provisioning_key_file, "provisioning_key_file")?;
+        let state_dir = required_path(values.state_dir, "state_dir")?;
+        let inventory_interval = Duration::from_secs(
+            values
+                .inventory_interval_secs
+                .unwrap_or(DEFAULT_INVENTORY_INTERVAL_SECS),
         );
-        apply_env_override(&mut values, "state_dir", "LARISKA_STATE_DIR");
-        apply_env_override(
-            &mut values,
-            "inventory_interval_secs",
-            "LARISKA_INVENTORY_INTERVAL_SECS",
+        let heartbeat_interval = Duration::from_secs(
+            values
+                .heartbeat_interval_secs
+                .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_SECS),
         );
-        apply_env_override(
-            &mut values,
-            "heartbeat_interval_secs",
-            "LARISKA_HEARTBEAT_INTERVAL_SECS",
+        let request_timeout = Duration::from_secs(
+            values
+                .request_timeout_secs
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
         );
-        apply_env_override(
-            &mut values,
-            "request_timeout_secs",
-            "LARISKA_REQUEST_TIMEOUT_SECS",
+        let log_level = values.log_level.unwrap_or_else(|| "info".to_string());
+        let allow_plain_http = values.allow_plain_http.unwrap_or(false);
+        let inventory_full_refresh_interval = Duration::from_secs(
+            values
+                .inventory_full_refresh_interval_secs
+                .unwrap_or(DEFAULT_FULL_REFRESH_INTERVAL_SECS),
         );
-        apply_env_override(&mut values, "tls_ca_file", "LARISKA_TLS_CA_FILE");
-        apply_env_override(&mut values, "log_level", "LARISKA_LOG_LEVEL");
-        apply_env_override(&mut values, "allow_plain_http", "LARISKA_ALLOW_PLAIN_HTTP");
-        apply_env_override(
-            &mut values,
-            "inventory_full_refresh_interval_secs",
-            "LARISKA_INVENTORY_FULL_REFRESH_INTERVAL_SECS",
-        );
-        apply_env_override(
-            &mut values,
+        let max_spool_entries = bounded_u64(
             "max_spool_entries",
-            "LARISKA_MAX_SPOOL_ENTRIES",
-        );
-
-        let server_url = required_string(&values, "server_url")?;
-        let provisioning_key_file = required_path(&values, "provisioning_key_file")?;
-        let state_dir = required_path(&values, "state_dir")?;
-        let inventory_interval = parse_duration(
-            &values,
-            "inventory_interval_secs",
-            DEFAULT_INVENTORY_INTERVAL_SECS,
-        )?;
-        let heartbeat_interval = parse_duration(
-            &values,
-            "heartbeat_interval_secs",
-            DEFAULT_HEARTBEAT_INTERVAL_SECS,
-        )?;
-        let request_timeout = parse_duration(
-            &values,
-            "request_timeout_secs",
-            DEFAULT_REQUEST_TIMEOUT_SECS,
-        )?;
-        let tls_ca_file = optional_path(&values, "tls_ca_file");
-        let log_level = values
-            .get("log_level")
-            .cloned()
-            .unwrap_or_else(|| "info".to_string());
-        let allow_plain_http = parse_bool(&values, "allow_plain_http")?;
-        let inventory_full_refresh_interval = parse_duration(
-            &values,
-            "inventory_full_refresh_interval_secs",
-            DEFAULT_FULL_REFRESH_INTERVAL_SECS,
-        )?;
-        let max_spool_entries = parse_bounded_u64(
-            &values,
-            "max_spool_entries",
-            DEFAULT_MAX_SPOOL_ENTRIES,
+            values
+                .max_spool_entries
+                .unwrap_or(DEFAULT_MAX_SPOOL_ENTRIES),
             MIN_MAX_SPOOL_ENTRIES,
             MAX_MAX_SPOOL_ENTRIES,
         )? as usize;
@@ -144,7 +119,7 @@ impl Config {
             inventory_interval,
             heartbeat_interval,
             request_timeout,
-            tls_ca_file,
+            tls_ca_file: values.tls_ca_file,
             log_level,
             allow_plain_http,
             inventory_full_refresh_interval,
@@ -208,111 +183,105 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-fn parse_config_file(path: &Path) -> Result<HashMap<String, String>, ConfigError> {
+fn parse_config_file(path: &Path) -> Result<FileConfig, ConfigError> {
     let content = fs::read_to_string(path)
         .map_err(|error| ConfigError::Io(format!("failed to read config file: {error}")))?;
-    parse_key_values(&content)
+    parse_toml(&content)
 }
 
-fn parse_key_values(content: &str) -> Result<HashMap<String, String>, ConfigError> {
-    let mut values = HashMap::new();
+fn parse_toml(content: &str) -> Result<FileConfig, ConfigError> {
+    toml::from_str(content)
+        .map_err(|error| ConfigError::Invalid(format!("invalid TOML configuration: {error}")))
+}
 
-    for (index, raw_line) in content.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
+fn apply_env_overrides(values: &mut FileConfig) -> Result<(), ConfigError> {
+    override_string(&mut values.server_url, "LARISKA_SERVER_URL");
+    override_path(
+        &mut values.provisioning_key_file,
+        "LARISKA_PROVISIONING_KEY_FILE",
+    );
+    override_path(&mut values.state_dir, "LARISKA_STATE_DIR");
+    override_u64(
+        &mut values.inventory_interval_secs,
+        "LARISKA_INVENTORY_INTERVAL_SECS",
+    )?;
+    override_u64(
+        &mut values.heartbeat_interval_secs,
+        "LARISKA_HEARTBEAT_INTERVAL_SECS",
+    )?;
+    override_u64(
+        &mut values.request_timeout_secs,
+        "LARISKA_REQUEST_TIMEOUT_SECS",
+    )?;
+    override_path(&mut values.tls_ca_file, "LARISKA_TLS_CA_FILE");
+    override_string(&mut values.log_level, "LARISKA_LOG_LEVEL");
+    override_bool(&mut values.allow_plain_http, "LARISKA_ALLOW_PLAIN_HTTP")?;
+    override_u64(
+        &mut values.inventory_full_refresh_interval_secs,
+        "LARISKA_INVENTORY_FULL_REFRESH_INTERVAL_SECS",
+    )?;
+    override_u64(
+        &mut values.max_spool_entries,
+        "LARISKA_MAX_SPOOL_ENTRIES",
+    )?;
+    Ok(())
+}
 
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(ConfigError::Invalid(format!(
-                "invalid config line {}: expected key = value",
-                index + 1
-            )));
-        };
-
-        values.insert(key.trim().to_string(), trim_value(value));
+fn override_string(target: &mut Option<String>, name: &str) {
+    if let Ok(value) = env::var(name) {
+        *target = Some(value);
     }
-
-    Ok(values)
 }
 
-fn trim_value(value: &str) -> String {
+fn override_path(target: &mut Option<PathBuf>, name: &str) {
+    if let Ok(value) = env::var(name) {
+        *target = Some(PathBuf::from(value));
+    }
+}
+
+fn override_u64(target: &mut Option<u64>, name: &str) -> Result<(), ConfigError> {
+    if let Ok(value) = env::var(name) {
+        *target = Some(value.parse::<u64>().map_err(|_| {
+            ConfigError::Invalid(format!("environment variable {name} must be an integer"))
+        })?);
+    }
+    Ok(())
+}
+
+fn override_bool(target: &mut Option<bool>, name: &str) -> Result<(), ConfigError> {
+    if let Ok(value) = env::var(name) {
+        *target = Some(match value.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(ConfigError::Invalid(format!(
+                    "environment variable {name} must be true or false"
+                )))
+            }
+        });
+    }
+    Ok(())
+}
+
+fn required_string(value: Option<String>, key: &str) -> Result<String, ConfigError> {
     value
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string()
-}
-
-fn apply_env_override(values: &mut HashMap<String, String>, key: &str, env_key: &str) {
-    if let Ok(value) = env::var(env_key) {
-        values.insert(key.to_string(), value);
-    }
-}
-
-fn required_string(values: &HashMap<String, String>, key: &str) -> Result<String, ConfigError> {
-    values
-        .get(key)
         .filter(|value| !value.trim().is_empty())
-        .cloned()
         .ok_or_else(|| ConfigError::Invalid(format!("{key} is required")))
 }
 
-fn required_path(values: &HashMap<String, String>, key: &str) -> Result<PathBuf, ConfigError> {
-    Ok(PathBuf::from(required_string(values, key)?))
+fn required_path(value: Option<PathBuf>, key: &str) -> Result<PathBuf, ConfigError> {
+    value
+        .filter(|value| !value.as_os_str().is_empty())
+        .ok_or_else(|| ConfigError::Invalid(format!("{key} is required")))
 }
 
-fn optional_path(values: &HashMap<String, String>, key: &str) -> Option<PathBuf> {
-    values
-        .get(key)
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-}
-
-fn parse_duration(
-    values: &HashMap<String, String>,
-    key: &str,
-    default_secs: u64,
-) -> Result<Duration, ConfigError> {
-    let seconds = match values.get(key) {
-        Some(raw) => raw
-            .parse::<u64>()
-            .map_err(|_| ConfigError::Invalid(format!("{key} must be an integer")))?,
-        None => default_secs,
-    };
-
-    Ok(Duration::from_secs(seconds))
-}
-
-fn parse_bounded_u64(
-    values: &HashMap<String, String>,
-    key: &str,
-    default: u64,
-    min: u64,
-    max: u64,
-) -> Result<u64, ConfigError> {
-    let value = match values.get(key) {
-        Some(raw) => raw
-            .parse::<u64>()
-            .map_err(|_| ConfigError::Invalid(format!("{key} must be an integer")))?,
-        None => default,
-    };
-
+fn bounded_u64(name: &str, value: u64, min: u64, max: u64) -> Result<u64, ConfigError> {
     if !(min..=max).contains(&value) {
         return Err(ConfigError::Invalid(format!(
-            "{key} must be between {min} and {max}"
+            "{name} must be between {min} and {max}"
         )));
     }
-
     Ok(value)
-}
-
-fn parse_bool(values: &HashMap<String, String>, key: &str) -> Result<bool, ConfigError> {
-    match values.get(key).map(String::as_str) {
-        Some("true") => Ok(true),
-        Some("false") | None => Ok(false),
-        Some(_) => Err(ConfigError::Invalid(format!("{key} must be true or false"))),
-    }
 }
 
 fn validate_interval(name: &str, value: Duration) -> Result<(), ConfigError> {
@@ -342,21 +311,38 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn parse_key_values_supports_quotes_and_comments() {
-        let values = parse_key_values(
+    fn parse_toml_supports_comments_and_typed_values() {
+        let values = parse_toml(
             r#"
             # comment
             server_url = "https://example.test"
-            log_level = 'debug'
+            log_level = "debug"
+            heartbeat_interval_secs = 30
+            allow_plain_http = false
             "#,
         )
         .expect("config should parse");
 
-        assert_eq!(
-            values.get("server_url"),
-            Some(&"https://example.test".to_string())
-        );
-        assert_eq!(values.get("log_level"), Some(&"debug".to_string()));
+        assert_eq!(values.server_url.as_deref(), Some("https://example.test"));
+        assert_eq!(values.log_level.as_deref(), Some("debug"));
+        assert_eq!(values.heartbeat_interval_secs, Some(30));
+        assert_eq!(values.allow_plain_http, Some(false));
+    }
+
+    #[test]
+    fn parse_toml_rejects_unknown_keys() {
+        let error = parse_toml("heartbeat_intervl_secs = 30")
+            .expect_err("unknown key should be rejected");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn parse_toml_rejects_wrong_types() {
+        let error = parse_toml("heartbeat_interval_secs = \"thirty\"")
+            .expect_err("wrong type should be rejected");
+
+        assert!(error.to_string().contains("invalid type"));
     }
 
     #[test]
@@ -366,15 +352,13 @@ mod tests {
         let secret_path = temp_dir.join("secret.key");
         File::create(&secret_path).expect("secret file should be created");
 
-        let mut values = HashMap::new();
-        values.insert("server_url".to_string(), "https://example.test".to_string());
-        values.insert(
-            "provisioning_key_file".to_string(),
-            secret_path.display().to_string(),
-        );
-        values.insert("state_dir".to_string(), temp_dir.display().to_string());
-
-        let config = Config::from_values_and_env(values).expect("config should be valid");
+        let config = Config::from_file_config(FileConfig {
+            server_url: Some("https://example.test".to_string()),
+            provisioning_key_file: Some(secret_path.clone()),
+            state_dir: Some(temp_dir.clone()),
+            ..FileConfig::default()
+        })
+        .expect("config should be valid");
         let debug = format!("{config:?}");
 
         assert!(debug.contains("<redacted>"));
@@ -391,15 +375,13 @@ mod tests {
         let mut secret = File::create(&secret_path).expect("secret file should be created");
         writeln!(secret, "bootstrap").expect("secret should be written");
 
-        let mut values = HashMap::new();
-        values.insert("server_url".to_string(), "http://example.test".to_string());
-        values.insert(
-            "provisioning_key_file".to_string(),
-            secret_path.display().to_string(),
-        );
-        values.insert("state_dir".to_string(), temp_dir.display().to_string());
-
-        let error = Config::from_values_and_env(values).expect_err("plain http should be rejected");
+        let error = Config::from_file_config(FileConfig {
+            server_url: Some("http://example.test".to_string()),
+            provisioning_key_file: Some(secret_path),
+            state_dir: Some(temp_dir.clone()),
+            ..FileConfig::default()
+        })
+        .expect_err("plain http should be rejected");
 
         assert_eq!(
             error,
