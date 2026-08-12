@@ -115,8 +115,9 @@ impl Spool {
             return Ok(());
         };
         let destination = self.quarantine_dir.join(file_name);
-        fs::rename(path, &destination)
-            .map_err(|error| SpoolError::Io(format!("failed to quarantine spool entry: {error}")))?;
+        fs::rename(path, &destination).map_err(|error| {
+            SpoolError::Io(format!("failed to quarantine spool entry: {error}"))
+        })?;
         sync_parent_dir(path)?;
         sync_parent_dir(&destination)?;
         Ok(())
@@ -173,7 +174,10 @@ impl Spool {
         for (path, snapshot) in pending {
             let size = fs::metadata(&path)
                 .map_err(|error| {
-                    SpoolError::Io(format!("failed to stat spool entry {}: {error}", path.display()))
+                    SpoolError::Io(format!(
+                        "failed to stat spool entry {}: {error}",
+                        path.display()
+                    ))
                 })?
                 .len();
             total_bytes = total_bytes.saturating_add(size);
