@@ -237,9 +237,8 @@ mod tests {
             http: Client::new(),
             base_url: server.uri(),
         };
-        let result: Result<serde_json::Value, ApiError> = client
-            .post_json("/test", None, &json!({}), None)
-            .await;
+        let result: Result<serde_json::Value, ApiError> =
+            client.post_json("/test", None, &json!({}), None).await;
 
         assert!(matches!(
             result,
@@ -262,9 +261,8 @@ mod tests {
             http: Client::new(),
             base_url: server.uri(),
         };
-        let result: Result<serde_json::Value, ApiError> = client
-            .post_json("/test", None, &json!({}), None)
-            .await;
+        let result: Result<serde_json::Value, ApiError> =
+            client.post_json("/test", None, &json!({}), None).await;
 
         assert!(matches!(
             result,
