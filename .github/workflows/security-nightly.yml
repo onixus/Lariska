@@ -1,0 +1,27 @@
+name: Nightly Security
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-security:
+    name: Dependency audit and policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+      - name: cargo audit (vulnerability advisories)
+        run: cargo audit
+      - name: cargo deny (advisories/licenses/bans/sources)
+        run: cargo deny check
