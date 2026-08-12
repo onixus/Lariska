@@ -7,6 +7,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 const MAX_ERROR_DETAIL_CHARS: usize = 500;
+const MAX_SUCCESS_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Classified outcomes of a Shapoclyack API call. Callers branch on the
 /// variant, not the HTTP status code, so retry/refresh policy lives in one
@@ -113,14 +115,62 @@ fn classify_transport_error(error: &reqwest::Error) -> ApiError {
     }
 }
 
+#[derive(Debug)]
+enum BodyReadError {
+    TooLarge { limit: usize },
+    Transport(ApiError),
+}
+
+async fn read_response_body_limited(
+    response: &mut reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, BodyReadError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(BodyReadError::TooLarge { limit });
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .unwrap_or_default()
+        .min(limit as u64) as usize;
+    let mut body = Vec::with_capacity(initial_capacity);
+
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|error| BodyReadError::Transport(classify_transport_error(&error)))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(BodyReadError::TooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
 async fn classify_response<R: DeserializeOwned>(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
 ) -> Result<R, ApiError> {
     let status = response.status();
     if status.is_success() {
-        return response
-            .json::<R>()
+        let body = read_response_body_limited(&mut response, MAX_SUCCESS_RESPONSE_BYTES)
             .await
+            .map_err(|error| match error {
+                BodyReadError::TooLarge { limit } => {
+                    ApiError::Fatal(format!("response body exceeds {limit} bytes"))
+                }
+                BodyReadError::Transport(error) => error,
+            })?;
+
+        return serde_json::from_slice::<R>(&body)
             .map_err(|error| ApiError::Fatal(format!("failed to decode response: {error}")));
     }
 
@@ -131,7 +181,13 @@ async fn classify_response<R: DeserializeOwned>(
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs);
 
-    let detail = sanitize_detail(&response.text().await.unwrap_or_default());
+    let detail = match read_response_body_limited(&mut response, MAX_ERROR_RESPONSE_BYTES).await {
+        Ok(body) => sanitize_detail(&String::from_utf8_lossy(&body)),
+        Err(BodyReadError::TooLarge { limit }) => {
+            format!("response body exceeds {limit} bytes")
+        }
+        Err(BodyReadError::Transport(error)) => return Err(error),
+    };
 
     Err(match status {
         StatusCode::UNAUTHORIZED => ApiError::Auth,
@@ -156,5 +212,70 @@ fn sanitize_detail(body: &str) -> String {
     } else {
         let truncated: String = trimmed.chars().take(MAX_ERROR_DETAIL_CHARS).collect();
         format!("{truncated}... (truncated)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn oversized_success_response_is_rejected_before_json_decode() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("x".repeat(MAX_SUCCESS_RESPONSE_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ApiClient {
+            http: Client::new(),
+            base_url: server.uri(),
+        };
+        let result: Result<serde_json::Value, ApiError> =
+            client.post_json("/test", None, &json!({}), None).await;
+
+        assert!(matches!(
+            result,
+            Err(ApiError::Fatal(message)) if message.contains("response body exceeds")
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_error_response_preserves_http_classification() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_string("x".repeat(MAX_ERROR_RESPONSE_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ApiClient {
+            http: Client::new(),
+            base_url: server.uri(),
+        };
+        let result: Result<serde_json::Value, ApiError> =
+            client.post_json("/test", None, &json!({}), None).await;
+
+        assert!(matches!(
+            result,
+            Err(ApiError::RateLimited { retry_after: None })
+        ));
+    }
+
+    #[test]
+    fn error_detail_is_sanitized_to_character_limit() {
+        let body = "x".repeat(MAX_ERROR_DETAIL_CHARS + 10);
+        let detail = sanitize_detail(&body);
+
+        assert!(detail.ends_with("... (truncated)"));
+        assert_eq!(detail.matches('x').count(), MAX_ERROR_DETAIL_CHARS);
     }
 }

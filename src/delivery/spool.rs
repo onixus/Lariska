@@ -1,22 +1,25 @@
 use crate::model::InventorySnapshot;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const SPOOL_SUBDIR: &str = "spool";
 const QUARANTINE_SUBDIR: &str = "spool/quarantine";
+const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SPOOL_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum SpoolError {
     Io(String),
+    Capacity(String),
 }
 
 impl fmt::Display for SpoolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(message) => formatter.write_str(message),
+            Self::Io(message) | Self::Capacity(message) => formatter.write_str(message),
         }
     }
 }
@@ -24,9 +27,9 @@ impl fmt::Display for SpoolError {
 impl std::error::Error for SpoolError {}
 
 /// Durable local queue of not-yet-acknowledged inventory snapshots. A
-/// snapshot is written here *before* any network submission is attempted
-/// (Plan.md §11 steps 5-7), so killing the process mid-upload never loses
-/// it — the next `list_pending` call after restart picks it back up.
+/// snapshot is written here *before* any network submission is attempted,
+/// so killing the process mid-upload never loses it. The next
+/// `list_pending` call after restart picks it back up.
 pub struct Spool {
     dir: PathBuf,
     quarantine_dir: PathBuf,
@@ -55,6 +58,15 @@ impl Spool {
         let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
         let payload = snapshot.to_canonical_json();
 
+        if payload.len() > MAX_SNAPSHOT_BYTES {
+            return Err(SpoolError::Capacity(format!(
+                "snapshot {} is {} bytes, exceeding the {} byte spool entry limit",
+                snapshot.snapshot_id,
+                payload.len(),
+                MAX_SNAPSHOT_BYTES
+            )));
+        }
+
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -69,12 +81,17 @@ impl Spool {
 
         fs::rename(&temp_path, &path)
             .map_err(|error| SpoolError::Io(format!("failed to persist spool entry: {error}")))?;
+        sync_parent_dir(&path)?;
         Ok(())
     }
 
     pub fn remove(&self, snapshot_id: &str) -> Result<(), SpoolError> {
-        match fs::remove_file(self.entry_path(snapshot_id)) {
-            Ok(()) => Ok(()),
+        let path = self.entry_path(snapshot_id);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                sync_parent_dir(&path)?;
+                Ok(())
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(SpoolError::Io(format!(
                 "failed to remove spool entry: {error}"
@@ -83,8 +100,7 @@ impl Spool {
     }
 
     /// Moves a spool entry aside so it stops being retried every cycle,
-    /// without deleting it outright (Plan.md §11: "quarantine malformed
-    /// queue entries instead of looping forever").
+    /// without deleting it outright.
     pub fn quarantine_by_id(&self, snapshot_id: &str) -> Result<(), SpoolError> {
         let path = self.entry_path(snapshot_id);
         if path.exists() {
@@ -99,14 +115,17 @@ impl Spool {
             return Ok(());
         };
         let destination = self.quarantine_dir.join(file_name);
-        fs::rename(path, destination)
-            .map_err(|error| SpoolError::Io(format!("failed to quarantine spool entry: {error}")))
+        fs::rename(path, &destination).map_err(|error| {
+            SpoolError::Io(format!("failed to quarantine spool entry: {error}"))
+        })?;
+        sync_parent_dir(path)?;
+        sync_parent_dir(&destination)?;
+        Ok(())
     }
 
     /// Pending snapshots, oldest first by file modification time. Entries
-    /// that fail to parse or fail snapshot validation are quarantined here
-    /// rather than returned, so a corrupt file can never cause an infinite
-    /// retry loop.
+    /// that fail to parse, exceed the per-entry byte limit, or fail snapshot
+    /// validation are quarantined rather than returned.
     pub fn list_pending(&self) -> Result<Vec<(PathBuf, InventorySnapshot)>, SpoolError> {
         let mut candidates: Vec<(PathBuf, SystemTime)> = Vec::new();
 
@@ -139,21 +158,48 @@ impl Spool {
         Ok(pending)
     }
 
-    /// Evicts the oldest pending entries beyond `max_entries`, never the
-    /// newest unsent snapshot (Plan.md §11: "cap disk usage without
-    /// deleting the newest unsent snapshot"). Returns the evicted snapshot
-    /// IDs so the caller can log what was dropped.
+    /// Evicts oldest pending entries until both the configured entry limit
+    /// and the hard spool byte limit are satisfied. The newest unsent
+    /// snapshot is always retained.
     pub fn enforce_limit(&self, max_entries: usize) -> Result<Vec<String>, SpoolError> {
         let pending = self.list_pending()?;
-        if pending.len() <= max_entries {
+        if pending.is_empty() {
             return Ok(Vec::new());
         }
 
-        let overflow = pending.len() - max_entries;
-        let mut evicted = Vec::with_capacity(overflow);
-        for (path, snapshot) in pending.into_iter().take(overflow) {
+        let max_entries = max_entries.max(1);
+        let mut entries = Vec::with_capacity(pending.len());
+        let mut total_bytes = 0_u64;
+
+        for (path, snapshot) in pending {
+            let size = fs::metadata(&path)
+                .map_err(|error| {
+                    SpoolError::Io(format!(
+                        "failed to stat spool entry {}: {error}",
+                        path.display()
+                    ))
+                })?
+                .len();
+            total_bytes = total_bytes.saturating_add(size);
+            entries.push((path, snapshot, size));
+        }
+
+        let mut remaining_entries = entries.len();
+        let mut evicted = Vec::new();
+
+        for (path, snapshot, size) in entries {
+            if remaining_entries <= max_entries && total_bytes <= MAX_SPOOL_BYTES {
+                break;
+            }
+            if remaining_entries <= 1 {
+                break;
+            }
+
             fs::remove_file(&path)
                 .map_err(|error| SpoolError::Io(format!("failed to evict spool entry: {error}")))?;
+            sync_parent_dir(&path)?;
+            remaining_entries -= 1;
+            total_bytes = total_bytes.saturating_sub(size);
             evicted.push(snapshot.snapshot_id);
         }
 
@@ -162,11 +208,42 @@ impl Spool {
 }
 
 fn read_entry(path: &Path) -> Result<InventorySnapshot, String> {
-    let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let mut content = Vec::new();
+    file.take((MAX_SNAPSHOT_BYTES + 1) as u64)
+        .read_to_end(&mut content)
+        .map_err(|error| error.to_string())?;
+
+    if content.len() > MAX_SNAPSHOT_BYTES {
+        return Err(format!(
+            "spool entry exceeds the {MAX_SNAPSHOT_BYTES} byte limit"
+        ));
+    }
+
     let snapshot: InventorySnapshot =
-        serde_json::from_str(&content).map_err(|error| error.to_string())?;
+        serde_json::from_slice(&content).map_err(|error| error.to_string())?;
     snapshot.validate().map_err(|error| error.to_string())?;
     Ok(snapshot)
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), SpoolError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            SpoolError::Io(format!(
+                "failed to sync spool directory {}: {error}",
+                parent.display()
+            ))
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), SpoolError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -273,6 +350,26 @@ mod tests {
         assert!(pending
             .iter()
             .any(|(_, snapshot)| snapshot.snapshot_id == "snap-4"));
+
+        fs::remove_dir_all(&state_dir).ok();
+    }
+
+    #[test]
+    fn write_rejects_oversized_snapshot() {
+        let state_dir = temp_state_dir("oversized");
+        let spool = Spool::open(&state_dir).expect("spool should open");
+        let mut snapshot = sample_snapshot("snap-big");
+        snapshot.hostname = "x".repeat(MAX_SNAPSHOT_BYTES);
+
+        let error = spool
+            .write(&snapshot)
+            .expect_err("oversized snapshot should be rejected");
+
+        assert!(matches!(error, SpoolError::Capacity(_)));
+        assert!(spool
+            .list_pending()
+            .expect("list should succeed")
+            .is_empty());
 
         fs::remove_dir_all(&state_dir).ok();
     }

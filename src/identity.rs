@@ -1,4 +1,5 @@
 use crate::model::{EndpointIdentifier, IdentifierType};
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -64,6 +65,22 @@ fn persist_atomically(path: &Path, agent_id: &str) -> Result<(), IdentityError> 
 
     fs::rename(&temp_path, path)
         .map_err(|error| IdentityError::Io(format!("failed to persist identity: {error}")))?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), IdentityError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| IdentityError::Io(format!("failed to sync identity directory: {error}")))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), IdentityError> {
     Ok(())
 }
 
@@ -92,25 +109,14 @@ fn random_hex_id(prefix: &str) -> Result<String, IdentityError> {
     Ok(format!("{prefix}_{hex}"))
 }
 
-#[cfg(unix)]
+/// Fill ID material from the operating system CSPRNG on every platform.
+/// `OsRng` delegates to the platform's cryptographically secure random source
+/// (including BCryptGenRandom/RtlGenRandom-backed facilities on Windows), so
+/// IDs are not derived from predictable process metadata such as PID/time.
 fn fill_random(bytes: &mut [u8]) -> Result<(), IdentityError> {
-    use std::io::Read;
-
-    let mut file = fs::File::open("/dev/urandom")
-        .map_err(|error| IdentityError::Io(format!("failed to open /dev/urandom: {error}")))?;
-    file.read_exact(bytes)
-        .map_err(|error| IdentityError::Io(format!("failed to read random bytes: {error}")))
-}
-
-#[cfg(not(unix))]
-fn fill_random(bytes: &mut [u8]) -> Result<(), IdentityError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| IdentityError::Io(format!("system clock error: {error}")))?
-        .as_nanos();
-    let pid = u128::from(std::process::id());
-    bytes.copy_from_slice(&(now ^ pid).to_le_bytes());
-    Ok(())
+    let mut rng = OsRng;
+    rng.try_fill_bytes(bytes)
+        .map_err(|error| IdentityError::Io(format!("failed to obtain OS randomness: {error}")))
 }
 
 /// Platform evidence supplementing the random `agent_id` — never a
@@ -241,6 +247,22 @@ mod tests {
     }
 
     #[test]
+    fn generated_ids_have_expected_format_and_are_distinct() {
+        let first = generate_agent_id().expect("agent id should be generated");
+        let second = generate_agent_id().expect("agent id should be generated");
+        let snapshot = generate_snapshot_id().expect("snapshot id should be generated");
+
+        assert!(is_valid_agent_id(&first));
+        assert!(is_valid_agent_id(&second));
+        assert_ne!(first, second);
+        assert!(snapshot.starts_with("snap_"));
+        assert_eq!(snapshot.len(), "snap_".len() + 32);
+        assert!(snapshot["snap_".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
     fn load_or_create_reuses_existing_identity() {
         let state_dir =
             std::env::temp_dir().join(format!("lariska-id-test-{}", std::process::id()));
@@ -249,14 +271,14 @@ mod tests {
 
         assert_eq!(first, second);
 
-        fs::remove_dir_all(state_dir).expect("state dir should be removed");
+        fs::remove_dir_all(state_dir).expect("temp dir should be removed");
     }
 
     #[test]
     fn load_or_create_rejects_corrupt_identity() {
         let state_dir =
             std::env::temp_dir().join(format!("lariska-corrupt-id-test-{}", std::process::id()));
-        fs::create_dir_all(&state_dir).expect("state dir should be created");
+        fs::create_dir_all(&state_dir).expect("temp dir should be created");
         fs::write(state_dir.join(IDENTITY_FILE), "not-valid").expect("identity should be written");
 
         let error = load_or_create(&state_dir).expect_err("corrupt identity should fail");
@@ -266,6 +288,6 @@ mod tests {
             IdentityError::Corrupt("identity file does not contain a valid agent id".to_string())
         );
 
-        fs::remove_dir_all(state_dir).expect("state dir should be removed");
+        fs::remove_dir_all(state_dir).expect("temp dir should be removed");
     }
 }
