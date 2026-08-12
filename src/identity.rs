@@ -65,6 +65,22 @@ fn persist_atomically(path: &Path, agent_id: &str) -> Result<(), IdentityError> 
 
     fs::rename(&temp_path, path)
         .map_err(|error| IdentityError::Io(format!("failed to persist identity: {error}")))?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), IdentityError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| IdentityError::Io(format!("failed to sync identity directory: {error}")))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), IdentityError> {
     Ok(())
 }
 
@@ -255,14 +271,14 @@ mod tests {
 
         assert_eq!(first, second);
 
-        fs::remove_dir_all(state_dir).expect("state dir should be removed");
+        fs::remove_dir_all(state_dir).expect("temp dir should be removed");
     }
 
     #[test]
     fn load_or_create_rejects_corrupt_identity() {
         let state_dir =
             std::env::temp_dir().join(format!("lariska-corrupt-id-test-{}", std::process::id()));
-        fs::create_dir_all(&state_dir).expect("state dir should be created");
+        fs::create_dir_all(&state_dir).expect("temp dir should be created");
         fs::write(state_dir.join(IDENTITY_FILE), "not-valid").expect("identity should be written");
 
         let error = load_or_create(&state_dir).expect_err("corrupt identity should fail");
@@ -272,6 +288,6 @@ mod tests {
             IdentityError::Corrupt("identity file does not contain a valid agent id".to_string())
         );
 
-        fs::remove_dir_all(state_dir).expect("state dir should be removed");
+        fs::remove_dir_all(state_dir).expect("temp dir should be removed");
     }
 }
