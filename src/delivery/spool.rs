@@ -227,7 +227,6 @@ fn is_zstd_magic(bytes: &[u8]) -> bool {
 }
 
 fn read_entry(path: &Path) -> Result<InventorySnapshot, String> {
-<<<<<<< HEAD
     let file = File::open(path).map_err(|error| error.to_string())?;
     let mut content = Vec::new();
     file.take((MAX_SNAPSHOT_BYTES + 1) as u64)
@@ -240,19 +239,21 @@ fn read_entry(path: &Path) -> Result<InventorySnapshot, String> {
         ));
     }
 
-    let snapshot: InventorySnapshot =
-        serde_json::from_slice(&content).map_err(|error| error.to_string())?;
-=======
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    let json_bytes = if path.to_string_lossy().ends_with(".zst") || is_zstd_magic(&bytes) {
-        zstd::decode_all(&bytes[..])
+    let json_bytes = if path.to_string_lossy().ends_with(".zst") || is_zstd_magic(&content) {
+        zstd::decode_all(&content[..])
             .map_err(|error| format!("failed to decompress spool entry: {error}"))?
     } else {
-        bytes
+        content
     };
+
+    if json_bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(format!(
+            "decompressed spool entry exceeds the {MAX_SNAPSHOT_BYTES} byte limit"
+        ));
+    }
+
     let snapshot: InventorySnapshot =
         serde_json::from_slice(&json_bytes).map_err(|error| error.to_string())?;
->>>>>>> 57aab5e (feat: implement hardening, runtime collectors, QoS E-cores, crash reporter and Jenkinsfile)
     snapshot.validate().map_err(|error| error.to_string())?;
     Ok(snapshot)
 }
@@ -386,7 +387,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn write_rejects_oversized_snapshot() {
         let state_dir = temp_state_dir("oversized");
         let spool = Spool::open(&state_dir).expect("spool should open");
@@ -402,7 +402,11 @@ mod tests {
             .list_pending()
             .expect("list should succeed")
             .is_empty());
-=======
+
+        fs::remove_dir_all(&state_dir).ok();
+    }
+
+    #[test]
     fn reads_legacy_uncompressed_json_spool_entry() {
         let state_dir = temp_state_dir("legacy_uncompressed");
         let spool = Spool::open(&state_dir).expect("spool should open");
@@ -420,7 +424,6 @@ mod tests {
             .remove("legacy-1")
             .expect("remove legacy should succeed");
         assert!(spool.list_pending().unwrap().is_empty());
->>>>>>> 57aab5e (feat: implement hardening, runtime collectors, QoS E-cores, crash reporter and Jenkinsfile)
 
         fs::remove_dir_all(&state_dir).ok();
     }
