@@ -105,6 +105,46 @@ impl ApiClient {
 
         classify_response(response).await
     }
+
+    /// POSTs a zstd-compressed JSON body with `Content-Encoding: zstd`.
+    pub async fn post_compressed_json<B, R>(
+        &self,
+        path: &str,
+        bearer_token: Option<&str>,
+        body: &B,
+        idempotency_key: Option<&str>,
+    ) -> Result<R, ApiError>
+    where
+        B: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
+        let url = format!("{}{path}", self.base_url);
+        let raw_json = serde_json::to_vec(body)
+            .map_err(|error| ApiError::Fatal(format!("failed to serialize request: {error}")))?;
+        let compressed = zstd::encode_all(&raw_json[..], 3)
+            .map_err(|error| ApiError::Fatal(format!("failed to compress request: {error}")))?;
+
+        let mut request = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "zstd")
+            .body(compressed);
+
+        if let Some(token) = bearer_token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(key) = idempotency_key {
+            request = request.header("Idempotency-Key", key);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|error| classify_transport_error(&error))?;
+
+        classify_response(response).await
+    }
 }
 
 fn classify_transport_error(error: &reqwest::Error) -> ApiError {

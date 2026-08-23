@@ -50,13 +50,15 @@ impl Spool {
     }
 
     fn entry_path(&self, snapshot_id: &str) -> PathBuf {
-        self.dir.join(format!("{snapshot_id}.json"))
+        self.dir.join(format!("{snapshot_id}.json.zst"))
     }
 
     pub fn write(&self, snapshot: &InventorySnapshot) -> Result<(), SpoolError> {
         let path = self.entry_path(&snapshot.snapshot_id);
         let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
         let payload = snapshot.to_canonical_json();
+        let compressed = zstd::encode_all(payload.as_bytes(), 3)
+            .map_err(|error| SpoolError::Io(format!("failed to compress spool entry: {error}")))?;
 
         if payload.len() > MAX_SNAPSHOT_BYTES {
             return Err(SpoolError::Capacity(format!(
@@ -75,7 +77,7 @@ impl Spool {
             .map_err(|error| {
                 SpoolError::Io(format!("failed to create spool temp file: {error}"))
             })?;
-        file.write_all(payload.as_bytes())
+        file.write_all(&compressed)
             .and_then(|()| file.sync_all())
             .map_err(|error| SpoolError::Io(format!("failed to write spool entry: {error}")))?;
 
@@ -86,28 +88,39 @@ impl Spool {
     }
 
     pub fn remove(&self, snapshot_id: &str) -> Result<(), SpoolError> {
-        let path = self.entry_path(snapshot_id);
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                sync_parent_dir(&path)?;
-                Ok(())
+        let zst_path = self.dir.join(format!("{snapshot_id}.json.zst"));
+        let json_path = self.dir.join(format!("{snapshot_id}.json"));
+
+        let mut last_err = None;
+        for path in [&zst_path, &json_path] {
+            if let Err(error) = fs::remove_file(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    last_err = Some(error);
+                }
+            } else {
+                let _ = sync_parent_dir(path);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(SpoolError::Io(format!(
+        }
+        if let Some(error) = last_err {
+            Err(SpoolError::Io(format!(
                 "failed to remove spool entry: {error}"
-            ))),
+            )))
+        } else {
+            Ok(())
         }
     }
 
     /// Moves a spool entry aside so it stops being retried every cycle,
     /// without deleting it outright.
     pub fn quarantine_by_id(&self, snapshot_id: &str) -> Result<(), SpoolError> {
-        let path = self.entry_path(snapshot_id);
-        if path.exists() {
-            self.quarantine(&path)
-        } else {
-            Ok(())
+        let zst_path = self.dir.join(format!("{snapshot_id}.json.zst"));
+        let json_path = self.dir.join(format!("{snapshot_id}.json"));
+        for path in [zst_path, json_path] {
+            if path.exists() {
+                self.quarantine(&path)?;
+            }
         }
+        Ok(())
     }
 
     fn quarantine(&self, path: &Path) -> Result<(), SpoolError> {
@@ -135,7 +148,9 @@ impl Spool {
             let dir_entry = dir_entry
                 .map_err(|error| SpoolError::Io(format!("failed to read spool entry: {error}")))?;
             let path = dir_entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            let is_spool_file = path.to_string_lossy().ends_with(".json.zst")
+                || path.extension().and_then(|ext| ext.to_str()) == Some("json");
+            if !is_spool_file {
                 continue;
             }
             let modified = dir_entry
@@ -207,7 +222,12 @@ impl Spool {
     }
 }
 
+fn is_zstd_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes[0..4] == [0x28, 0xB5, 0x2F, 0xFD]
+}
+
 fn read_entry(path: &Path) -> Result<InventorySnapshot, String> {
+<<<<<<< HEAD
     let file = File::open(path).map_err(|error| error.to_string())?;
     let mut content = Vec::new();
     file.take((MAX_SNAPSHOT_BYTES + 1) as u64)
@@ -222,6 +242,17 @@ fn read_entry(path: &Path) -> Result<InventorySnapshot, String> {
 
     let snapshot: InventorySnapshot =
         serde_json::from_slice(&content).map_err(|error| error.to_string())?;
+=======
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let json_bytes = if path.to_string_lossy().ends_with(".zst") || is_zstd_magic(&bytes) {
+        zstd::decode_all(&bytes[..])
+            .map_err(|error| format!("failed to decompress spool entry: {error}"))?
+    } else {
+        bytes
+    };
+    let snapshot: InventorySnapshot =
+        serde_json::from_slice(&json_bytes).map_err(|error| error.to_string())?;
+>>>>>>> 57aab5e (feat: implement hardening, runtime collectors, QoS E-cores, crash reporter and Jenkinsfile)
     snapshot.validate().map_err(|error| error.to_string())?;
     Ok(snapshot)
 }
@@ -355,6 +386,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn write_rejects_oversized_snapshot() {
         let state_dir = temp_state_dir("oversized");
         let spool = Spool::open(&state_dir).expect("spool should open");
@@ -370,6 +402,25 @@ mod tests {
             .list_pending()
             .expect("list should succeed")
             .is_empty());
+=======
+    fn reads_legacy_uncompressed_json_spool_entry() {
+        let state_dir = temp_state_dir("legacy_uncompressed");
+        let spool = Spool::open(&state_dir).expect("spool should open");
+
+        let legacy_file = state_dir.join(SPOOL_SUBDIR).join("legacy-1.json");
+        let snapshot = sample_snapshot("legacy-1");
+        fs::write(&legacy_file, snapshot.to_canonical_json().as_bytes())
+            .expect("legacy file should be written");
+
+        let pending = spool.list_pending().expect("list should succeed");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.snapshot_id, "legacy-1");
+
+        spool
+            .remove("legacy-1")
+            .expect("remove legacy should succeed");
+        assert!(spool.list_pending().unwrap().is_empty());
+>>>>>>> 57aab5e (feat: implement hardening, runtime collectors, QoS E-cores, crash reporter and Jenkinsfile)
 
         fs::remove_dir_all(&state_dir).ok();
     }

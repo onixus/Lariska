@@ -476,7 +476,10 @@ mod contract_tests {
             pending.is_empty(),
             "rejected entry must not stay in the retry queue"
         );
-        assert!(state_dir.join("spool/quarantine/snap-1.json").exists());
+        assert!(
+            state_dir.join("spool/quarantine/snap-1.json.zst").exists()
+                || state_dir.join("spool/quarantine/snap-1.json").exists()
+        );
 
         fs::remove_file(key_path).ok();
         fs::remove_dir_all(state_dir).ok();

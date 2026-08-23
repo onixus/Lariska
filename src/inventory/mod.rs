@@ -1,6 +1,9 @@
 use crate::model::SoftwareEntry;
 use std::time::Duration;
 
+pub mod environment;
+pub mod runtimes;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
@@ -42,28 +45,39 @@ pub async fn collect_all() -> CollectorResult {
 }
 
 pub async fn collect_all_with_timeout(timeout: Duration) -> CollectorResult {
-    #[cfg(target_os = "linux")]
-    {
-        linux::collect(timeout).await
-    }
-    #[cfg(target_os = "windows")]
-    {
-        windows::collect(timeout).await
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos::collect(timeout).await
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    {
-        let _ = timeout;
-        CollectorResult {
-            entries: Vec::new(),
-            warnings: vec![
-                "software collection is not supported on this operating system".to_string(),
-            ],
+    #[allow(unused_mut)]
+    let mut result = {
+        #[cfg(target_os = "linux")]
+        {
+            linux::collect(timeout).await
         }
-    }
+        #[cfg(target_os = "windows")]
+        {
+            windows::collect(timeout).await
+        }
+        #[cfg(target_os = "macos")]
+        {
+            macos::collect(timeout).await
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        {
+            let _ = timeout;
+            CollectorResult {
+                entries: Vec::new(),
+                warnings: vec![
+                    "software collection is not supported on this operating system".to_string(),
+                ],
+            }
+        }
+    };
+
+    // Collect language runtimes & package ecosystems (Python, Node.js, Java)
+    let runtime_entries = tokio::task::spawn_blocking(runtimes::collect_all_runtimes)
+        .await
+        .unwrap_or_default();
+    result.entries.extend(runtime_entries);
+
+    result
 }
 
 /// Outcome of attempting to run an external collector command.
@@ -75,8 +89,52 @@ pub(crate) enum CommandRunError {
     Other(String),
 }
 
+use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "linux")]
+pub(crate) const TRUSTED_SYSTEM_DIRS: &[&str] =
+    &["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin"];
+
+#[cfg(target_os = "macos")]
+pub(crate) const TRUSTED_SYSTEM_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/opt/local/bin",
+];
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) const TRUSTED_SYSTEM_DIRS: &[&str] = &[];
+
+/// Resolves a binary name against trusted system directories only.
+/// Prevents PATH-hijacking vulnerabilities by never searching ambient `$PATH`.
+pub(crate) fn find_trusted_binary(binary_name: &str) -> Option<PathBuf> {
+    // If a relative path or traversal is passed, reject or check strictly
+    if binary_name.contains('/') || binary_name.contains('\\') || binary_name.contains("..") {
+        let path = Path::new(binary_name);
+        if path.is_absolute()
+            && TRUSTED_SYSTEM_DIRS.iter().any(|dir| path.starts_with(dir))
+            && path.is_file()
+        {
+            return Some(path.to_path_buf());
+        }
+        return None;
+    }
+
+    for dir in TRUSTED_SYSTEM_DIRS {
+        let candidate = Path::new(dir).join(binary_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Runs `program` with a timeout and a bounded-size, no-shell-interpolation
-/// argument list (Plan.md §10.1/§14).
+/// argument list, strictly using trusted system paths (Plan.md §10.1/§14).
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 pub(crate) async fn run_command(
     program: &str,
@@ -85,7 +143,9 @@ pub(crate) async fn run_command(
 ) -> Result<String, CommandRunError> {
     use std::process::Stdio;
 
-    let mut command = tokio::process::Command::new(program);
+    let executable = find_trusted_binary(program).ok_or(CommandRunError::NotFound)?;
+
+    let mut command = tokio::process::Command::new(&executable);
     command
         .args(args)
         .stdin(Stdio::null())
@@ -99,7 +159,8 @@ pub(crate) async fn run_command(
         }
         Err(error) => {
             return Err(CommandRunError::Other(format!(
-                "failed to start {program}: {error}"
+                "failed to start {}: {error}",
+                executable.display()
             )))
         }
     };
@@ -135,5 +196,27 @@ pub(crate) fn non_empty(value: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_trusted_binary_rejects_untrusted_paths() {
+        assert!(find_trusted_binary("/tmp/malicious_bin").is_none());
+        assert!(find_trusted_binary("../../../bin/sh").is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn find_trusted_binary_finds_standard_utilities() {
+        // `sh` exists on virtually all Unix-like systems in /bin or /usr/bin
+        let sh = find_trusted_binary("sh");
+        assert!(
+            sh.is_some(),
+            "expected to locate 'sh' in trusted system directories"
+        );
     }
 }

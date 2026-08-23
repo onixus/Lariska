@@ -149,6 +149,100 @@ impl InventorySnapshot {
     pub fn to_canonical_json(&self) -> String {
         serde_json::to_string(self).expect("InventorySnapshot serialization must not fail")
     }
+
+    /// Calculates the delta (added, removed, modified software) between `self` (current snapshot)
+    /// and a `previous` snapshot for delta-synchronization.
+    pub fn diff(&self, previous: &InventorySnapshot) -> InventoryDelta {
+        let prev_map: BTreeMap<String, &SoftwareEntry> = previous
+            .software
+            .iter()
+            .map(|entry| (entry.comparison_key(), entry))
+            .collect();
+
+        let curr_map: BTreeMap<String, &SoftwareEntry> = self
+            .software
+            .iter()
+            .map(|entry| (entry.comparison_key(), entry))
+            .collect();
+
+        let mut changes = Vec::new();
+
+        // Check for added or modified entries in current snapshot
+        for (key, curr_entry) in &curr_map {
+            match prev_map.get(key) {
+                Some(prev_entry) => {
+                    if curr_entry.version != prev_entry.version {
+                        changes.push(SoftwareDeltaItem {
+                            action: DeltaAction::Modified,
+                            entry: (*curr_entry).clone(),
+                            previous_version: prev_entry.version.clone(),
+                        });
+                    }
+                }
+                None => {
+                    changes.push(SoftwareDeltaItem {
+                        action: DeltaAction::Added,
+                        entry: (*curr_entry).clone(),
+                        previous_version: None,
+                    });
+                }
+            }
+        }
+
+        // Check for removed entries that were in previous snapshot
+        for (key, prev_entry) in &prev_map {
+            if !curr_map.contains_key(key) {
+                changes.push(SoftwareDeltaItem {
+                    action: DeltaAction::Removed,
+                    entry: (*prev_entry).clone(),
+                    previous_version: prev_entry.version.clone(),
+                });
+            }
+        }
+
+        // Sort deterministically by entry comparison key
+        changes.sort_by(|left, right| {
+            left.entry
+                .comparison_key()
+                .cmp(&right.entry.comparison_key())
+        });
+
+        InventoryDelta {
+            schema_version: self.schema_version,
+            snapshot_id: self.snapshot_id.clone(),
+            base_snapshot_id: previous.snapshot_id.clone(),
+            agent_id: self.agent_id.clone(),
+            collected_at: self.collected_at.clone(),
+            software_changes: changes,
+            collector_warnings: self.collector_warnings.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeltaAction {
+    Added,
+    Removed,
+    Modified,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SoftwareDeltaItem {
+    pub action: DeltaAction,
+    pub entry: SoftwareEntry,
+    pub previous_version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InventoryDelta {
+    pub schema_version: u16,
+    pub snapshot_id: String,
+    pub base_snapshot_id: String,
+    pub agent_id: String,
+    pub collected_at: String,
+    pub software_changes: Vec<SoftwareDeltaItem>,
+    pub collector_warnings: Vec<String>,
 }
 
 #[derive(
@@ -190,6 +284,9 @@ pub enum SoftwareSource {
     Winreg,
     Msi,
     Brew,
+    Pip,
+    Npm,
+    Java,
     #[default]
     Other,
 }
@@ -203,15 +300,14 @@ impl SoftwareSource {
             Self::Winreg => "winreg",
             Self::Msi => "msi",
             Self::Brew => "brew",
+            Self::Pip => "pip",
+            Self::Npm => "npm",
+            Self::Java => "java",
             Self::Other => "other",
         }
     }
 
-    /// Maps a collector-reported source name onto the server's closed enum.
-    /// Anything the server doesn't recognize (e.g. `pacman`, `snap`,
-    /// `flatpak`) becomes `other` — the server would reject an unknown
-    /// literal outright. Used by the Phase L3 collectors.
-    #[allow(dead_code)]
+    /// Maps a collector-reported source name onto the software source enum.
     pub fn from_raw(raw: &str) -> Self {
         match raw.to_ascii_lowercase().as_str() {
             "apt" => Self::Apt,
@@ -220,6 +316,9 @@ impl SoftwareSource {
             "winreg" => Self::Winreg,
             "msi" => Self::Msi,
             "brew" => Self::Brew,
+            "pip" | "python" => Self::Pip,
+            "npm" | "node" | "nodejs" => Self::Npm,
+            "java" | "jar" | "jdk" | "jre" => Self::Java,
             _ => Self::Other,
         }
     }
@@ -381,6 +480,52 @@ mod tests {
         snapshot
             .validate()
             .expect("Shapoclyack's fixture must pass Lariska's own validation");
+    }
+
+    #[test]
+    fn snapshot_diff_computes_added_removed_and_modified() {
+        let prev = fixture_snapshot(vec![
+            software("bash", Some("x64"), Some("5.1"), "dpkg"),
+            software("curl", Some("x64"), Some("7.88"), "dpkg"),
+            software("nginx", Some("x64"), Some("1.22"), "dpkg"),
+        ]);
+
+        let curr = fixture_snapshot(vec![
+            software("bash", Some("x64"), Some("5.2"), "dpkg"), // modified
+            software("curl", Some("x64"), Some("7.88"), "dpkg"), // unchanged
+            software("git", Some("x64"), Some("2.40"), "dpkg"), // added
+                                                                // nginx removed
+        ]);
+
+        let delta = curr.diff(&prev);
+        assert_eq!(delta.base_snapshot_id, prev.snapshot_id);
+        assert_eq!(delta.snapshot_id, curr.snapshot_id);
+        assert_eq!(delta.software_changes.len(), 3);
+
+        let bash_change = delta
+            .software_changes
+            .iter()
+            .find(|c| c.entry.name == "bash")
+            .expect("bash change present");
+        assert_eq!(bash_change.action, DeltaAction::Modified);
+        assert_eq!(bash_change.previous_version.as_deref(), Some("5.1"));
+        assert_eq!(bash_change.entry.version.as_deref(), Some("5.2"));
+
+        let git_change = delta
+            .software_changes
+            .iter()
+            .find(|c| c.entry.name == "git")
+            .expect("git change present");
+        assert_eq!(git_change.action, DeltaAction::Added);
+        assert_eq!(git_change.previous_version, None);
+
+        let nginx_change = delta
+            .software_changes
+            .iter()
+            .find(|c| c.entry.name == "nginx")
+            .expect("nginx change present");
+        assert_eq!(nginx_change.action, DeltaAction::Removed);
+        assert_eq!(nginx_change.previous_version.as_deref(), Some("1.22"));
     }
 
     #[test]

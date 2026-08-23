@@ -46,6 +46,13 @@ fn run_internal(
     let config = Config::from_file_and_env(config_path).map_err(|error| error.to_string())?;
     telemetry::init(&config.log_level);
 
+    // Initialize panic hook for crash recovery & reporting
+    crate::crash::init_panic_hook(config.state_dir.clone());
+    crate::crash::check_and_report_previous_crash(&config.state_dir);
+
+    // Set background priority for the agent process
+    crate::qos::set_background_priority();
+
     if running_as_service && !config.state_dir.is_absolute() {
         return Err("state_dir must be an absolute path when running with --service".to_string());
     }
@@ -88,7 +95,13 @@ async fn run_async(
     .map_err(|error| error.to_string())?;
 
     let hostname = gethostname::gethostname().to_string_lossy().into_owned();
-    let labels = BTreeMap::new();
+    let mut labels = inventory::environment::detect_environment().to_labels();
+    let power_source = if crate::qos::is_on_battery() {
+        "battery"
+    } else {
+        "ac"
+    };
+    labels.insert("host.power_source".to_string(), power_source.to_string());
 
     register_with_retry(
         &heartbeat_client,
@@ -199,6 +212,13 @@ fn build_snapshot(
     let collected_at = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|error| format!("failed to format timestamp: {error}"))?;
+    let mut labels = inventory::environment::detect_environment().to_labels();
+    let power_source = if crate::qos::is_on_battery() {
+        "battery"
+    } else {
+        "ac"
+    };
+    labels.insert("host.power_source".to_string(), power_source.to_string());
 
     Ok(InventorySnapshot::new(
         snapshot_id,
@@ -210,7 +230,7 @@ fn build_snapshot(
         None,
         Some(std::env::consts::ARCH.to_string()),
         env!("CARGO_PKG_VERSION").to_string(),
-        BTreeMap::new(),
+        labels,
         identifiers,
         collected.entries,
         collected.warnings,
@@ -266,20 +286,19 @@ pub fn print_inventory() {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("failed to start async runtime: {error}");
+            eprintln!("failed to initialize runtime: {error}");
             return;
         }
     };
 
-    let collected = runtime.block_on(inventory::collect_all());
-    let identifiers = identity::platform_identifiers();
+    let (collected, identifiers) = runtime.block_on(async {
+        (
+            inventory::collect_all().await,
+            identity::platform_identifiers(),
+        )
+    });
+
     let snapshot = diagnostic_snapshot(collected, identifiers);
-
-    if let Err(error) = snapshot.validate() {
-        eprintln!("Inventory snapshot validation failed: {error}");
-        return;
-    }
-
     println!("{}", snapshot.to_canonical_json());
 }
 
@@ -287,6 +306,14 @@ fn diagnostic_snapshot(
     collected: CollectorResult,
     identifiers: Vec<crate::model::EndpointIdentifier>,
 ) -> InventorySnapshot {
+    let mut labels = inventory::environment::detect_environment().to_labels();
+    let power_source = if crate::qos::is_on_battery() {
+        "battery"
+    } else {
+        "ac"
+    };
+    labels.insert("host.power_source".to_string(), power_source.to_string());
+
     InventorySnapshot::new(
         "diagnostic-snapshot".to_string(),
         "agent_00000000000000000000000000000000".to_string(),
@@ -297,7 +324,7 @@ fn diagnostic_snapshot(
         None,
         Some(std::env::consts::ARCH.to_string()),
         env!("CARGO_PKG_VERSION").to_string(),
-        BTreeMap::new(),
+        labels,
         identifiers,
         collected.entries,
         collected.warnings,

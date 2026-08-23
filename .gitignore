@@ -7,3 +7,4 @@
 *.cdx.json
 /dist/
 .cargo/config.toml
+.DS_Store
