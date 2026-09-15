@@ -205,7 +205,7 @@ mod contract_tests {
 
     async fn mount_exchange(server: &MockServer) {
         Mock::given(method("POST"))
-            .and(path("/api/v1/auth/exchange"))
+            .and(path(crate::auth::AUTH_EXCHANGE_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "test-jwt",
                 "token_type": "bearer",
