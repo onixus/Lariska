@@ -73,11 +73,6 @@ impl ApiClient {
         })
     }
 
-    /// POSTs a JSON body and classifies the response. `idempotency_key`, when
-    /// set, is sent as `Idempotency-Key` — the header is currently advisory
-    /// only (the live Shapoclyack ingestion endpoint keys idempotency off the
-    /// `snapshot_id` field in the body, not this header) but is sent anyway
-    /// for spec compliance and forward compatibility.
     /// The configured HTTP client, for the one caller that needs a plain GET:
     /// fetching an offered build (#358). Shared rather than a second client so
     /// the download inherits the same TLS trust -- including the internal CA in
@@ -86,6 +81,11 @@ impl ApiClient {
         &self.http
     }
 
+    /// POSTs a JSON body and classifies the response. `idempotency_key`, when
+    /// set, is sent as `Idempotency-Key` — the header is currently advisory
+    /// only (the live Shapoclyack ingestion endpoint keys idempotency off the
+    /// `snapshot_id` field in the body, not this header) but is sent anyway
+    /// for spec compliance and forward compatibility.
     pub async fn post_json<B, R>(
         &self,
         path: &str,

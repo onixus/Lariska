@@ -124,13 +124,28 @@ pub fn apply_settings(
     applied: Option<u64>,
     runtime: &tokio::sync::watch::Sender<Runtime>,
 ) -> Option<u64> {
-    let revision = directive.managed_revision?;
-    if applied == Some(revision) {
-        return applied;
-    }
     let Some(settings) = directive.managed_settings.as_ref() else {
-        return Some(revision);
+        return directive.managed_revision.or(applied);
     };
+
+    match directive.managed_revision {
+        Some(revision) if applied == Some(revision) => return applied,
+        // A policy with no revision on it still has to take effect: an older
+        // console, or a path that does not stamp one, would otherwise have its
+        // settings accepted there and silently dropped here. Deduplicated on
+        // the settings themselves instead, so the repeat on every beat does
+        // not re-log or reload the filter.
+        None => {
+            let mut last = last_unversioned_settings()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last.as_ref() == Some(settings) {
+                return applied;
+            }
+            *last = Some(settings.clone());
+        }
+        Some(_) => {}
+    }
 
     let mut next = *runtime.borrow();
     if let Some(secs) = settings.heartbeat_interval_secs {
@@ -152,13 +167,22 @@ pub fn apply_settings(
         runtime.send_replace(next);
     }
     tracing::info!(
-        revision,
+        revision = directive.managed_revision.unwrap_or_default(),
         heartbeat_secs = next.heartbeat_interval.as_secs(),
         inventory_secs = next.inventory_interval.as_secs(),
         log_level = settings.log_level.as_deref().unwrap_or("unchanged"),
         "applied managed settings"
     );
-    Some(revision)
+    directive.managed_revision.or(applied)
+}
+
+/// The last settings applied from a directive that carried no revision. Only
+/// that case needs it: a revision is the server's own way of saying "this is
+/// the same decision as last time".
+fn last_unversioned_settings() -> &'static std::sync::Mutex<Option<ManagedSettings>> {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<Option<ManagedSettings>>> =
+        std::sync::OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// Why an update was not carried out. Separated from a plain error string so

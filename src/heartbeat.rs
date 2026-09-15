@@ -208,6 +208,12 @@ impl HeartbeatClient {
         ticker.tick().await; // first tick fires immediately; skip it, register() already ran once
         let mut applied: Option<u64> = None;
         let mut last_block_reason: Option<String> = None;
+        // The offer that already failed or was refused. The server repeats the
+        // same offer on every beat, and without this the agent would re-fetch
+        // the whole binary once per tick for an offer that cannot succeed --
+        // a mismatched digest or a build for another platform does not become
+        // installable by being tried again. A *different* offer is tried.
+        let mut declined_update: Option<crate::managed::ManagedUpdate> = None;
 
         loop {
             tokio::select! {
@@ -231,10 +237,16 @@ impl HeartbeatClient {
                                 last_block_reason = directive.managed_update_blocked.clone();
                             }
 
-                            if let Some(update) = directive.managed_update.as_ref() {
-                                if let Some(outcome) = self.try_update(update, config).await {
-                                    return outcome;
+                            match directive.managed_update.as_ref() {
+                                Some(update) if declined_update.as_ref() != Some(update) => {
+                                    if let Some(outcome) = self.try_update(update, config).await {
+                                        return outcome;
+                                    }
+                                    declined_update = Some(update.clone());
                                 }
+                                // Either nothing on offer, or the same offer
+                                // this process has already turned down.
+                                _ => {}
                             }
                         }
                         Err(error) => tracing::warn!(%error, "heartbeat failed"),
