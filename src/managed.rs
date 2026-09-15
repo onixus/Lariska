@@ -404,6 +404,84 @@ mod tests {
         assert_eq!(std::fs::read(&exe).unwrap(), b"old build");
     }
 
+    fn config_for(server_url: &str, allow_insecure: bool) -> Config {
+        Config {
+            server_url: server_url.to_string(),
+            provisioning_key_file: std::env::temp_dir().join("key"),
+            state_dir: std::env::temp_dir(),
+            inventory_interval: Duration::from_secs(3600),
+            heartbeat_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(5),
+            tls_ca_file: None,
+            log_level: "info".to_string(),
+            allow_plain_http: true,
+            allow_insecure_updates: allow_insecure,
+            inventory_full_refresh_interval: Duration::from_secs(86_400),
+            max_spool_entries: 200,
+        }
+    }
+
+    fn offered(platform: &str) -> ManagedUpdate {
+        ManagedUpdate {
+            version: "9.9.9".to_string(),
+            platform: platform.to_string(),
+            sha256: "0".repeat(64),
+            size_bytes: Some(1),
+            url: "/api/endpoint/agent/releases/9.9.9/x/download".to_string(),
+        }
+    }
+
+    /// The refusal that makes the whole mechanism safe to have.
+    ///
+    /// Over plain HTTP the build and the digest that vouches for it travel on
+    /// the same connection, so whoever can rewrite one can rewrite both and the
+    /// verification proves nothing. Refused before anything is downloaded, and
+    /// reported as a *decision* rather than as a failure.
+    #[tokio::test]
+    async fn an_upgrade_over_plain_http_is_refused_before_anything_is_fetched() {
+        let config = config_for("http://stand.invalid:8080", false);
+        let outcome = apply_update(
+            &offered(&target_triple()),
+            &config,
+            "token",
+            &reqwest::Client::new(),
+        )
+        .await;
+
+        match outcome {
+            UpdateOutcome::Refused(reason) => {
+                assert!(reason.contains("plain HTTP"), "{reason}");
+                assert!(reason.contains("allow_insecure_updates"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A build for another platform is refused rather than run.
+    ///
+    /// The server looks an upgrade up by (version, platform) and should never
+    /// offer the wrong one, but "the server should not" is not a reason for the
+    /// thing that executes the binary to skip the check.
+    #[tokio::test]
+    async fn a_build_for_another_platform_is_refused() {
+        let config = config_for("https://stand.invalid:8443", false);
+        let outcome = apply_update(
+            &offered("sparc64-unknown-none"),
+            &config,
+            "token",
+            &reqwest::Client::new(),
+        )
+        .await;
+
+        match outcome {
+            UpdateOutcome::Refused(reason) => {
+                assert!(reason.contains("sparc64-unknown-none"), "{reason}");
+                assert!(reason.contains(&target_triple()), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_successful_swap_keeps_the_previous_build_beside_it() {
         let dir = tempdir();
