@@ -4,6 +4,25 @@ All notable changes to the Lariska endpoint inventory agent will be documented i
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-09-15
+
+### Fixed
+- **A transport failure says what it was.** `reqwest::Error`'s Display is
+  "error sending request" for everything below HTTP — a refused connection, a
+  name that does not resolve, a certificate that does not verify — and the
+  distinction lives in the source chain, which was dropped. An operator could
+  not tell "nothing is listening" from "I do not trust that certificate", which
+  are opposite problems with opposite fixes. The chain is now flattened onto
+  the line, bounded at eight levels.
+- **`install-lariska.cmd` finds a relative `/ca` path beside itself.** The
+  binary was resolved with `%~dp0` and the CA against the current directory, so
+  two files in the same folder were looked for in two different places —
+  and "Run as administrator" opens a prompt in `C:\Windows\System32`.
+- **The `KB` list is documented as what it is**: the separately-named updates.
+  Cumulative updates are recorded as `Package_for_RollupFix~…` and name no KB,
+  so a patched host reports a handful of rows rather than dozens. Its
+  cumulative state is the build revision, which is what a match is decided on.
+
 ## [0.3.0] - 2026-09-15
 
 ### Added
