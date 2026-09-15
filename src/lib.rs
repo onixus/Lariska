@@ -7,6 +7,7 @@ pub mod delivery;
 pub mod heartbeat;
 pub mod identity;
 pub mod inventory;
+pub mod managed;
 pub mod model;
 pub mod qos;
 pub mod service;

@@ -21,6 +21,97 @@ pub struct InventorySnapshot {
     pub collector_warnings: Vec<String>,
 }
 
+/// Orders two version strings the way a human reads them: digit runs compare as
+/// numbers, everything else as text.
+///
+/// Plain string ordering is wrong wherever two components differ in digit
+/// count — `"1.10.0"` sorts below `"1.9.0"`, `"22631"` below `"9600"` — and the
+/// inventory is full of both. Neither this nor any other single rule is a
+/// correct version comparison for every packaging ecosystem at once (that is
+/// what the server's per-flavour `version_compare` is for); it only has to
+/// pick the better of two builds of *one* product on *one* host, and it is
+/// applied nowhere else.
+///
+/// `None` sorts below any version: an entry the registry gave no version for
+/// tells us less than one that has a version, so it loses.
+pub fn compare_versions(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    match (left, right) {
+        (None, None) => return Ordering::Equal,
+        (None, Some(_)) => return Ordering::Less,
+        (Some(_), None) => return Ordering::Greater,
+        (Some(_), Some(_)) => {}
+    }
+
+    let mut left_parts = version_chunks(left.unwrap_or_default());
+    let mut right_parts = version_chunks(right.unwrap_or_default());
+
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(a), Some(b)) => {
+                let ordering = match (&a, &b) {
+                    (Chunk::Number(x), Chunk::Number(y)) => x.cmp(y),
+                    (Chunk::Text(x), Chunk::Text(y)) => x.cmp(y),
+                    // A numeric component outranks a textual one at the same
+                    // position: "4.10.08029" against "4.10.08029.BYOD" is
+                    // settled by length below, but "1.0" against "1.beta" is
+                    // this case, and the release beats the pre-release.
+                    (Chunk::Number(_), Chunk::Text(_)) => Ordering::Greater,
+                    (Chunk::Text(_), Chunk::Number(_)) => Ordering::Less,
+                };
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Chunk {
+    Number(u128),
+    Text(String),
+}
+
+/// Splits a version into runs of digits and runs of everything else, dropping
+/// the separators between them. A digit run too long for `u128` is kept as
+/// text rather than truncated to a number that would compare wrongly.
+fn version_chunks(value: &str) -> impl Iterator<Item = Chunk> + '_ {
+    let mut rest = value.trim();
+    std::iter::from_fn(move || {
+        while let Some(first) = rest.chars().next() {
+            if first.is_ascii_digit() || first.is_alphanumeric() {
+                break;
+            }
+            rest = &rest[first.len_utf8()..];
+        }
+        let first = rest.chars().next()?;
+        let numeric = first.is_ascii_digit();
+        let end = rest
+            .char_indices()
+            .find(|(_, c)| c.is_ascii_digit() != numeric || !c.is_alphanumeric())
+            .map(|(index, _)| index)
+            .unwrap_or(rest.len());
+        let (head, tail) = rest.split_at(end);
+        rest = tail;
+        Some(if numeric {
+            match head.trim_start_matches('0') {
+                "" => Chunk::Number(0),
+                trimmed => match trimmed.parse::<u128>() {
+                    Ok(number) => Chunk::Number(number),
+                    Err(_) => Chunk::Text(head.to_string()),
+                },
+            }
+        } else {
+            Chunk::Text(head.to_ascii_lowercase())
+        })
+    })
+}
+
 impl InventorySnapshot {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -61,11 +152,19 @@ impl InventorySnapshot {
     /// Sorts and deduplicates identifiers/software deterministically. Software
     /// entries are deduplicated on the server's comparison key (name +
     /// publisher + architecture + source, excluding version) because the
-    /// server rejects a payload containing two entries with the same key —
-    /// it does not deduplicate for us. When a collision has differing
-    /// versions we keep the greater version string (best-effort heuristic;
-    /// there is no reliable cross-source version ordering) and record a
-    /// `collector_warnings` entry so the drop is visible.
+    /// server holds `UNIQUE(snapshot_id, comparison_key)` and rejects a
+    /// payload carrying two entries with the same key — it does not
+    /// deduplicate for us. A host with two versions of one product installed
+    /// side by side (three Visual C++ redistributables of the same year is
+    /// ordinary on Windows) therefore cannot be represented in full, and the
+    /// greater version is what survives.
+    ///
+    /// "Greater" is decided by [`compare_versions`], not by string order.
+    /// Lexicographically `"1.9.0"` beats `"1.10.0"`, which would have kept the
+    /// *older* build and reported the machine as running software it had
+    /// already replaced — or, in the other direction, hidden the old copy that
+    /// is the one an advisory is about. Every dropped version is named in
+    /// `collector_warnings`, so what could not be sent is at least visible.
     pub fn normalize(&mut self) {
         self.identifiers
             .retain(|identifier| !identifier.value_hash.trim().is_empty());
@@ -81,7 +180,11 @@ impl InventorySnapshot {
         self.software.sort_by(|left, right| {
             left.comparison_key()
                 .cmp(&right.comparison_key())
-                .then_with(|| right.version.cmp(&left.version))
+                .then_with(|| {
+                    // Descending: the survivor of each group is the one
+                    // `deduplicate_software` keeps, which is the first it sees.
+                    compare_versions(right.version.as_deref(), left.version.as_deref())
+                })
         });
         self.deduplicate_software();
     }
@@ -93,11 +196,16 @@ impl InventorySnapshot {
         for entry in self.software.drain(..) {
             match deduped.last() {
                 Some(last) if last.comparison_key() == entry.comparison_key() => {
+                    // Named plainly rather than with Rust's `{:?}`, which
+                    // rendered these as `Some("8.0.61001")` in an operator's
+                    // console.
                     warnings.push(format!(
-                        "duplicate software entry collapsed for key \"{}\": kept version {:?}, dropped version {:?}",
+                        "{} is installed more than once ({}); the server's inventory \
+                         key does not carry a version, so only {} was sent and {} was dropped",
+                        entry.name,
                         entry.comparison_key(),
-                        last.version,
-                        entry.version
+                        last.version.as_deref().unwrap_or("no version"),
+                        entry.version.as_deref().unwrap_or("no version"),
                     ));
                 }
                 _ => deduped.push(entry),
@@ -287,6 +395,11 @@ pub enum SoftwareSource {
     Pip,
     Npm,
     Java,
+    /// A Windows servicing update -- a `KB` id from Component Based Servicing,
+    /// not a product in the uninstall list (#358). Kept separate because it is
+    /// what a Microsoft advisory is actually matched against: an OS build plus
+    /// the updates applied on top of it.
+    Kb,
     #[default]
     Other,
 }
@@ -303,6 +416,7 @@ impl SoftwareSource {
             Self::Pip => "pip",
             Self::Npm => "npm",
             Self::Java => "java",
+            Self::Kb => "kb",
             Self::Other => "other",
         }
     }
@@ -319,6 +433,7 @@ impl SoftwareSource {
             "pip" | "python" => Self::Pip,
             "npm" | "node" | "nodejs" => Self::Npm,
             "java" | "jar" | "jdk" | "jre" => Self::Java,
+            "kb" | "msu" | "hotfix" => Self::Kb,
             _ => Self::Other,
         }
     }
@@ -398,6 +513,73 @@ fn normalize_architecture(value: &str) -> String {
 }
 
 #[cfg(test)]
+mod version_order_tests {
+    use super::compare_versions;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn a_longer_number_wins_over_a_bigger_first_digit() {
+        // The case plain string ordering gets backwards, and the reason this
+        // function exists: lexicographically "1.9.0" beats "1.10.0".
+        assert_eq!(
+            compare_versions(Some("1.10.0"), Some("1.9.0")),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions(Some("1.9.0"), Some("1.10.0")),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn windows_build_numbers_order_numerically() {
+        assert_eq!(
+            compare_versions(Some("10.0.22631.4169"), Some("10.0.9600.1")),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn leading_zeroes_do_not_change_the_number() {
+        assert_eq!(
+            compare_versions(Some("4.10.08029"), Some("4.10.8029")),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn a_suffixed_build_outranks_the_bare_one() {
+        // Seen in the field: Cisco AnyConnect ships 4.10.08029 and
+        // 4.10.08029.BYOD side by side.
+        assert_eq!(
+            compare_versions(Some("4.10.08029.BYOD"), Some("4.10.08029")),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn a_release_outranks_its_pre_release() {
+        assert_eq!(
+            compare_versions(Some("1.0"), Some("1.beta")),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn an_entry_without_a_version_loses() {
+        assert_eq!(compare_versions(None, Some("0.0.1")), Ordering::Less);
+        assert_eq!(compare_versions(Some("0.0.1"), None), Ordering::Greater);
+        assert_eq!(compare_versions(None, None), Ordering::Equal);
+    }
+
+    #[test]
+    fn a_digit_run_too_long_for_u128_does_not_panic_or_truncate() {
+        let huge = "9".repeat(60);
+        assert_eq!(compare_versions(Some(&huge), Some(&huge)), Ordering::Equal);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -428,10 +610,33 @@ mod tests {
 
         assert_eq!(snapshot.software.len(), 1);
         assert_eq!(snapshot.software[0].version.as_deref(), Some("2.0"));
-        assert!(snapshot
+        let warning = snapshot
             .collector_warnings
             .iter()
-            .any(|warning| warning.contains("duplicate software entry collapsed")));
+            .find(|warning| warning.contains("installed more than once"))
+            .expect("the drop must be visible");
+        // Both versions are named: what was sent and what could not be. An
+        // operator reading this has to be able to tell which copy the
+        // inventory is missing.
+        assert!(warning.contains("2.0"), "{warning}");
+        assert!(warning.contains("1.0"), "{warning}");
+        assert!(
+            !warning.contains("Some("),
+            "Rust Debug output leaked: {warning}"
+        );
+    }
+
+    #[test]
+    fn the_collapse_keeps_the_newer_build_not_the_lexicographically_larger() {
+        // Before natural ordering this kept 1.9.0 and dropped 1.10.0, so the
+        // inventory named a build the host had already replaced.
+        let snapshot = fixture_snapshot(vec![
+            software("agent", Some("amd64"), Some("1.9.0"), "dpkg"),
+            software("agent", Some("amd64"), Some("1.10.0"), "dpkg"),
+        ]);
+
+        assert_eq!(snapshot.software.len(), 1);
+        assert_eq!(snapshot.software[0].version.as_deref(), Some("1.10.0"));
     }
 
     #[test]

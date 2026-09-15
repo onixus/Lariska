@@ -2,9 +2,10 @@ use crate::api::{ApiClient, ApiError};
 use crate::auth::AuthClient;
 use crate::config::Config;
 use crate::delivery::DeliveryClient;
-use crate::heartbeat::HeartbeatClient;
+use crate::heartbeat::{self, HeartbeatClient};
 use crate::identity;
 use crate::inventory::{self, CollectorResult};
+use crate::managed;
 use crate::model::{EndpointIdentifier, InventorySnapshot};
 use crate::{service, telemetry};
 use std::collections::BTreeMap;
@@ -38,12 +39,32 @@ pub fn default_service_config_path() -> std::path::PathBuf {
     std::path::PathBuf::from(r"C:\ProgramData\Lariska\config\lariska.toml")
 }
 
+/// Where the service writes a failure it hit before the configuration — and
+/// therefore the configured `state_dir` — was readable. Fixed rather than
+/// derived for exactly that reason.
+#[cfg(windows)]
+pub fn default_service_state_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(r"C:\ProgramData\Lariska\state")
+}
+
 fn run_internal(
     config_path: &Path,
     running_as_service: bool,
     external_shutdown: Option<std::sync::Arc<tokio::sync::Notify>>,
 ) -> Result<(), String> {
     let config = Config::from_file_and_env(config_path).map_err(|error| error.to_string())?;
+    // Under the Windows SCM stdout goes nowhere, so a service that logs there
+    // cannot be diagnosed at all; log into the state directory instead. Only
+    // on Windows: the systemd unit and launchd job also pass `--service`, and
+    // there stdout is exactly where the log belongs (journald / the plist's
+    // StandardOutPath).
+    #[cfg(windows)]
+    if running_as_service {
+        telemetry::init_to_file(&config.log_level, &config.state_dir.join("lariska.log"));
+    } else {
+        telemetry::init(&config.log_level);
+    }
+    #[cfg(not(windows))]
     telemetry::init(&config.log_level);
 
     // Initialize panic hook for crash recovery & reporting
@@ -121,16 +142,22 @@ async fn run_async(
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // What the loops actually run on, as opposed to what the file said at
+    // startup: the server can change it while they run (#358).
+    let (runtime_tx, runtime_rx) =
+        tokio::sync::watch::channel(managed::Runtime::from_config(&config));
     let heartbeat_loop = heartbeat_client.run_loop(
         &identity.agent_id,
-        config.heartbeat_interval,
+        runtime_rx.clone(),
+        &runtime_tx,
+        &config,
         shutdown_rx.clone(),
     );
     let inventory_loop = inventory_loop(
         &delivery_client,
         &identity.agent_id,
         &hostname,
-        config.inventory_interval,
+        runtime_rx,
         shutdown_rx,
     );
 
@@ -141,8 +168,13 @@ async fn run_async(
         }
     };
 
+    let mut updated_to: Option<String> = None;
     tokio::select! {
-        () = heartbeat_loop => {}
+        outcome = heartbeat_loop => {
+            if let heartbeat::LoopOutcome::Updated { version } = outcome {
+                updated_to = Some(version);
+            }
+        }
         () = inventory_loop => {}
         () = service::wait_for_shutdown_signal() => {
             tracing::info!("shutdown signal received, stopping");
@@ -152,6 +184,18 @@ async fn run_async(
             tracing::info!("external stop request received, stopping");
             let _ = shutdown_tx.send(true);
         }
+    }
+
+    // A staged upgrade only becomes the running agent when this process ends
+    // and something starts the binary that is now on disk. Reported as an
+    // error rather than a clean stop on purpose: systemd's `Restart=always`
+    // would cover either, but the Windows SCM restarts a service only when it
+    // *fails*, and a clean exit there would leave the machine with the new
+    // build installed and nothing running it.
+    if let Some(version) = updated_to {
+        return Err(format!(
+            "restarting to run the newly installed build {version}"
+        ));
     }
 
     Ok(())
@@ -164,10 +208,10 @@ async fn inventory_loop(
     delivery_client: &DeliveryClient,
     agent_id: &str,
     hostname: &str,
-    interval: Duration,
+    mut runtime: tokio::sync::watch::Receiver<managed::Runtime>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = tokio::time::interval(runtime.borrow().inventory_interval);
 
     loop {
         tokio::select! {
@@ -175,6 +219,17 @@ async fn inventory_loop(
                 if let Err(error) = collect_and_submit(delivery_client, agent_id, hostname).await {
                     tracing::warn!(%error, "inventory collection/submission failed");
                 }
+            }
+            changed = runtime.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                // `interval` cannot be re-paced, so it is replaced. The first
+                // tick of a fresh interval fires immediately and is consumed
+                // here: a policy change must not trigger an extra collection
+                // on top of the schedule it just set.
+                ticker = tokio::time::interval(runtime.borrow().inventory_interval);
+                ticker.tick().await;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -220,14 +275,20 @@ fn build_snapshot(
     };
     labels.insert("host.power_source".to_string(), power_source.to_string());
 
+    let os_release = inventory::environment::detect_os_release();
+
     Ok(InventorySnapshot::new(
         snapshot_id,
         agent_id.to_string(),
         collected_at,
         hostname.to_string(),
         Some(std::env::consts::OS.to_string()),
-        Some(std::env::consts::OS.to_string()),
-        None,
+        Some(
+            os_release
+                .name
+                .unwrap_or_else(|| std::env::consts::OS.to_string()),
+        ),
+        os_release.version,
         Some(std::env::consts::ARCH.to_string()),
         env!("CARGO_PKG_VERSION").to_string(),
         labels,
@@ -314,14 +375,20 @@ fn diagnostic_snapshot(
     };
     labels.insert("host.power_source".to_string(), power_source.to_string());
 
+    let os_release = inventory::environment::detect_os_release();
+
     InventorySnapshot::new(
         "diagnostic-snapshot".to_string(),
         "agent_00000000000000000000000000000000".to_string(),
         "1970-01-01T00:00:00Z".to_string(),
         "localhost".to_string(),
         Some(std::env::consts::OS.to_string()),
-        Some(std::env::consts::OS.to_string()),
-        None,
+        Some(
+            os_release
+                .name
+                .unwrap_or_else(|| std::env::consts::OS.to_string()),
+        ),
+        os_release.version,
         Some(std::env::consts::ARCH.to_string()),
         env!("CARGO_PKG_VERSION").to_string(),
         labels,

@@ -155,6 +155,162 @@ fn classify_dmi(vendor: &str, product: &str) -> (Option<&'static str>, Option<&'
     }
 }
 
+/// Product name and version of the running OS, as the inventory schema wants
+/// them: `name` is what an operator calls the machine's OS ("Windows 11 Pro"),
+/// `version` is what a matcher parses ("10.0.22631.4169"). Either may be
+/// `None` on a platform whose collector has not been written yet; the caller
+/// falls back to `std::env::consts::OS` for the name and sends no version.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OsRelease {
+    pub name: Option<String>,
+    pub version: Option<String>,
+}
+
+/// Reads the OS product name and version from the platform.
+///
+/// Windows is the only platform implemented here (#358). Linux and macOS still
+/// report `std::env::consts::OS` with no version, which is why their inventory
+/// matches as `unknown_distro` server-side — tracked separately.
+pub fn detect_os_release() -> OsRelease {
+    #[cfg(target_os = "windows")]
+    {
+        windows_os_release()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        OsRelease::default()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_os_release() -> OsRelease {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let key = match hklm
+        .open_subkey_with_flags("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", KEY_READ)
+    {
+        Ok(key) => key,
+        Err(_) => return OsRelease::default(),
+    };
+
+    let product: Option<String> = key.get_value("ProductName").ok();
+    let build: Option<String> = key.get_value("CurrentBuildNumber").ok();
+    let major: Option<u32> = key.get_value("CurrentMajorVersionNumber").ok();
+    let minor: Option<u32> = key.get_value("CurrentMinorVersionNumber").ok();
+    let ubr: Option<u32> = key.get_value("UBR").ok();
+    let installation_type: Option<String> = key.get_value("InstallationType").ok();
+
+    let build_number = build
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u32>().ok());
+
+    OsRelease {
+        name: product.map(|product| {
+            windows_product_name(&product, build_number, installation_type.as_deref())
+        }),
+        version: windows_version_string(major, minor, build.as_deref(), ubr),
+    }
+}
+
+/// Windows 11 keeps reporting `ProductName` as "Windows 10 …" — the edition was
+/// never rewritten in the registry, and Microsoft's own guidance is to read the
+/// build number instead. Client builds from 22000 up are Windows 11; Server
+/// installations keep whatever name they were given.
+#[cfg(target_os = "windows")]
+fn windows_product_name(
+    product: &str,
+    build: Option<u32>,
+    installation_type: Option<&str>,
+) -> String {
+    let is_client = installation_type
+        .map(|value| value.eq_ignore_ascii_case("Client"))
+        .unwrap_or(true);
+
+    if is_client && build.map(|build| build >= 22000).unwrap_or(false) {
+        if let Some(rest) = product.strip_prefix("Windows 10") {
+            return format!("Windows 11{rest}");
+        }
+    }
+
+    product.to_string()
+}
+
+/// `major.minor.build.ubr`, the form MSRC and the Update Guide use. Anything the
+/// registry does not answer is dropped from the right, so a machine missing
+/// `UBR` still reports `10.0.22631` rather than a version with an empty field.
+#[cfg(target_os = "windows")]
+fn windows_version_string(
+    major: Option<u32>,
+    minor: Option<u32>,
+    build: Option<&str>,
+    ubr: Option<u32>,
+) -> Option<String> {
+    let build = build.map(str::trim).filter(|value| !value.is_empty())?;
+    let major = major?;
+    let minor = minor.unwrap_or(0);
+
+    Some(match ubr {
+        Some(ubr) => format!("{major}.{minor}.{build}.{ubr}"),
+        None => format!("{major}.{minor}.{build}"),
+    })
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_release_tests {
+    use super::{windows_product_name, windows_version_string};
+
+    #[test]
+    fn renames_windows_10_product_on_a_windows_11_client_build() {
+        assert_eq!(
+            windows_product_name("Windows 10 Pro", Some(22631), Some("Client")),
+            "Windows 11 Pro"
+        );
+    }
+
+    #[test]
+    fn leaves_the_product_name_alone_below_the_windows_11_build() {
+        assert_eq!(
+            windows_product_name("Windows 10 Pro", Some(19045), Some("Client")),
+            "Windows 10 Pro"
+        );
+    }
+
+    #[test]
+    fn leaves_server_names_alone_even_on_a_high_build() {
+        assert_eq!(
+            windows_product_name("Windows Server 2025 Standard", Some(26100), Some("Server")),
+            "Windows Server 2025 Standard"
+        );
+    }
+
+    #[test]
+    fn builds_the_four_part_version() {
+        assert_eq!(
+            windows_version_string(Some(10), Some(0), Some("22631"), Some(4169)).as_deref(),
+            Some("10.0.22631.4169")
+        );
+    }
+
+    #[test]
+    fn drops_the_revision_when_the_registry_has_no_ubr() {
+        assert_eq!(
+            windows_version_string(Some(10), Some(0), Some("22631"), None).as_deref(),
+            Some("10.0.22631")
+        );
+    }
+
+    #[test]
+    fn reports_no_version_without_a_build_number() {
+        assert_eq!(
+            windows_version_string(Some(10), Some(0), None, Some(4169)),
+            None
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

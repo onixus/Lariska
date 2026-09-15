@@ -329,6 +329,7 @@ mod contract_tests {
             tls_ca_file: None,
             log_level: "info".to_string(),
             allow_plain_http: true,
+            allow_insecure_updates: false,
             inventory_full_refresh_interval: Duration::from_secs(86_400),
             max_spool_entries: 200,
         };
@@ -346,7 +347,7 @@ mod contract_tests {
 
     async fn mount_exchange(server: &MockServer) {
         Mock::given(method("POST"))
-            .and(path("/api/v1/auth/exchange"))
+            .and(path(crate::auth::AUTH_EXCHANGE_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "test-jwt",
                 "token_type": "bearer",

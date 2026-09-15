@@ -144,6 +144,38 @@ pub mod windows_scm {
     fn service_main(_arguments: Vec<OsString>) {
         if let Err(error) = run_service() {
             tracing::error!(%error, "Windows service run failed");
+            record_startup_failure(&error);
+        }
+    }
+
+    /// Writes a startup failure to a file, in addition to the `tracing` call
+    /// above.
+    ///
+    /// The SCM attaches no console, and the subscriber is installed only after
+    /// the configuration has been read — so the failures an operator most needs
+    /// to see (a missing, unreadable or invalid `lariska.toml`) are precisely
+    /// the ones `tracing` cannot report anywhere. The service then stops with
+    /// `ServiceSpecific(1)` and leaves nothing at all behind.
+    ///
+    /// Best effort by construction: if this path is not writable either, there
+    /// is nothing further to try, and failing to record a failure must not
+    /// change what the service reports about it.
+    fn record_startup_failure(error: &str) {
+        use std::io::Write;
+
+        let dir = crate::app::default_service_state_dir();
+        let _ = std::fs::create_dir_all(&dir);
+
+        let stamp = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "unknown-time".to_string());
+
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("startup-error.log"))
+        {
+            let _ = writeln!(file, "{stamp} service failed to start: {error}");
         }
     }
 
