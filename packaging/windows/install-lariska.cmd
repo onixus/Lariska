@@ -114,10 +114,26 @@ if "%SERVICE_EXISTS%"=="1" (
 
 rem  --- directories --------------------------------------------------------
 
+rem  Tested by existence rather than with `|| exit /b`: when the directory is
+rem  already there mkdir never runs, and `||` would then be judging whatever
+rem  command ran last -- `sc.exe query`, which returns 1 when the service is not
+rem  registered yet.
 echo ==^> Creating directories
-if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%" || exit /b 1
-if not exist "%CONFIG_DIR%" mkdir "%CONFIG_DIR%" || exit /b 1
-if not exist "%STATE_DIR%" mkdir "%STATE_DIR%" || exit /b 1
+if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
+if not exist "%CONFIG_DIR%" mkdir "%CONFIG_DIR%"
+if not exist "%STATE_DIR%" mkdir "%STATE_DIR%"
+if not exist "%INSTALL_DIR%" (
+    echo ERROR: could not create %INSTALL_DIR%.
+    exit /b 1
+)
+if not exist "%CONFIG_DIR%" (
+    echo ERROR: could not create %CONFIG_DIR%.
+    exit /b 1
+)
+if not exist "%STATE_DIR%" (
+    echo ERROR: could not create %STATE_DIR%.
+    exit /b 1
+)
 
 rem  The config holds the provisioning key and the state directory holds the
 rem  delivery spool: both are readable only by SYSTEM and local Administrators.
@@ -130,14 +146,34 @@ icacls "%STATE_DIR%"  /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "*S-1-5-32-544:
 rem  --- files --------------------------------------------------------------
 
 echo ==^> Installing the binary into %INSTALL_DIR%
-copy /y "%SOURCE_EXE%" "%TARGET_EXE%" >nul || exit /b 1
+copy /y "%SOURCE_EXE%" "%TARGET_EXE%" >nul
+if not exist "%TARGET_EXE%" (
+    echo ERROR: could not copy lariska.exe to %TARGET_EXE%.
+    exit /b 1
+)
 
 rem  `set /p` with no newline: the agent reads the whole file as the key, and a
 rem  trailing CRLF would be part of it.
+rem
+rem  No `|| exit /b` on this line: `set /p` reports ERRORLEVEL 1 when its read
+rem  fails, and reading from nul is a failed read by design -- that is what makes
+rem  it write the value without a newline. The `||` therefore fired on every
+rem  run, and the installer exited right here, leaving a config directory that
+rem  held the key and nothing else. The file's existence is the real test.
 echo ==^> Writing the provisioning key
-<nul set /p "=%PROV_KEY%" > "%KEY_FILE%" || exit /b 1
+<nul set /p "=%PROV_KEY%" > "%KEY_FILE%"
+if not exist "%KEY_FILE%" (
+    echo ERROR: could not write %KEY_FILE%.
+    exit /b 1
+)
 
-if defined CA_FILE copy /y "%CA_FILE%" "%CA_DEST%" >nul || exit /b 1
+if defined CA_FILE (
+    copy /y "%CA_FILE%" "%CA_DEST%" >nul
+    if not exist "%CA_DEST%" (
+        echo ERROR: could not copy the CA bundle to %CA_DEST%.
+        exit /b 1
+    )
+)
 
 echo ==^> Writing the configuration
 > "%CONFIG_FILE%" echo # Written by install-lariska.cmd. See lariska.example.toml
@@ -153,6 +189,11 @@ if "%ALLOW_PLAIN%"=="1" (>>"%CONFIG_FILE%" echo allow_plain_http = true)
 if defined CA_FILE (>>"%CONFIG_FILE%" echo tls_ca_file = '%CA_DEST%')
 
 rem  --- validate before handing the service a config it will reject --------
+
+if not exist "%CONFIG_FILE%" (
+    echo ERROR: could not write %CONFIG_FILE%.
+    exit /b 1
+)
 
 echo ==^> Validating the configuration
 "%TARGET_EXE%" check-config --config "%CONFIG_FILE%"
