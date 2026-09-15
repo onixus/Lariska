@@ -38,6 +38,14 @@ pub fn default_service_config_path() -> std::path::PathBuf {
     std::path::PathBuf::from(r"C:\ProgramData\Lariska\config\lariska.toml")
 }
 
+/// Where the service writes a failure it hit before the configuration — and
+/// therefore the configured `state_dir` — was readable. Fixed rather than
+/// derived for exactly that reason.
+#[cfg(windows)]
+pub fn default_service_state_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(r"C:\ProgramData\Lariska\state")
+}
+
 fn run_internal(
     config_path: &Path,
     running_as_service: bool,
