@@ -203,7 +203,9 @@ fn windows_os_release() -> OsRelease {
     let ubr: Option<u32> = key.get_value("UBR").ok();
     let installation_type: Option<String> = key.get_value("InstallationType").ok();
 
-    let build_number = build.as_deref().and_then(|value| value.trim().parse::<u32>().ok());
+    let build_number = build
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u32>().ok());
 
     OsRelease {
         name: product.map(|product| {
@@ -302,7 +304,10 @@ mod windows_release_tests {
 
     #[test]
     fn reports_no_version_without_a_build_number() {
-        assert_eq!(windows_version_string(Some(10), Some(0), None, Some(4169)), None);
+        assert_eq!(
+            windows_version_string(Some(10), Some(0), None, Some(4169)),
+            None
+        );
     }
 }
 

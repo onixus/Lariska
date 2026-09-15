@@ -4,8 +4,8 @@ use crate::config::Config;
 use crate::delivery::DeliveryClient;
 use crate::heartbeat::{self, HeartbeatClient};
 use crate::identity;
-use crate::managed;
 use crate::inventory::{self, CollectorResult};
+use crate::managed;
 use crate::model::{EndpointIdentifier, InventorySnapshot};
 use crate::{service, telemetry};
 use std::collections::BTreeMap;
@@ -144,7 +144,8 @@ async fn run_async(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     // What the loops actually run on, as opposed to what the file said at
     // startup: the server can change it while they run (#358).
-    let (runtime_tx, runtime_rx) = tokio::sync::watch::channel(managed::Runtime::from_config(&config));
+    let (runtime_tx, runtime_rx) =
+        tokio::sync::watch::channel(managed::Runtime::from_config(&config));
     let heartbeat_loop = heartbeat_client.run_loop(
         &identity.agent_id,
         runtime_rx.clone(),

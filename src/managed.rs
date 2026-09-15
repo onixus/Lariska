@@ -92,14 +92,22 @@ pub fn target_triple() -> String {
     let arch = std::env::consts::ARCH;
 
     if cfg!(target_os = "windows") {
-        let env = if cfg!(target_env = "msvc") { "msvc" } else { "gnu" };
+        let env = if cfg!(target_env = "msvc") {
+            "msvc"
+        } else {
+            "gnu"
+        };
         return format!("{arch}-pc-windows-{env}");
     }
     if cfg!(target_os = "macos") {
         return format!("{arch}-apple-darwin");
     }
     if cfg!(target_os = "linux") {
-        let env = if cfg!(target_env = "musl") { "musl" } else { "gnu" };
+        let env = if cfg!(target_env = "musl") {
+            "musl"
+        } else {
+            "gnu"
+        };
         return format!("{arch}-unknown-linux-{env}");
     }
     format!("{arch}-unknown-{}", std::env::consts::OS)
@@ -159,7 +167,9 @@ pub fn apply_settings(
 #[derive(Debug)]
 pub enum UpdateOutcome {
     /// Swapped in; the process must exit so the supervisor starts the new one.
-    Staged { version: String },
+    Staged {
+        version: String,
+    },
     Refused(String),
     Failed(String),
 }
@@ -200,11 +210,7 @@ pub async fn apply_update(
         }
     };
 
-    let url = format!(
-        "{}{}",
-        config.server_url.trim_end_matches('/'),
-        update.url
-    );
+    let url = format!("{}{}", config.server_url.trim_end_matches('/'), update.url);
     let response = match http
         .get(&url)
         .bearer_auth(token)
@@ -359,7 +365,10 @@ mod tests {
         assert_eq!(applied, Some(7));
         assert_eq!(sender.borrow().heartbeat_interval, Duration::from_secs(30));
         // Untouched by a policy that did not mention it.
-        assert_eq!(sender.borrow().inventory_interval, Duration::from_secs(3600));
+        assert_eq!(
+            sender.borrow().inventory_interval,
+            Duration::from_secs(3600)
+        );
 
         // The server repeats itself on every beat; the agent must not.
         let again = apply_settings(&directive, applied, &sender);
@@ -491,7 +500,10 @@ mod tests {
         swap_binary(&exe, b"new build", "1.2.3", &dir).unwrap();
 
         assert_eq!(std::fs::read(&exe).unwrap(), b"new build");
-        assert_eq!(std::fs::read(with_suffix(&exe, ".old")).unwrap(), b"old build");
+        assert_eq!(
+            std::fs::read(with_suffix(&exe, ".old")).unwrap(),
+            b"old build"
+        );
     }
 
     fn tempdir() -> PathBuf {

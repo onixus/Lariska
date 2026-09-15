@@ -506,7 +506,9 @@ mod managed_contract_tests {
                 "platform": crate::managed::target_triple(),
                 "applied_config_revision": 4
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(info_with(serde_json::json!({}))))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(info_with(serde_json::json!({}))),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -527,7 +529,9 @@ mod managed_contract_tests {
             .and(body_partial_json(
                 serde_json::json!({"agent_kind": "endpoint"}),
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(info_with(serde_json::json!({}))))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(info_with(serde_json::json!({}))),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -548,17 +552,19 @@ mod managed_contract_tests {
         mount_exchange(&server).await;
         Mock::given(method("POST"))
             .and(path(HEARTBEAT_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(info_with(serde_json::json!({
-                "managed_revision": 9,
-                "managed_settings": {"inventory_interval_secs": 900, "log_level": "debug"},
-                "managed_update": {
-                    "version": "0.3.0",
-                    "platform": "x86_64-pc-windows-msvc",
-                    "sha256": "abc",
-                    "size_bytes": 12,
-                    "url": "/api/endpoint/agent/releases/0.3.0/x86_64-pc-windows-msvc/download"
-                }
-            }))))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(info_with(serde_json::json!({
+                    "managed_revision": 9,
+                    "managed_settings": {"inventory_interval_secs": 900, "log_level": "debug"},
+                    "managed_update": {
+                        "version": "0.3.0",
+                        "platform": "x86_64-pc-windows-msvc",
+                        "sha256": "abc",
+                        "size_bytes": 12,
+                        "url": "/api/endpoint/agent/releases/0.3.0/x86_64-pc-windows-msvc/download"
+                    }
+                }))),
+            )
             .mount(&server)
             .await;
 
@@ -578,7 +584,10 @@ mod managed_contract_tests {
             Some(900)
         );
         assert_eq!(
-            directive.managed_update.as_ref().map(|u| u.version.as_str()),
+            directive
+                .managed_update
+                .as_ref()
+                .map(|u| u.version.as_str()),
             Some("0.3.0")
         );
     }
@@ -589,7 +598,9 @@ mod managed_contract_tests {
         mount_exchange(&server).await;
         Mock::given(method("POST"))
             .and(path(HEARTBEAT_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(info_with(serde_json::json!({}))))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(info_with(serde_json::json!({}))),
+            )
             .mount(&server)
             .await;
 

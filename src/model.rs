@@ -178,11 +178,13 @@ impl InventorySnapshot {
         self.software.iter_mut().for_each(SoftwareEntry::normalize);
         self.software.retain(|entry| !entry.name.is_empty());
         self.software.sort_by(|left, right| {
-            left.comparison_key().cmp(&right.comparison_key()).then_with(|| {
-                // Descending: the survivor of each group is the one
-                // `deduplicate_software` keeps, which is the first it sees.
-                compare_versions(right.version.as_deref(), left.version.as_deref())
-            })
+            left.comparison_key()
+                .cmp(&right.comparison_key())
+                .then_with(|| {
+                    // Descending: the survivor of each group is the one
+                    // `deduplicate_software` keeps, which is the first it sees.
+                    compare_versions(right.version.as_deref(), left.version.as_deref())
+                })
         });
         self.deduplicate_software();
     }
@@ -519,8 +521,14 @@ mod version_order_tests {
     fn a_longer_number_wins_over_a_bigger_first_digit() {
         // The case plain string ordering gets backwards, and the reason this
         // function exists: lexicographically "1.9.0" beats "1.10.0".
-        assert_eq!(compare_versions(Some("1.10.0"), Some("1.9.0")), Ordering::Greater);
-        assert_eq!(compare_versions(Some("1.9.0"), Some("1.10.0")), Ordering::Less);
+        assert_eq!(
+            compare_versions(Some("1.10.0"), Some("1.9.0")),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions(Some("1.9.0"), Some("1.10.0")),
+            Ordering::Less
+        );
     }
 
     #[test]
@@ -533,7 +541,10 @@ mod version_order_tests {
 
     #[test]
     fn leading_zeroes_do_not_change_the_number() {
-        assert_eq!(compare_versions(Some("4.10.08029"), Some("4.10.8029")), Ordering::Equal);
+        assert_eq!(
+            compare_versions(Some("4.10.08029"), Some("4.10.8029")),
+            Ordering::Equal
+        );
     }
 
     #[test]
@@ -548,7 +559,10 @@ mod version_order_tests {
 
     #[test]
     fn a_release_outranks_its_pre_release() {
-        assert_eq!(compare_versions(Some("1.0"), Some("1.beta")), Ordering::Greater);
+        assert_eq!(
+            compare_versions(Some("1.0"), Some("1.beta")),
+            Ordering::Greater
+        );
     }
 
     #[test]
@@ -606,7 +620,10 @@ mod tests {
         // inventory is missing.
         assert!(warning.contains("2.0"), "{warning}");
         assert!(warning.contains("1.0"), "{warning}");
-        assert!(!warning.contains("Some("), "Rust Debug output leaked: {warning}");
+        assert!(
+            !warning.contains("Some("),
+            "Rust Debug output leaked: {warning}"
+        );
     }
 
     #[test]

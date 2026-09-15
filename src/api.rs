@@ -216,7 +216,9 @@ mod transport_error_tests {
 
     impl std::error::Error for Layer {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            self.source.as_deref().map(|layer| layer as &dyn std::error::Error)
+            self.source
+                .as_deref()
+                .map(|layer| layer as &dyn std::error::Error)
         }
     }
 
@@ -258,9 +260,7 @@ mod transport_error_tests {
 
     #[test]
     fn a_very_deep_chain_is_bounded() {
-        let error = chain(&[
-            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
-        ]);
+        let error = chain(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]);
         // Eight causes below the headline, and no more: a log line is not a
         // place to print an unbounded structure.
         assert_eq!(describe_causes(&error).matches(": ").count(), 8);

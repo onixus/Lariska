@@ -319,7 +319,9 @@ mod tests {
 
     #[test]
     fn recognises_an_msi_product_guid() {
-        assert!(looks_like_product_guid("{90160000-008C-0000-1000-0000000FF1CE}"));
+        assert!(looks_like_product_guid(
+            "{90160000-008C-0000-1000-0000000FF1CE}"
+        ));
         assert!(!looks_like_product_guid("7-Zip"));
         assert!(!looks_like_product_guid("{not-a-guid}"));
     }

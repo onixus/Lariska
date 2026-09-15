@@ -69,7 +69,9 @@ fn install(filter: EnvFilter, writer: Option<std::fs::File>) {
                     .with_target(false)
                     .with_ansi(false)
                     .with_writer(move || {
-                        file.try_clone().map(LogSink::File).unwrap_or(LogSink::Discard)
+                        file.try_clone()
+                            .map(LogSink::File)
+                            .unwrap_or(LogSink::Discard)
                     }),
             )
             .try_init(),
@@ -110,7 +112,11 @@ pub fn init_to_file(log_level: &str, path: &std::path::Path) {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         Ok(file) => install(base_filter(log_level), Some(file)),
         Err(_) => init(log_level),
     }
