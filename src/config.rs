@@ -185,8 +185,15 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 fn parse_config_file(path: &Path) -> Result<FileConfig, ConfigError> {
-    let content = fs::read_to_string(path)
-        .map_err(|error| ConfigError::Io(format!("failed to read config file: {error}")))?;
+    // The path belongs in the message: under the Windows SCM this is the only
+    // thing an operator sees, and "not found" and "access denied" at a path
+    // they can check are different problems with different fixes.
+    let content = fs::read_to_string(path).map_err(|error| {
+        ConfigError::Io(format!(
+            "failed to read config file {}: {error}",
+            path.display()
+        ))
+    })?;
     parse_toml(&content)
 }
 
