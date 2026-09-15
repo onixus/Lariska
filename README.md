@@ -19,6 +19,9 @@ It collects software inventory, runtime packages (Shadow IT detection), virtuali
   * **PATH-Hijacking Protection**: Strict executable resolution against trusted system directories with directory traversal prevention.
   * **Identifier Hashing**: One-way SHA-256 pseudonymized hardware identifiers (`/etc/machine-id`, `MachineGuid`, `IOPlatformUUID`).
   * **Zero-Leak Telemetry**: Redacted secret paths, in-memory-only JWTs, bounded sanitized error messages.
+* **Remote Management**:
+  * **Settings without a restart**: heartbeat/inventory intervals and log level are set from the Shapoclyack console and take effect on the next tick; `server_url`, the provisioning key, `state_dir` and the transport-security switches are deliberately local-only.
+  * **Verified Self-Upgrade**: an offered build is downloaded over the agent's own TLS trust, checked against a published SHA-256, installed with the previous binary kept beside it, and refused outright over plain HTTP or for a foreign target triple.
 * **Resilient Delivery & Delta Sync**:
   * **zstd Compression**: Spool entries saved as `.json.zst` and transmitted with `Content-Encoding: zstd`.
   * **Spool-then-Submit**: Durable local SQLite/file-based FIFO queue with exponential jittered backoff, terminal quarantine, and crash recovery.
