@@ -47,6 +47,7 @@ inventory_full_refresh_interval_secs = 86400
 max_spool_entries = 200
 log_level = "info"
 allow_plain_http = false
+allow_insecure_updates = false
 ```
 
 For a private certificate authority, add:
@@ -157,12 +158,12 @@ tail -n 100 /Library/Logs/Lariska/lariska.log
 
 ## 5. Windows
 
-Download `lariska-v0.2.0-x86_64-pc-windows-msvc.zip` and its `.sha256` file
+Download `lariska-v0.3.1-x86_64-pc-windows-msvc.zip` and its `.sha256` file
 from the [latest release page](https://github.com/onixus/Lariska/releases/latest),
 and unpack it. From an **elevated command prompt**, in the unpacked directory:
 
 ```bat
-certutil -hashfile lariska-v0.2.0-x86_64-pc-windows-msvc.zip SHA256
+certutil -hashfile lariska-v0.3.1-x86_64-pc-windows-msvc.zip SHA256
 install-lariska.cmd https://shapoclyack.example.com octo-pk-...
 ```
 
@@ -194,6 +195,7 @@ inventory_full_refresh_interval_secs = 86400
 max_spool_entries = 200
 log_level = "info"
 allow_plain_http = false
+allow_insecure_updates = false
 ```
 
 Under the SCM there is no console, so the service logs to
@@ -225,6 +227,49 @@ submits its first inventory snapshot. Confirm all of the following:
 Do not delete `state_dir` during an upgrade: it contains the stable agent
 identity and queued inventory snapshots.
 
+## 7. Remote management
+
+From 0.3.0 an operator changes what an installed agent does, and which build
+it runs, from the Shapoclyack console rather than from the machine. The
+decision travels in the heartbeat response — the only channel that reaches a
+running agent — so nothing has to be opened towards the endpoint.
+
+What the console can change, with no restart and no edit to the local file:
+
+- `heartbeat_interval_secs`
+- `inventory_interval_secs`
+- `log_level`
+
+They take effect on the next tick. The local configuration is not rewritten:
+it remains what the agent falls back to when it restarts and the server has no
+policy for it.
+
+What the console cannot change, by design: `server_url`, the provisioning key
+file, `state_dir`, `allow_plain_http` and `allow_insecure_updates`. An agent
+that accepted a new `server_url` over the network could be told to report
+somewhere else by whoever reached that network, and the instruction would
+arrive through the very channel being used to say it.
+
+### Upgrading an agent from the console
+
+An offered build is downloaded from the Shapoclyack API, checked against the
+SHA-256 digest the server published, and only then installed; the previous
+binary is kept beside it as `lariska.old` so an operator can restore it by
+hand. The agent then exits so that the service manager starts the build now on
+disk — `Restart=always` on systemd, `KeepAlive` on launchd, and the SCM's own
+failure-restart on Windows, which is why the exit is reported as a failure.
+
+An upgrade is refused rather than attempted when:
+
+- the connection is plain HTTP — the build and the digest that vouches for it
+  would travel on the same unprotected connection, so the check proves
+  nothing. `allow_insecure_updates = true` overrides this for a lab stand;
+- the build is for a different target triple than the one this agent runs.
+
+A refused or failed offer is logged once and not retried until the server
+offers something different. The installed build is never touched unless a
+complete, digest-matching download is in hand.
+
 ## Troubleshooting
 
 - `server_url must use HTTPS`: use the HTTPS Shapoclyack origin. Set
@@ -238,6 +283,13 @@ identity and queued inventory snapshots.
   the expected tenant.
 - `request validation failed`: verify that the Lariska and Shapoclyack
   versions support the same endpoint inventory schema.
+- `declined the offered build`: the console offered an upgrade the agent
+  refused — a build for another platform, or an upgrade over plain HTTP. The
+  log line names which.
+- `downloaded build does not match the digest the server published`: nothing
+  was replaced and the agent kept running its current build. Re-publish the
+  release artifact; the digest in the console and the file it points at
+  disagree.
 - Connection timeouts or `503`: verify DNS, firewall, reverse proxy, and
   Shapoclyack health. Lariska retries transient delivery failures and keeps
   unsent snapshots in `state_dir`.

@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cumulative updates are recorded as `Package_for_RollupFix~…` and name no KB,
   so a patched host reports a handful of rows rather than dozens. Its
   cumulative state is the build revision, which is what a match is decided on.
+- **An offer that cannot succeed is not retried every minute.** A build with a
+  mismatched digest, or one for another target triple, was re-downloaded in
+  full on every heartbeat. The refusal is remembered; a *different* offer is
+  still tried.
+- **A managed policy with no revision on it takes effect.** `managed_settings`
+  arriving without `managed_revision` — an older console, or a path that does
+  not stamp one — was accepted in the console and silently dropped on the
+  endpoint. It is now applied, deduplicated on the settings themselves.
+
+### Documentation
+- Remote management is documented where an operator looks for it: what the
+  console can and cannot change, how a console-driven upgrade is verified and
+  when it is refused, and what the `.old` binary beside the installed one is
+  for ([INSTALL.md §7](docs/INSTALL.md), [RELEASE.md](docs/RELEASE.md)).
 
 ## [0.3.0] - 2026-09-15
 

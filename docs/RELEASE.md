@@ -42,8 +42,22 @@ ownership and release-key custody").
 
 ## Upgrade procedure
 
-Lariska has no built-in self-update. Upgrading means replacing the binary
-and restarting the service:
+From 0.3.0 an agent can be upgraded from the Shapoclyack console: the build
+is named in the heartbeat response, downloaded from the API, verified against
+the SHA-256 digest the server published, installed over the running binary
+(the previous one is kept beside it as `lariska.old`), and the process exits
+so the service manager starts the new build. Publishing a release is therefore
+only half of a fleet upgrade — the artifact and its digest have to be
+registered in the console for the version and target triple in question, and
+the triples the agent asks for are exactly the five built below.
+
+An agent refuses an offer over plain HTTP (the build and its digest would
+share one unprotected connection) unless `allow_insecure_updates = true`, and
+refuses a build for a different target triple. See
+[INSTALL.md §7](INSTALL.md#7-remote-management).
+
+The manual path remains supported, and is the one to use when the console is
+not involved — replace the binary and restart the service:
 
 ### Linux (systemd)
 
@@ -76,7 +90,10 @@ sc.exe start Lariska
 
 ## Rollback procedure
 
-Same as upgrade, in reverse: stop the service, restore the previous binary
+After a console-driven upgrade the build that was replaced is still on the
+host, beside the installed one and suffixed `.old`; restoring it is a stop,
+a rename and a start. Otherwise the procedure is the upgrade in reverse: stop
+the service, restore the previous binary
 (keep the last N release archives on hand — they are exactly what was
 downloaded from the GitHub release, no rebuild needed), restart. State
 compatibility: the wire schema is versioned (`schema_version`, currently
