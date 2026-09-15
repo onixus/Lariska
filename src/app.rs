@@ -2,8 +2,9 @@ use crate::api::{ApiClient, ApiError};
 use crate::auth::AuthClient;
 use crate::config::Config;
 use crate::delivery::DeliveryClient;
-use crate::heartbeat::HeartbeatClient;
+use crate::heartbeat::{self, HeartbeatClient};
 use crate::identity;
+use crate::managed;
 use crate::inventory::{self, CollectorResult};
 use crate::model::{EndpointIdentifier, InventorySnapshot};
 use crate::{service, telemetry};
@@ -141,16 +142,21 @@ async fn run_async(
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // What the loops actually run on, as opposed to what the file said at
+    // startup: the server can change it while they run (#358).
+    let (runtime_tx, runtime_rx) = tokio::sync::watch::channel(managed::Runtime::from_config(&config));
     let heartbeat_loop = heartbeat_client.run_loop(
         &identity.agent_id,
-        config.heartbeat_interval,
+        runtime_rx.clone(),
+        &runtime_tx,
+        &config,
         shutdown_rx.clone(),
     );
     let inventory_loop = inventory_loop(
         &delivery_client,
         &identity.agent_id,
         &hostname,
-        config.inventory_interval,
+        runtime_rx,
         shutdown_rx,
     );
 
@@ -161,8 +167,13 @@ async fn run_async(
         }
     };
 
+    let mut updated_to: Option<String> = None;
     tokio::select! {
-        () = heartbeat_loop => {}
+        outcome = heartbeat_loop => {
+            if let heartbeat::LoopOutcome::Updated { version } = outcome {
+                updated_to = Some(version);
+            }
+        }
         () = inventory_loop => {}
         () = service::wait_for_shutdown_signal() => {
             tracing::info!("shutdown signal received, stopping");
@@ -172,6 +183,18 @@ async fn run_async(
             tracing::info!("external stop request received, stopping");
             let _ = shutdown_tx.send(true);
         }
+    }
+
+    // A staged upgrade only becomes the running agent when this process ends
+    // and something starts the binary that is now on disk. Reported as an
+    // error rather than a clean stop on purpose: systemd's `Restart=always`
+    // would cover either, but the Windows SCM restarts a service only when it
+    // *fails*, and a clean exit there would leave the machine with the new
+    // build installed and nothing running it.
+    if let Some(version) = updated_to {
+        return Err(format!(
+            "restarting to run the newly installed build {version}"
+        ));
     }
 
     Ok(())
@@ -184,10 +207,10 @@ async fn inventory_loop(
     delivery_client: &DeliveryClient,
     agent_id: &str,
     hostname: &str,
-    interval: Duration,
+    mut runtime: tokio::sync::watch::Receiver<managed::Runtime>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = tokio::time::interval(runtime.borrow().inventory_interval);
 
     loop {
         tokio::select! {
@@ -195,6 +218,17 @@ async fn inventory_loop(
                 if let Err(error) = collect_and_submit(delivery_client, agent_id, hostname).await {
                     tracing::warn!(%error, "inventory collection/submission failed");
                 }
+            }
+            changed = runtime.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                // `interval` cannot be re-paced, so it is replaced. The first
+                // tick of a fresh interval fires immediately and is consumed
+                // here: a policy change must not trigger an extra collection
+                // on top of the schedule it just set.
+                ticker = tokio::time::interval(runtime.borrow().inventory_interval);
+                ticker.tick().await;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {

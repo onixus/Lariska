@@ -119,3 +119,39 @@ lariska.exe inventory --output json
 Prints the snapshot this host would send — the registry entries, the OS fields
 and the hardware identifier hashes — without a server, a config or a service.
 This is the first thing to run on a new Windows build.
+
+## Remote management
+
+An operator can change what this agent does, and which build it runs, from the
+Shapoclyack console instead of from this machine (#358). The decision travels
+in the heartbeat response — the only channel that reaches a running agent — and
+the agent acts on it:
+
+- **Settings** (`inventory_interval_secs`, `heartbeat_interval_secs`,
+  `log_level` and the rest) take effect on the next tick. No restart, no
+  reinstall. The agent applies a revision once and then ignores the server
+  repeating it.
+- **A build** is downloaded with the same token the agent heartbeats with,
+  checked against the sha256 the heartbeat named, and only then put in place of
+  the installed binary — which is moved aside to `lariska.exe.old`, not
+  deleted, because that is what someone restores by hand if the new build turns
+  out to be broken and nobody is standing next to the machine.
+
+What the server cannot change: `server_url`, the provisioning key and
+`state_dir`. An agent that could be told where to report could be told to
+report somewhere else, through the very channel carrying the instruction.
+
+**An upgrade is refused over plain HTTP.** The build and the digest that
+vouches for it travel on the same connection, so without TLS whoever can
+rewrite one can rewrite both. `allow_insecure_updates = true` overrides it for
+a lab stand, and is deliberately separate from `allow_plain_http`: sending an
+inventory in the clear and executing a binary fetched in the clear are not the
+same decision.
+
+**The restart.** A staged build only runs once the process ends, so the agent
+stops with a failure code and the service control manager starts it again —
+which is why `install-lariska.cmd` sets `sc failure` recovery actions and
+`sc failureflag 1`. Without the flag the SCM applies recovery only to a process
+that died, not to a service that reported `SERVICE_STOPPED` with an error code,
+and the machine would be left with the new build installed and nothing running
+it.

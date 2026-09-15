@@ -1,13 +1,12 @@
 use super::{non_empty, CollectorResult};
 use crate::model::{SoftwareEntry, SoftwareSource};
+use std::collections::BTreeSet;
 use std::time::Duration;
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+use winreg::enums::{HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ};
 use winreg::RegKey;
 
 /// Native and 32-on-64 uninstall registry views. `Win32_Product` (WMI) is
 /// deliberately avoided (Plan.md §10.2: slow, can trigger MSI repair).
-/// Machine scope only in this release — see the open decision on user-scope
-/// inventory for a system-context service in Plan.md §19.
 const UNINSTALL_KEYS: [(&str, &str); 2] = [
     (
         "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
@@ -18,6 +17,29 @@ const UNINSTALL_KEYS: [(&str, &str); 2] = [
         "x86",
     ),
 ];
+
+/// The same two views inside a user hive, which is rooted one level deeper.
+const USER_UNINSTALL_KEYS: [(&str, &str); 2] = [
+    (
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        "x86_64",
+    ),
+    (
+        "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        "x86",
+    ),
+];
+
+/// Where Windows records the servicing updates applied to the running build.
+/// Keys are named `Package_for_KB5034123~31bf3856ad364e35~amd64~~10.0.1.7`.
+const CBS_PACKAGES: &str =
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\Packages";
+
+/// `CurrentState` of a CBS package that is installed. The key exists for
+/// packages that were staged, superseded or removed as well, and counting
+/// those as applied updates would report a host as patched against something
+/// it is not.
+const CBS_STATE_INSTALLED: u32 = 112;
 
 pub async fn collect(_timeout: Duration) -> CollectorResult {
     // Registry reads are synchronous and fast, but run off the async runtime
@@ -48,11 +70,88 @@ fn collect_sync() -> CollectorResult {
         }
     }
 
+    collect_user_scope(&mut entries, &mut warnings);
+    collect_updates(&hklm, &mut entries, &mut warnings);
+
     if entries.is_empty() && warnings.is_empty() {
         warnings.push("no entries found under either uninstall registry view".to_string());
     }
 
     CollectorResult { entries, warnings }
+}
+
+/// Per-user installs, read out of the loaded profiles under `HKEY_USERS`.
+///
+/// Not `HKEY_CURRENT_USER`: the agent runs as a service under SYSTEM, whose own
+/// hive is where that points, and it holds nothing an operator wants. What this
+/// reaches instead is every profile the system currently has loaded.
+///
+/// **A profile that is not loaded is not visible**, which is the honest limit of
+/// doing this without mounting hives: software a signed-out user installed for
+/// themselves is missing until they log in. Reported as a warning rather than
+/// passed over in silence, so the gap is in the snapshot and not only in this
+/// comment. Mounting every profile's `NTUSER.DAT` is the alternative, and is not
+/// something a background inventory agent should be doing to a machine.
+fn collect_user_scope(entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<String>) {
+    let users = RegKey::predef(HKEY_USERS);
+    let mut profiles = 0usize;
+
+    for name in users.enum_keys() {
+        let Ok(name) = name else { continue };
+        if !is_user_profile_sid(&name) {
+            continue;
+        }
+        let Ok(hive) = users.open_subkey_with_flags(&name, KEY_READ) else {
+            continue;
+        };
+        profiles += 1;
+
+        for (subkey_path, architecture) in USER_UNINSTALL_KEYS {
+            if let Ok(uninstall_key) = hive.open_subkey_with_flags(subkey_path, KEY_READ) {
+                collect_from_key(&uninstall_key, architecture, entries, warnings);
+            }
+        }
+    }
+
+    if profiles == 0 {
+        warnings.push(
+            "no user profiles are loaded, so per-user installs were not collected".to_string(),
+        );
+    }
+}
+
+/// Whether a `HKEY_USERS` subkey is a real user's profile.
+///
+/// Skips `.DEFAULT`, the `_Classes` companion hives (the same software seen
+/// twice), and the built-in service accounts — SYSTEM (`S-1-5-18`), LOCAL
+/// SERVICE (`-19`) and NETWORK SERVICE (`-20`), the first of which is the
+/// agent's own.
+fn is_user_profile_sid(name: &str) -> bool {
+    name.starts_with("S-1-5-21") && !name.ends_with("_Classes")
+}
+
+/// Whether an uninstall entry was installed by Windows Installer.
+///
+/// Two signals, because neither is present everywhere: the `WindowsInstaller`
+/// value, and a key name that is a product GUID, which is what MSI names its
+/// entries. Read rather than asked of WMI for the reason at the top of this
+/// file — enumerating `Win32_Product` can trigger an MSI repair of every
+/// installed product, which is not something an inventory agent may do.
+fn is_msi_entry(subkey: &RegKey, key_name: &str) -> bool {
+    if subkey.get_value::<u32, _>("WindowsInstaller").ok() == Some(1) {
+        return true;
+    }
+    looks_like_product_guid(key_name)
+}
+
+fn looks_like_product_guid(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.len() == 38
+        && trimmed.starts_with('{')
+        && trimmed.ends_with('}')
+        && trimmed[1..37]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 fn collect_from_key(
@@ -90,8 +189,144 @@ fn collect_from_key(
             version: version.as_deref().and_then(non_empty),
             publisher: publisher.as_deref().and_then(non_empty),
             architecture: Some(architecture.to_string()),
-            source: SoftwareSource::Winreg,
+            source: if is_msi_entry(&subkey, &name) {
+                SoftwareSource::Msi
+            } else {
+                SoftwareSource::Winreg
+            },
             install_location: install_location.as_deref().and_then(non_empty),
         });
+    }
+}
+
+/// The `KB` updates applied to the running Windows build.
+///
+/// A Microsoft advisory is matched against an OS build *plus* the updates on
+/// top of it, so an inventory that lists products and no updates cannot answer
+/// "is this host patched" at all. Read from Component Based Servicing rather
+/// than through the Windows Update agent's COM API: a registry read has no
+/// service dependency and still reflects a host whose update history was
+/// cleared.
+///
+/// Only packages in state `112` are reported. A package key exists for staged,
+/// superseded and removed packages too, and counting those would claim a patch
+/// level the host does not have.
+fn collect_updates(hklm: &RegKey, entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<String>) {
+    let packages = match hklm.open_subkey_with_flags(CBS_PACKAGES, KEY_READ) {
+        Ok(key) => key,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            warnings.push("Component Based Servicing has no package list".to_string());
+            return;
+        }
+        Err(error) => {
+            warnings.push(format!("failed to read installed updates: {error}"));
+            return;
+        }
+    };
+
+    // One KB is many packages — one per component, per architecture — and the
+    // inventory wants the update, not its parts.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    for name in packages.enum_keys() {
+        let Ok(name) = name else { continue };
+        let Some(kb) = kb_id_from_package_name(&name) else {
+            continue;
+        };
+        if seen.contains(&kb) {
+            continue;
+        }
+        let Ok(package) = packages.open_subkey_with_flags(&name, KEY_READ) else {
+            continue;
+        };
+        if package.get_value::<u32, _>("CurrentState").ok() != Some(CBS_STATE_INSTALLED) {
+            continue;
+        }
+        seen.insert(kb.clone());
+        entries.push(SoftwareEntry {
+            name: kb,
+            // A KB has no version of its own: the identifier *is* the version.
+            // Repeating it would make every update look like a product whose
+            // version never changes.
+            version: None,
+            publisher: Some("Microsoft Corporation".to_string()),
+            architecture: None,
+            source: SoftwareSource::Kb,
+            install_location: None,
+        });
+    }
+
+    if seen.is_empty() {
+        warnings.push("no installed updates found under Component Based Servicing".to_string());
+    }
+}
+
+/// Extracts `KB5034123` from `Package_for_KB5034123~31bf3856ad364e35~amd64~~10.0.1.7`.
+///
+/// `None` for the package names that carry no KB: rollups named after a
+/// feature, language packs, and anything where "KB" is part of another token.
+fn kb_id_from_package_name(name: &str) -> Option<String> {
+    let upper = name.to_ascii_uppercase();
+    let start = upper.find("KB")?;
+    let digits: String = upper[start + 2..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    // Real KB ids are six or seven digits; the length test is what keeps "KB"
+    // appearing inside some other token from producing a fictitious update.
+    if !(6..=8).contains(&digits.len()) {
+        return None;
+    }
+    Some(format!("KB{digits}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_user_profile_sid, kb_id_from_package_name, looks_like_product_guid};
+
+    #[test]
+    fn reads_the_kb_out_of_a_package_name() {
+        assert_eq!(
+            kb_id_from_package_name("Package_for_KB5034123~31bf3856ad364e35~amd64~~10.0.1.7")
+                .as_deref(),
+            Some("KB5034123")
+        );
+    }
+
+    #[test]
+    fn ignores_packages_that_name_no_update() {
+        assert_eq!(
+            kb_id_from_package_name("Package_for_RollupFix~~amd64~~19041.1"),
+            None
+        );
+        assert_eq!(
+            kb_id_from_package_name("Microsoft-Windows-Foo~~amd64~~10.0.1"),
+            None
+        );
+        // "KB" followed by too few digits is some other token, not an update.
+        assert_eq!(kb_id_from_package_name("Package_for_KB12~amd64"), None);
+    }
+
+    #[test]
+    fn recognises_an_msi_product_guid() {
+        assert!(looks_like_product_guid("{90160000-008C-0000-1000-0000000FF1CE}"));
+        assert!(!looks_like_product_guid("7-Zip"));
+        assert!(!looks_like_product_guid("{not-a-guid}"));
+    }
+
+    #[test]
+    fn skips_the_hives_that_are_not_a_users_software() {
+        assert!(is_user_profile_sid(
+            "S-1-5-21-1111111111-2222222222-3333333333-1001"
+        ));
+        // The agent's own hive, and the two other service accounts.
+        assert!(!is_user_profile_sid("S-1-5-18"));
+        assert!(!is_user_profile_sid("S-1-5-19"));
+        assert!(!is_user_profile_sid("S-1-5-20"));
+        assert!(!is_user_profile_sid(".DEFAULT"));
+        // The same software seen twice.
+        assert!(!is_user_profile_sid(
+            "S-1-5-21-1111111111-2222222222-3333333333-1001_Classes"
+        ));
     }
 }

@@ -217,6 +217,24 @@ if "%SERVICE_EXISTS%"=="0" (
     sc.exe description "%SERVICE_NAME%" "Cross-platform endpoint inventory agent for Shapoclyack" >nul
 )
 
+rem  Recovery actions, set on every run so an existing installation gains them
+rem  too. Two reasons, and the second is the one that is easy to miss:
+rem
+rem    1. An agent that crashes should come back without anyone visiting the
+rem       machine, which is the entire premise of a fleet of these.
+rem    2. A remotely installed upgrade takes effect only when the process ends
+rem       and something starts the binary that is now on disk. The agent stops
+rem       with a failure code precisely so this restarts it; without these
+rem       actions the machine would be left with the new build installed and
+rem       nothing running it.
+rem
+rem  failureflag is required for the second case: without it the SCM applies
+rem  recovery only to a process that died, not to a service that reported
+rem  SERVICE_STOPPED with an error code, which is how a graceful stop-to-
+rem  upgrade looks.
+sc.exe failure "%SERVICE_NAME%" reset= 86400 actions= restart/5000/restart/15000/restart/60000 >nul
+sc.exe failureflag "%SERVICE_NAME%" 1 >nul
+
 echo ==^> Starting the service
 sc.exe start "%SERVICE_NAME%" >nul
 if errorlevel 1 (

@@ -173,6 +173,7 @@ mod contract_tests {
             tls_ca_file: None,
             log_level: "info".to_string(),
             allow_plain_http: true,
+            allow_insecure_updates: false,
             inventory_full_refresh_interval: Duration::from_secs(86_400),
             max_spool_entries: 200,
         }

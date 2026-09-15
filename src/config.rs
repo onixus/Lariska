@@ -28,6 +28,7 @@ pub struct Config {
     pub tls_ca_file: Option<PathBuf>,
     pub log_level: String,
     pub allow_plain_http: bool,
+    pub allow_insecure_updates: bool,
     pub inventory_full_refresh_interval: Duration,
     pub max_spool_entries: usize,
 }
@@ -49,6 +50,7 @@ impl fmt::Debug for Config {
                 "inventory_full_refresh_interval",
                 &self.inventory_full_refresh_interval,
             )
+            .field("allow_insecure_updates", &self.allow_insecure_updates)
             .field("max_spool_entries", &self.max_spool_entries)
             .finish()
     }
@@ -66,6 +68,7 @@ struct FileConfig {
     tls_ca_file: Option<PathBuf>,
     log_level: Option<String>,
     allow_plain_http: Option<bool>,
+    allow_insecure_updates: Option<bool>,
     inventory_full_refresh_interval_secs: Option<u64>,
     max_spool_entries: Option<u64>,
 }
@@ -99,6 +102,13 @@ impl Config {
         );
         let log_level = values.log_level.unwrap_or_else(|| "info".to_string());
         let allow_plain_http = values.allow_plain_http.unwrap_or(false);
+        // Off unless asked for. A remote upgrade over plain HTTP carries the
+        // build and the digest that vouches for it on the same unprotected
+        // connection, so whoever can rewrite one can rewrite both and the
+        // verification proves nothing. Separate from ``allow_plain_http``
+        // because submitting an inventory in the clear on a lab stand and
+        // executing a binary fetched in the clear are not the same decision.
+        let allow_insecure_updates = values.allow_insecure_updates.unwrap_or(false);
         let inventory_full_refresh_interval = Duration::from_secs(
             values
                 .inventory_full_refresh_interval_secs
@@ -123,6 +133,7 @@ impl Config {
             tls_ca_file: values.tls_ca_file,
             log_level,
             allow_plain_http,
+            allow_insecure_updates,
             inventory_full_refresh_interval,
             max_spool_entries,
         };

@@ -29,6 +29,15 @@ log_level = "info"
 # Plain HTTP is refused by default. Set this only against a lab stand.
 # allow_plain_http = false
 
+# A remotely offered upgrade is refused over plain HTTP even when the line
+# above allows plain HTTP for everything else, and this is what overrides that.
+# They are separate decisions: submitting an inventory in the clear on a lab
+# stand and *executing a binary* fetched in the clear are not the same risk. The
+# build and the sha256 that vouches for it travel on the same connection, so
+# without TLS whoever can rewrite one can rewrite both and the check proves
+# nothing.
+# allow_insecure_updates = false
+
 # PEM bundle for an internal CA terminating the API's TLS.
 # tls_ca_file = 'C:\ProgramData\Lariska\config\ca.pem'
 

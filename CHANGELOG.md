@@ -4,7 +4,42 @@ All notable changes to the Lariska endpoint inventory agent will be documented i
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-09-15
+
+### Added
+- **Remote management (Shapoclyack #358).** An operator changes what this agent
+  does, and which build it runs, from the console instead of from the machine.
+  The decision travels in the heartbeat response — the only channel that
+  reaches a running agent — and is acted on here: intervals and log level take
+  effect on the next tick, with no restart, and a build is downloaded with the
+  agent's own token, checked against the sha256 the heartbeat named, and put in
+  place of the installed binary, which is moved aside rather than deleted. A
+  revision is applied once; the server repeating it changes nothing.
+  `server_url`, the provisioning key and `state_dir` are not settable remotely:
+  an agent that can be told where to report can be told to report somewhere
+  else, through the very channel carrying the instruction. An upgrade is
+  refused over plain HTTP unless `allow_insecure_updates` is set — the build
+  and its digest travel on the same connection, so without TLS the check proves
+  nothing.
+- **Windows: MSI, per-user installs and applied updates.** Uninstall entries
+  installed by Windows Installer are reported as `msi` rather than lumped in
+  with `winreg`; per-user software is read from the loaded profiles under
+  `HKEY_USERS` (not `HKEY_CURRENT_USER`, which under a SYSTEM service is the
+  service's own hive); and the `KB` updates applied to the running build are
+  read from Component Based Servicing, in state 112 only, because a package key
+  exists for staged and superseded packages too. A Microsoft advisory is
+  matched against an OS build plus the updates on top of it, so an inventory
+  without them could not answer whether a host is patched.
+
+### Fixed
+- **The collapse of duplicate entries kept the wrong build.** The server holds
+  `UNIQUE(snapshot_id, comparison_key)` on a key that excludes the version, so
+  a host with two versions of one product installed cannot report both, and the
+  greater one survives. "Greater" was decided by string order, where `"1.9.0"`
+  beats `"1.10.0"` — so the inventory named a build the host had already
+  replaced. Versions now compare by numeric component. The warning also names
+  both versions in plain text instead of rendering them as Rust's
+  `Some("8.0.61001")`.
 
 ### Fixed
 - **The provisioning-key exchange used a path the API has never served.**
