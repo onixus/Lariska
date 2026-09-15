@@ -91,10 +91,22 @@ if "%ALLOW_PLAIN%"=="0" if /i not "%SERVER_URL:~0,8%"=="https://" (
     exit /b 1
 )
 
-if defined CA_FILE if not exist "%CA_FILE%" (
-    echo ERROR: TLS CA bundle not found at %CA_FILE%.
-    exit /b 1
-)
+rem  A relative /ca path is resolved against this script's own directory as
+rem  well as against the current one. "Run as administrator" opens a prompt in
+rem  C:\Windows\System32, so `install-lariska.cmd ... /ca stand-ca.crt` looked
+rem  for the bundle there -- while the binary beside it was found, because that
+rem  one is resolved with %~dp0. Two different rules for two files in the same
+rem  folder is a trap, and it caught its first user immediately.
+if not defined CA_FILE goto :ca_resolved
+if exist "%CA_FILE%" goto :ca_resolved
+if exist "%~dp0%CA_FILE%" goto :ca_beside_script
+echo ERROR: TLS CA bundle not found.
+echo        Looked for "%CA_FILE%" in the current directory (%CD%)
+echo        and beside this script (%~dp0).
+exit /b 1
+:ca_beside_script
+set "CA_FILE=%~dp0%CA_FILE%"
+:ca_resolved
 
 rem  --- stop an existing service so the binary is not locked ---------------
 
