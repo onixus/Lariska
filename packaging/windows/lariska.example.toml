@@ -1,0 +1,36 @@
+# Lariska endpoint agent — Windows service configuration.
+#
+# The service entry point (`lariska.exe --winservice`) reads this file from
+# C:\ProgramData\Lariska\config\lariska.toml unless --config says otherwise.
+# install-lariska.ps1 writes it for you; edit it here only to change settings
+# the installer does not expose.
+
+# Shapoclyack API base URL. HTTPS is required unless allow_plain_http is true.
+server_url = "https://shapoclyack.example.internal"
+
+# File holding the provisioning key minted for this tenant
+# (console: Agents -> provisioning key, or POST /api/tenants/{id}/provisioning-keys).
+provisioning_key_file = 'C:\ProgramData\Lariska\config\provisioning.key'
+
+# Agent identity, the durable delivery spool and the single-instance lock.
+state_dir = 'C:\ProgramData\Lariska\state'
+
+# How often a snapshot is collected and sent, and how often the agent checks in.
+inventory_interval_secs = 3600
+heartbeat_interval_secs = 60
+
+# A full snapshot is sent this often even when nothing changed, so the server
+# is never left reconciling against a diff whose base it no longer holds.
+inventory_full_refresh_interval_secs = 86400
+
+request_timeout_secs = 30
+log_level = "info"
+
+# Plain HTTP is refused by default. Set this only against a lab stand.
+# allow_plain_http = false
+
+# PEM bundle for an internal CA terminating the API's TLS.
+# tls_ca_file = 'C:\ProgramData\Lariska\config\ca.pem'
+
+# Snapshots kept on disk while the API is unreachable (1..10000).
+max_spool_entries = 200

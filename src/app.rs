@@ -44,6 +44,18 @@ fn run_internal(
     external_shutdown: Option<std::sync::Arc<tokio::sync::Notify>>,
 ) -> Result<(), String> {
     let config = Config::from_file_and_env(config_path).map_err(|error| error.to_string())?;
+    // Under the Windows SCM stdout goes nowhere, so a service that logs there
+    // cannot be diagnosed at all; log into the state directory instead. Only
+    // on Windows: the systemd unit and launchd job also pass `--service`, and
+    // there stdout is exactly where the log belongs (journald / the plist's
+    // StandardOutPath).
+    #[cfg(windows)]
+    if running_as_service {
+        telemetry::init_to_file(&config.log_level, &config.state_dir.join("lariska.log"));
+    } else {
+        telemetry::init(&config.log_level);
+    }
+    #[cfg(not(windows))]
     telemetry::init(&config.log_level);
 
     // Initialize panic hook for crash recovery & reporting
@@ -220,14 +232,20 @@ fn build_snapshot(
     };
     labels.insert("host.power_source".to_string(), power_source.to_string());
 
+    let os_release = inventory::environment::detect_os_release();
+
     Ok(InventorySnapshot::new(
         snapshot_id,
         agent_id.to_string(),
         collected_at,
         hostname.to_string(),
         Some(std::env::consts::OS.to_string()),
-        Some(std::env::consts::OS.to_string()),
-        None,
+        Some(
+            os_release
+                .name
+                .unwrap_or_else(|| std::env::consts::OS.to_string()),
+        ),
+        os_release.version,
         Some(std::env::consts::ARCH.to_string()),
         env!("CARGO_PKG_VERSION").to_string(),
         labels,
@@ -314,14 +332,20 @@ fn diagnostic_snapshot(
     };
     labels.insert("host.power_source".to_string(), power_source.to_string());
 
+    let os_release = inventory::environment::detect_os_release();
+
     InventorySnapshot::new(
         "diagnostic-snapshot".to_string(),
         "agent_00000000000000000000000000000000".to_string(),
         "1970-01-01T00:00:00Z".to_string(),
         "localhost".to_string(),
         Some(std::env::consts::OS.to_string()),
-        Some(std::env::consts::OS.to_string()),
-        None,
+        Some(
+            os_release
+                .name
+                .unwrap_or_else(|| std::env::consts::OS.to_string()),
+        ),
+        os_release.version,
         Some(std::env::consts::ARCH.to_string()),
         env!("CARGO_PKG_VERSION").to_string(),
         labels,
