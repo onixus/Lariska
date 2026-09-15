@@ -199,14 +199,24 @@ fn collect_from_key(
     }
 }
 
-/// The `KB` updates applied to the running Windows build.
+/// The separately-identified `KB` updates applied to the running Windows build.
 ///
-/// A Microsoft advisory is matched against an OS build *plus* the updates on
-/// top of it, so an inventory that lists products and no updates cannot answer
-/// "is this host patched" at all. Read from Component Based Servicing rather
-/// than through the Windows Update agent's COM API: a registry read has no
-/// service dependency and still reflects a host whose update history was
-/// cleared.
+/// **This is not the whole update history, and cannot be.** A cumulative update
+/// is recorded in Component Based Servicing as `Package_for_RollupFix~...~~
+/// 26200.9445.1.x`, which names a build and no KB at all — so the updates that
+/// matter most are, by construction, absent from this list. That is not a gap
+/// in the inventory: the cumulative state *is* the build revision the host
+/// reports in `os_version`, and that revision is what a match is decided on.
+/// What this adds is the rest — the separately-named updates (.NET, out-of-band
+/// fixes, driver packages) that ship their own KB and raise no revision, which
+/// is exactly the case a revision comparison alone gets wrong.
+///
+/// A host with a handful of rows here is therefore normal and not a broken
+/// collector.
+///
+/// Read from the registry rather than through the Windows Update agent's COM
+/// API: no service dependency, and it still reflects a host whose update
+/// history was cleared.
 ///
 /// Only packages in state `112` are reported. A package key exists for staged,
 /// superseded and removed packages too, and counting those would claim a patch

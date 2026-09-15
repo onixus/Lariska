@@ -25,11 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installed by Windows Installer are reported as `msi` rather than lumped in
   with `winreg`; per-user software is read from the loaded profiles under
   `HKEY_USERS` (not `HKEY_CURRENT_USER`, which under a SYSTEM service is the
-  service's own hive); and the `KB` updates applied to the running build are
-  read from Component Based Servicing, in state 112 only, because a package key
-  exists for staged and superseded packages too. A Microsoft advisory is
-  matched against an OS build plus the updates on top of it, so an inventory
-  without them could not answer whether a host is patched.
+  service's own hive); and the separately-named `KB` updates are read
+  from Component Based Servicing, in state 112 only, because a package key
+  exists for staged and superseded packages too. Cumulative updates are not in
+  that list and cannot be — they are recorded as
+  `Package_for_RollupFix~…~~26200.9445.1.x`, naming a build and no KB — so a
+  patched host reports a handful of these rows rather than dozens; one real
+  endpoint reported two. That is correct: its cumulative state is the build
+  revision it already reports, and these rows add the out-of-band updates that
+  ship their own KB and raise no revision, which is the case a revision
+  comparison alone gets wrong.
 
 ### Fixed
 - **The collapse of duplicate entries kept the wrong build.** The server holds
