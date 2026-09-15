@@ -4,6 +4,41 @@ All notable changes to the Lariska endpoint inventory agent will be documented i
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **The provisioning-key exchange used a path the API has never served.**
+  `AUTH_EXCHANGE_PATH` was `/api/v1/auth/exchange`; Shapoclyack serves it at
+  `/api/auth/agent/token` and has no `/api/v1` prefix at all, so the agent 404'd
+  on its first request against any real deployment and never obtained a token —
+  on every platform. Both wiremock tests hard-coded the same wrong path, so the
+  suite passed by agreeing with the bug; they now reference the constant.
+- **A Windows service was silent.** Logging went to stdout, which the SCM does
+  not attach, so an installed service produced no log at all — including the
+  reason it failed to start. The Windows service path now logs to
+  `state_dir\lariska.log`, rotated once at 8 MiB. Gated on Windows: the systemd
+  unit and the launchd job also pass `--service`, and there stdout is where the
+  log belongs.
+- **`docs/INSTALL.md` documented a configuration the agent rejects.** The
+  Windows paths were given as TOML basic strings, where `"C:\ProgramData\..."`
+  is a parse error on the `\P` escape. They are literal strings now.
+
+### Added
+- **OS product name and version on Windows.** Every snapshot previously reported
+  `os_name` as the bare platform (`"windows"`) with `os_version` `null`;
+  `detect_os_release` now reads `SOFTWARE\Microsoft\Windows NT\CurrentVersion`
+  and returns the product name and `major.minor.build.ubr`, the form MSRC uses.
+  Windows 11 is recognised by build number, because its `ProductName` still
+  reads "Windows 10". Linux and macOS still report the bare platform name with
+  no version — their collectors are not written.
+- **`packaging/windows/install-lariska.cmd` and `uninstall-lariska.cmd`.**
+  Batch rather than PowerShell: the environments this agent targets commonly
+  forbid running PowerShell scripts by policy. The installer restricts the data
+  directories to SYSTEM and Administrators, validates the configuration with
+  `check-config` before registering anything, and leaves the state directory
+  alone on reinstall so the device keeps its identity. Neither script has been
+  executed on Windows yet.
+
 ## [0.2.0] - 2026-08-23
 
 ### Added

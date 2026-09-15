@@ -2,7 +2,7 @@
 #
 # The service entry point (`lariska.exe --winservice`) reads this file from
 # C:\ProgramData\Lariska\config\lariska.toml unless --config says otherwise.
-# install-lariska.ps1 writes it for you; edit it here only to change settings
+# install-lariska.cmd writes it for you; edit it here only to change settings
 # the installer does not expose.
 
 # Shapoclyack API base URL. HTTPS is required unless allow_plain_http is true.

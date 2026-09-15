@@ -157,30 +157,36 @@ tail -n 100 /Library/Logs/Lariska/lariska.log
 
 ## 5. Windows
 
-Download `lariska-v0.1.2-x86_64-pc-windows-msvc.zip` and its `.sha256` file
-from the [latest release page](https://github.com/onixus/Lariska/releases/latest).
-In an elevated PowerShell window:
+Download `lariska-v0.2.0-x86_64-pc-windows-msvc.zip` and its `.sha256` file
+from the [latest release page](https://github.com/onixus/Lariska/releases/latest),
+and unpack it. From an **elevated command prompt**, in the unpacked directory:
 
-```powershell
-$Archive = ".\lariska-v0.1.2-x86_64-pc-windows-msvc.zip"
-$Expected = (Get-Content "$Archive.sha256").Split()[0]
-$Actual = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($Actual -ne $Expected) { throw "SHA-256 checksum mismatch" }
-
-New-Item -ItemType Directory -Force "C:\Program Files\Lariska" | Out-Null
-New-Item -ItemType Directory -Force "C:\ProgramData\Lariska\config" | Out-Null
-New-Item -ItemType Directory -Force "C:\ProgramData\Lariska\state" | Out-Null
-Expand-Archive $Archive -DestinationPath "C:\Program Files\Lariska" -Force
+```bat
+certutil -hashfile lariska-v0.2.0-x86_64-pc-windows-msvc.zip SHA256
+install-lariska.cmd https://shapoclyack.example.com octo-pk-...
 ```
 
-Save the provisioning key as
-`C:\ProgramData\Lariska\config\provisioning.key`, then create
-`C:\ProgramData\Lariska\config\lariska.toml`:
+Compare the `certutil` output against the `.sha256` file before installing.
+
+`install-lariska.cmd` creates `C:\Program Files\Lariska` and
+`C:\ProgramData\Lariska\{config,state}`, restricts the two data directories to
+`SYSTEM` and local Administrators, writes the provisioning key and the
+configuration, validates it with `check-config`, and registers and starts the
+service. It is batch rather than PowerShell because PowerShell script execution
+is blocked by policy in many of the environments this agent targets.
+
+For a lab stand without TLS add `/plainhttp`; for an internal CA add
+`/ca <path to PEM>`. To remove the agent, `uninstall-lariska.cmd` (add
+`/purgedata` to drop the agent identity as well).
+
+If you would rather write the configuration yourself, note the quoting:
 
 ```toml
 server_url = "https://shapoclyack.example.com"
-provisioning_key_file = "C:\ProgramData\Lariska\config\provisioning.key"
-state_dir = "C:\ProgramData\Lariska\state"
+# Single quotes. A TOML basic string treats a backslash as an escape, and
+# "C:\ProgramData\..." is a parse error on the \P.
+provisioning_key_file = 'C:\ProgramData\Lariska\config\provisioning.key'
+state_dir = 'C:\ProgramData\Lariska\state'
 inventory_interval_secs = 3600
 heartbeat_interval_secs = 60
 request_timeout_secs = 30
@@ -190,23 +196,17 @@ log_level = "info"
 allow_plain_http = false
 ```
 
-Restrict both `C:\ProgramData\Lariska\config` and
-`C:\ProgramData\Lariska\state` to `SYSTEM` and local Administrators. Validate
-the configuration and register the Windows Service:
+Under the SCM there is no console, so the service logs to
+`C:\ProgramData\Lariska\state\lariska.log` rather than to stdout:
 
-```powershell
-& "C:\Program Files\Lariska\lariska.exe" check-config `
-  --config "C:\ProgramData\Lariska\config\lariska.toml"
-sc.exe create Lariska binPath= '"C:\Program Files\Lariska\lariska.exe" --winservice' start= auto DisplayName= "Lariska Endpoint Agent"
-sc.exe description Lariska "Cross-platform endpoint inventory agent for Shapoclyack"
-sc.exe start Lariska
-sc.exe query Lariska
+```bat
+type C:\ProgramData\Lariska\state\lariska.log
 ```
 
-The native Windows Service integration has been cross-compiled but has not
-yet been validated against a real Windows Service Control Manager. See
-[`packaging/windows/README.md`](../packaging/windows/README.md) for current
-status and uninstall instructions.
+The native Windows Service integration and the installer have been
+cross-compiled and reviewed but not yet run against a real Windows Service
+Control Manager. See [`packaging/windows/README.md`](../packaging/windows/README.md)
+for current status.
 
 ## 6. Verify the connection
 
