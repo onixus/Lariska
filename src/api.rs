@@ -156,10 +156,114 @@ impl ApiClient {
 }
 
 fn classify_transport_error(error: &reqwest::Error) -> ApiError {
+    let described = describe_transport_error(error);
     if error.is_timeout() || error.is_connect() || error.is_request() {
-        ApiError::Transient(error.to_string())
+        ApiError::Transient(described)
     } else {
-        ApiError::Fatal(error.to_string())
+        ApiError::Fatal(described)
+    }
+}
+
+/// A transport failure with its cause and its destination, not just its
+/// headline.
+///
+/// `reqwest::Error`'s own `Display` is "error sending request" for everything
+/// that goes wrong below HTTP — a refused connection, a name that does not
+/// resolve, a certificate that does not verify. The distinction lives in the
+/// source chain, and a log line that drops it leaves an operator unable to tell
+/// "nothing is listening" from "I do not trust that certificate", which are
+/// opposite problems with opposite fixes. Seen for real: an agent pointed at a
+/// stand that had moved to TLS reported exactly the same sentence it would have
+/// reported for an untrusted CA.
+///
+/// The destination is not added here: reqwest's own `Display` already carries
+/// "for url (…)", and appending it again made the line say the address twice.
+fn describe_transport_error(error: &reqwest::Error) -> String {
+    format!("{error}{}", describe_causes(error))
+}
+
+/// The chain below an error, flattened onto one line.
+fn describe_causes(error: &dyn std::error::Error) -> String {
+    let mut out = String::new();
+    let mut source = error.source();
+    // Bounded: a cyclic or absurdly deep chain must not produce a log line
+    // measured in kilobytes.
+    for _ in 0..8 {
+        let Some(cause) = source else { break };
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
+#[cfg(test)]
+mod transport_error_tests {
+    use super::describe_causes;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct Layer {
+        message: &'static str,
+        source: Option<Box<Layer>>,
+    }
+
+    impl fmt::Display for Layer {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.as_deref().map(|layer| layer as &dyn std::error::Error)
+        }
+    }
+
+    fn chain(messages: &[&'static str]) -> Layer {
+        let mut iter = messages.iter().rev();
+        let mut layer = Layer {
+            message: iter.next().copied().unwrap_or(""),
+            source: None,
+        };
+        for message in iter {
+            layer = Layer {
+                message,
+                source: Some(Box::new(layer)),
+            };
+        }
+        layer
+    }
+
+    /// The whole point: the sentence that distinguishes "I do not trust that
+    /// certificate" from "nothing is listening" is two levels down.
+    #[test]
+    fn the_cause_below_the_headline_is_reported() {
+        let error = chain(&[
+            "error sending request",
+            "client error (Connect)",
+            "invalid peer certificate: UnknownIssuer",
+        ]);
+
+        assert_eq!(
+            describe_causes(&error),
+            ": client error (Connect): invalid peer certificate: UnknownIssuer"
+        );
+    }
+
+    #[test]
+    fn an_error_with_no_cause_adds_nothing() {
+        assert_eq!(describe_causes(&chain(&["error sending request"])), "");
+    }
+
+    #[test]
+    fn a_very_deep_chain_is_bounded() {
+        let error = chain(&[
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
+        ]);
+        // Eight causes below the headline, and no more: a log line is not a
+        // place to print an unbounded structure.
+        assert_eq!(describe_causes(&error).matches(": ").count(), 8);
     }
 }
 
