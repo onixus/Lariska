@@ -448,3 +448,83 @@ mod contract_tests {
             .expect("first submission should succeed");
         client
             .submit_if_needed(sample_snapshot("snap-2")) // identical content, different id
+            .await
+            .expect("second call should short-circuit, not error");
+
+        fs::remove_file(key_path).ok();
+        fs::remove_dir_all(state_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn validation_failure_quarantines_the_entry_instead_of_looping() {
+        let server = MockServer::start().await;
+        mount_exchange(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/endpoint/inventory"))
+            .respond_with(ResponseTemplate::new(422).set_body_string("schema validation failed"))
+            .mount(&server)
+            .await;
+
+        let key_path = write_temp_key("invalid");
+        let state_dir = temp_state_dir("invalid");
+        let client = test_client(server.uri(), key_path.clone(), &state_dir);
+
+        let result = client.submit_if_needed(sample_snapshot("snap-1")).await;
+        assert!(result.is_err());
+
+        let pending = client.spool.list_pending().expect("list should succeed");
+        assert!(
+            pending.is_empty(),
+            "rejected entry must not stay in the retry queue"
+        );
+        assert!(
+            state_dir.join("spool/quarantine/snap-1.json.zst").exists()
+                || state_dir.join("spool/quarantine/snap-1.json").exists()
+        );
+
+        fs::remove_file(key_path).ok();
+        fs::remove_dir_all(state_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_resumes_pending_spool_entries() {
+        let server = MockServer::start().await;
+        mount_exchange(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/endpoint/inventory"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "snapshot_id": "snap-1",
+                "status": "accepted",
+                "device_id": "dev-1",
+                "asset_id": "asset-1",
+                "reconciliation_status": "linked",
+                "software_count": 1,
+                "changes": {"installed": 1, "removed": 0, "updated": 0}
+            })))
+            .mount(&server)
+            .await;
+
+        let key_path = write_temp_key("crash");
+        let state_dir = temp_state_dir("crash");
+
+        // Simulate a snapshot that was spooled by a previous process that
+        // died before it could submit.
+        {
+            let client = test_client(server.uri(), key_path.clone(), &state_dir);
+            client
+                .spool
+                .write(&sample_snapshot("snap-1"))
+                .expect("write should succeed");
+        }
+
+        // A freshly started client (new process, in spirit) drains it.
+        let client = test_client(server.uri(), key_path.clone(), &state_dir);
+        client.drain_spool().await.expect("drain should succeed");
+
+        let pending = client.spool.list_pending().expect("list should succeed");
+        assert!(pending.is_empty());
+
+        fs::remove_file(key_path).ok();
+        fs::remove_dir_all(state_dir).ok();
+    }
+}
