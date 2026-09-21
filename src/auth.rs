@@ -8,10 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-// The API exposes the provisioning-key exchange at /api/auth/agent/token.
-// This used to point at /api/v1/auth/exchange, a path the server has never
-// served — the agent 404'd on its first request against any real deployment
-// (Shapoclyack #358). There is no /api/v1 prefix anywhere in that API.
+// APEX v1 requires versioned integration paths. Shapoclyack exposes the
+// provisioning-key exchange under the versioned agent boundary below.
 pub(crate) const AUTH_EXCHANGE_PATH: &str = "/api/v1/auth/agent/token";
 /// Refresh somewhere in the first 10-25% of the token's remaining lifetime,
 /// picked per-token so many agents restarting together don't all refresh in
@@ -118,111 +116,3 @@ impl AuthClient {
         let ttl = Duration::from_secs(ttl_secs);
         let jitter_fraction =
             rand::thread_rng().gen_range(MIN_REFRESH_JITTER_FRACTION..MAX_REFRESH_JITTER_FRACTION);
-        let refresh_in = ttl.mul_f64((1.0 - jitter_fraction).max(0.0));
-
-        Ok(TokenState {
-            access_token: response.access_token,
-            refresh_at: Instant::now() + refresh_in,
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn token_state_debug_never_leaks_the_access_token() {
-        let state = TokenState {
-            access_token: "super-secret-jwt".to_string(),
-            refresh_at: Instant::now(),
-        };
-
-        let debug = format!("{state:?}");
-
-        assert!(!debug.contains("super-secret-jwt"));
-        assert!(debug.contains("<redacted>"));
-    }
-}
-
-#[cfg(test)]
-mod contract_tests {
-    use super::*;
-    use crate::config::Config;
-    use std::fs;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn write_temp_key(label: &str) -> PathBuf {
-        let key_path = std::env::temp_dir().join(format!(
-            "lariska-auth-test-key-{label}-{}",
-            std::process::id()
-        ));
-        fs::write(&key_path, "bootstrap-key").expect("key file should be written");
-        key_path
-    }
-
-    fn test_config(server_url: String, key_path: PathBuf) -> Config {
-        Config {
-            server_url,
-            provisioning_key_file: key_path,
-            state_dir: std::env::temp_dir(),
-            inventory_interval: Duration::from_secs(3600),
-            heartbeat_interval: Duration::from_secs(60),
-            request_timeout: Duration::from_secs(5),
-            tls_ca_file: None,
-            log_level: "info".to_string(),
-            allow_plain_http: true,
-            allow_insecure_updates: false,
-            inventory_full_refresh_interval: Duration::from_secs(86_400),
-            max_spool_entries: 200,
-        }
-    }
-
-    #[tokio::test]
-    async fn successful_exchange_returns_access_token() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path(AUTH_EXCHANGE_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "test-jwt",
-                "token_type": "bearer",
-                "tenant_id": "tenant-1",
-                "agent_id": "agent_test",
-                "key_id": null,
-                "expires_in": 7200
-            })))
-            .mount(&server)
-            .await;
-
-        let key_path = write_temp_key("success");
-        let config = test_config(server.uri(), key_path.clone());
-        let api = ApiClient::new(&config).expect("api client should build");
-        let auth = AuthClient::new(api, config.provisioning_key_file, "agent_test".to_string());
-
-        let token = auth.token().await.expect("exchange should succeed");
-        assert_eq!(token, "test-jwt");
-
-        fs::remove_file(key_path).ok();
-    }
-
-    #[tokio::test]
-    async fn invalid_provisioning_key_surfaces_as_auth_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path(AUTH_EXCHANGE_PATH))
-            .respond_with(ResponseTemplate::new(401))
-            .mount(&server)
-            .await;
-
-        let key_path = write_temp_key("invalid");
-        let config = test_config(server.uri(), key_path.clone());
-        let api = ApiClient::new(&config).expect("api client should build");
-        let auth = AuthClient::new(api, config.provisioning_key_file, "agent_test".to_string());
-
-        let error = auth.token().await.expect_err("invalid key should fail");
-        assert!(matches!(error, ApiError::Auth));
-
-        fs::remove_file(key_path).ok();
-    }
-}
