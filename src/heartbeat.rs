@@ -3,8 +3,8 @@ use crate::auth::AuthClient;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-const REGISTER_PATH: &str = "/api/agent/register";
-const HEARTBEAT_PATH: &str = "/api/agent/heartbeat";
+const REGISTER_PATH: &str = "/api/v1/agent/register";
+const HEARTBEAT_PATH: &str = "/api/v1/agent/heartbeat";
 
 /// `Busy`/`Error` are reported once Phase L3/L4 wire collection and delivery
 /// status into the heartbeat loop.

@@ -1,0 +1,80 @@
+{
+  "apex_contract_version": "1.0",
+  "canonical": {
+    "repo": "onixus/unified-platform",
+    "commit": "878d138c560cd4106ab0d6cccde804ddc3e5ae1d",
+    "path": "contracts/v1/CONTRACT.md"
+  },
+  "system": "lariska",
+  "namespace": "lariska",
+  "identity": {
+    "mode": "shapoclyack-agent-jwt",
+    "trust_unsigned_role_header": false
+  },
+  "boundaries": [
+    {
+      "name": "shapoclyack-agent-v1",
+      "kind": "http",
+      "paths": [
+        "POST /api/v1/auth/agent/token",
+        "POST /api/v1/agent/register",
+        "POST /api/v1/agent/heartbeat",
+        "POST /api/v1/endpoint/inventory"
+      ]
+    }
+  ],
+  "native_contracts": [
+    {
+      "path": "src/model.rs",
+      "kind": "wire-model"
+    },
+    {
+      "path": "tests/fixtures/inventory_v1.json",
+      "kind": "fixture"
+    }
+  ],
+  "resources": {
+    "owns": [
+      "event",
+      "evidence"
+    ],
+    "references": [
+      "asset"
+    ]
+  },
+  "source_guards": [
+    {
+      "path": "src/auth.rs",
+      "contains": [
+        "/api/v1/auth/agent/token"
+      ]
+    },
+    {
+      "path": "src/heartbeat.rs",
+      "contains": [
+        "/api/v1/agent/register",
+        "/api/v1/agent/heartbeat"
+      ]
+    },
+    {
+      "path": "src/delivery/mod.rs",
+      "contains": [
+        "/api/v1/endpoint/inventory"
+      ]
+    },
+    {
+      "path": "src/model.rs",
+      "contains": [
+        "INVENTORY_SCHEMA_VERSION: u16 = 1"
+      ]
+    }
+  ],
+  "coverage": {
+    "identity": "enforced",
+    "api_versioning": "enforced",
+    "canonical_refs": "adapter",
+    "event_envelope": "not-applicable",
+    "observability": "partial",
+    "supply_chain": "partial"
+  }
+}

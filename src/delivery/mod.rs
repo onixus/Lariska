@@ -12,7 +12,7 @@ pub mod spool;
 use retry::{classify, RetryDecision};
 use spool::{Spool, SpoolError};
 
-const INVENTORY_PATH: &str = "/api/endpoint/inventory";
+const INVENTORY_PATH: &str = "/api/v1/endpoint/inventory";
 /// Bounds retries within a single delivery attempt; the spool itself is what
 /// makes delivery durable across process restarts, so this does not need to
 /// be unbounded.
@@ -390,7 +390,7 @@ mod contract_tests {
         let server = MockServer::start().await;
         mount_exchange(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/endpoint/inventory"))
+            .and(path(INVENTORY_PATH))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "snapshot_id": "snap-1",
                 "status": "accepted",
@@ -424,7 +424,7 @@ mod contract_tests {
         let server = MockServer::start().await;
         mount_exchange(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/endpoint/inventory"))
+            .and(path(INVENTORY_PATH))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "snapshot_id": "snap-1",
                 "status": "accepted",
@@ -460,7 +460,7 @@ mod contract_tests {
         let server = MockServer::start().await;
         mount_exchange(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/endpoint/inventory"))
+            .and(path(INVENTORY_PATH))
             .respond_with(ResponseTemplate::new(422).set_body_string("schema validation failed"))
             .mount(&server)
             .await;
@@ -491,7 +491,7 @@ mod contract_tests {
         let server = MockServer::start().await;
         mount_exchange(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/endpoint/inventory"))
+            .and(path(INVENTORY_PATH))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "snapshot_id": "snap-1",
                 "status": "accepted",

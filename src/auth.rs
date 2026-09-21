@@ -8,11 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-// The API exposes the provisioning-key exchange at /api/auth/agent/token.
-// This used to point at /api/v1/auth/exchange, a path the server has never
-// served — the agent 404'd on its first request against any real deployment
-// (Shapoclyack #358). There is no /api/v1 prefix anywhere in that API.
-pub(crate) const AUTH_EXCHANGE_PATH: &str = "/api/auth/agent/token";
+// APEX v1 requires versioned integration paths. Shapoclyack exposes the
+// provisioning-key exchange under the versioned agent boundary below.
+pub(crate) const AUTH_EXCHANGE_PATH: &str = "/api/v1/auth/agent/token";
 /// Refresh somewhere in the first 10-25% of the token's remaining lifetime,
 /// picked per-token so many agents restarting together don't all refresh in
 /// lockstep.
