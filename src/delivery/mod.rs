@@ -528,3 +528,4 @@ mod contract_tests {
         fs::remove_dir_all(state_dir).ok();
     }
 }
+
