@@ -6,6 +6,15 @@ on:
   pull_request:
 
 jobs:
+  apex-contract:
+    name: APEX Architecture Contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Validate local conformance manifest
+        run: python3 apex-contract/validate.py
+
   rust:
     name: Rust checks
     runs-on: ${{ matrix.os }}
