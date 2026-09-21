@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 // This used to point at /api/v1/auth/exchange, a path the server has never
 // served — the agent 404'd on its first request against any real deployment
 // (Shapoclyack #358). There is no /api/v1 prefix anywhere in that API.
-pub(crate) const AUTH_EXCHANGE_PATH: &str = "/api/auth/agent/token";
+pub(crate) const AUTH_EXCHANGE_PATH: &str = "/api/v1/auth/agent/token";
 /// Refresh somewhere in the first 10-25% of the token's remaining lifetime,
 /// picked per-token so many agents restarting together don't all refresh in
 /// lockstep.
