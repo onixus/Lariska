@@ -390,7 +390,7 @@ mod contract_tests {
         let server = MockServer::start().await;
         mount_exchange(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/endpoint/inventory"))
+            .and(path(INVENTORY_PATH))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "snapshot_id": "snap-1",
                 "status": "accepted",
@@ -424,7 +424,7 @@ mod contract_tests {
         let server = MockServer::start().await;
         mount_exchange(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/endpoint/inventory"))
+            .and(path(INVENTORY_PATH))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "snapshot_id": "snap-1",
                 "status": "accepted",
@@ -460,7 +460,7 @@ mod contract_tests {
         let server = MockServer::start().await;
         mount_exchange(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/endpoint/inventory"))
+            .and(path(INVENTORY_PATH))
             .respond_with(ResponseTemplate::new(422).set_body_string("schema validation failed"))
             .mount(&server)
             .await;
@@ -491,7 +491,7 @@ mod contract_tests {
         let server = MockServer::start().await;
         mount_exchange(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/endpoint/inventory"))
+            .and(path(INVENTORY_PATH))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "snapshot_id": "snap-1",
                 "status": "accepted",
