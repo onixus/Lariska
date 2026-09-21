@@ -224,3 +224,4 @@ mod contract_tests {
         fs::remove_file(key_path).ok();
     }
 }
+
