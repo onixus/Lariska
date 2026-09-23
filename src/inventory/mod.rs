@@ -1,5 +1,5 @@
 use crate::model::SoftwareEntry;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub mod environment;
 pub mod runtimes;
@@ -11,14 +11,18 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-/// Command output is capped so a runaway or malicious package-manager output
-/// cannot exhaust memory (Plan.md §14 "bounded memory when parsing collector
-/// output").
+/// Command output is capped while it is being read so a runaway or malicious
+/// package manager cannot exhaust memory before the limit is checked.
 // Only Linux/macOS collectors shell out to external commands; the Windows
 // collector reads the registry directly, so these items are legitimately
 // unused when compiling for Windows.
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 pub(crate) const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Individual package metadata files are tiny in normal installations. Keep a
+/// generous ceiling while refusing a corrupt/sparse file that would otherwise
+/// create a large allocation on an endpoint.
+pub(crate) const MAX_METADATA_FILE_BYTES: usize = 512 * 1024;
 
 const DEFAULT_COLLECTOR_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -45,6 +49,7 @@ pub async fn collect_all() -> CollectorResult {
 }
 
 pub async fn collect_all_with_timeout(timeout: Duration) -> CollectorResult {
+    let started = Instant::now();
     #[allow(unused_mut)]
     let mut result = {
         #[cfg(target_os = "linux")]
@@ -71,11 +76,21 @@ pub async fn collect_all_with_timeout(timeout: Duration) -> CollectorResult {
         }
     };
 
-    // Collect language runtimes & package ecosystems (Python, Node.js, Java)
+    // Runtime metadata is filesystem-bound and synchronous. Keep it off the
+    // async runtime, but deliberately run only one blocking task at a time: a
+    // short scan with low peak I/O is preferable to three ecosystems racing
+    // over the endpoint disk.
     let runtime_entries = tokio::task::spawn_blocking(runtimes::collect_all_runtimes)
         .await
         .unwrap_or_default();
     result.entries.extend(runtime_entries);
+
+    tracing::debug!(
+        elapsed_ms = started.elapsed().as_millis(),
+        entries = result.entries.len(),
+        warnings = result.warnings.len(),
+        "inventory collection completed"
+    );
 
     result
 }
@@ -112,7 +127,7 @@ pub(crate) const TRUSTED_SYSTEM_DIRS: &[&str] = &[];
 /// Resolves a binary name against trusted system directories only.
 /// Prevents PATH-hijacking vulnerabilities by never searching ambient `$PATH`.
 pub(crate) fn find_trusted_binary(binary_name: &str) -> Option<PathBuf> {
-    // If a relative path or traversal is passed, reject or check strictly
+    // If a relative path or traversal is passed, reject or check strictly.
     if binary_name.contains('/') || binary_name.contains('\\') || binary_name.contains("..") {
         let path = Path::new(binary_name);
         if path.is_absolute()
@@ -135,6 +150,11 @@ pub(crate) fn find_trusted_binary(binary_name: &str) -> Option<PathBuf> {
 
 /// Runs `program` with a timeout and a bounded-size, no-shell-interpolation
 /// argument list, strictly using trusted system paths (Plan.md §10.1/§14).
+///
+/// The output limit is enforced while reading, not after `wait_with_output`
+/// has already allocated it. A timed-out or overflowing collector is killed
+/// and reaped before this function returns, so it cannot keep consuming host
+/// resources in the background.
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 pub(crate) async fn run_command(
     program: &str,
@@ -142,6 +162,7 @@ pub(crate) async fn run_command(
     timeout: Duration,
 ) -> Result<String, CommandRunError> {
     use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
 
     let executable = find_trusted_binary(program).ok_or(CommandRunError::NotFound)?;
 
@@ -150,9 +171,10 @@ pub(crate) async fn run_command(
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
 
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(CommandRunError::NotFound)
@@ -165,27 +187,65 @@ pub(crate) async fn run_command(
         }
     };
 
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| CommandRunError::Other(format!("{program} timed out after {timeout:?}")))?
-        .map_err(|error| {
+    let captured = tokio::time::timeout(timeout, async {
+        let stdout = child.stdout.take().ok_or_else(|| {
+            CommandRunError::Other(format!("failed to capture {program} stdout"))
+        })?;
+        let mut stdout = stdout.take((MAX_OUTPUT_BYTES + 1) as u64);
+        let mut bytes = Vec::with_capacity(64 * 1024);
+        stdout.read_to_end(&mut bytes).await.map_err(|error| {
             CommandRunError::Other(format!("failed to read {program} output: {error}"))
         })?;
 
-    if !output.status.success() {
+        if bytes.len() > MAX_OUTPUT_BYTES {
+            let _ = child.kill().await;
+            return Err(CommandRunError::Other(format!(
+                "{program} output exceeded {MAX_OUTPUT_BYTES} bytes"
+            )));
+        }
+
+        let status = child.wait().await.map_err(|error| {
+            CommandRunError::Other(format!("failed to wait for {program}: {error}"))
+        })?;
+        Ok::<_, CommandRunError>((status, bytes))
+    })
+    .await;
+
+    let (status, stdout) = match captured {
+        Ok(result) => result?,
+        Err(_) => {
+            // `kill` also waits on Tokio, which prevents a zombie on Unix.
+            let _ = child.kill().await;
+            return Err(CommandRunError::Other(format!(
+                "{program} timed out after {timeout:?}"
+            )));
+        }
+    };
+
+    if !status.success() {
         return Err(CommandRunError::Other(format!(
-            "{program} exited with status {}",
-            output.status
+            "{program} exited with status {status}"
         )));
     }
 
-    if output.stdout.len() > MAX_OUTPUT_BYTES {
-        return Err(CommandRunError::Other(format!(
-            "{program} output exceeded {MAX_OUTPUT_BYTES} bytes"
-        )));
-    }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
 
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+/// Reads a small text metadata file without ever allocating more than the
+/// configured ceiling. Invalid UTF-8 is decoded lossily because package names
+/// are still useful, while an oversized file is ignored as corrupt input.
+pub(crate) fn read_text_file_limited(path: &Path) -> Option<String> {
+    use std::fs::File;
+    use std::io::Read;
+
+    let file = File::open(path).ok()?;
+    let mut reader = file.take((MAX_METADATA_FILE_BYTES + 1) as u64);
+    let mut bytes = Vec::with_capacity(4 * 1024);
+    reader.read_to_end(&mut bytes).ok()?;
+    if bytes.len() > MAX_METADATA_FILE_BYTES {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Trims a raw field and returns `None` for blank values, so collectors
@@ -202,6 +262,7 @@ pub(crate) fn non_empty(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn find_trusted_binary_rejects_untrusted_paths() {
@@ -212,11 +273,25 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn find_trusted_binary_finds_standard_utilities() {
-        // `sh` exists on virtually all Unix-like systems in /bin or /usr/bin
+        // `sh` exists on virtually all Unix-like systems in /bin or /usr/bin.
         let sh = find_trusted_binary("sh");
         assert!(
             sh.is_some(),
             "expected to locate 'sh' in trusted system directories"
         );
+    }
+
+    #[test]
+    fn metadata_reader_refuses_oversized_files() {
+        let path = std::env::temp_dir().join(format!(
+            "lariska-metadata-limit-{}",
+            std::process::id()
+        ));
+        fs::write(&path, vec![b'x'; MAX_METADATA_FILE_BYTES + 1])
+            .expect("test metadata should be written");
+
+        assert!(read_text_file_limited(&path).is_none());
+
+        fs::remove_file(path).ok();
     }
 }
