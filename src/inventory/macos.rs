@@ -1,5 +1,7 @@
-use super::{non_empty, run_command, CollectorResult, CommandRunError};
-use crate::model::{SoftwareEntry, SoftwareSource};
+use super::{
+    non_empty, run_command, CollectorResult, CommandRunError, MAX_METADATA_FILE_BYTES,
+};
+use crate::model::{compare_versions, SoftwareEntry, SoftwareSource};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -70,6 +72,15 @@ fn read_bundle_info(app_path: &Path) -> Result<Option<SoftwareEntry>, String> {
     let plist_path = app_path.join("Contents/Info.plist");
     if !plist_path.exists() {
         return Ok(None);
+    }
+    if plist_path
+        .metadata()
+        .map(|metadata| metadata.len() > MAX_METADATA_FILE_BYTES as u64)
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "Info.plist exceeds {MAX_METADATA_FILE_BYTES} bytes"
+        ));
     }
 
     let value = plist::Value::from_file(&plist_path).map_err(|error| error.to_string())?;
@@ -143,10 +154,17 @@ fn parse_brew_versions(output: &str) -> Vec<SoftwareEntry> {
             if name.trim().is_empty() {
                 return None;
             }
-            let version = fields.next();
+            // Homebrew can report multiple installed versions on one line.
+            // The server key cannot represent them all, so report the newest
+            // one deterministically instead of whichever token appeared first.
+            let version = fields
+                .map(ToOwned::to_owned)
+                .max_by(|left, right| {
+                    compare_versions(Some(left.as_str()), Some(right.as_str()))
+                });
             Some(SoftwareEntry {
                 name: name.to_string(),
-                version: version.and_then(non_empty),
+                version,
                 publisher: None,
                 architecture: None,
                 source: SoftwareSource::Brew,
@@ -169,6 +187,14 @@ mod tests {
         assert_eq!(entries[0].name, "wget");
         assert_eq!(entries[0].version.as_deref(), Some("1.24.5"));
         assert_eq!(entries[0].source, SoftwareSource::Brew);
+    }
+
+    #[test]
+    fn keeps_the_newest_of_multiple_homebrew_versions() {
+        let entries = parse_brew_versions("openssl@3 3.1.7 3.10.1 3.9.0\n");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].version.as_deref(), Some("3.10.1"));
     }
 
     #[test]
