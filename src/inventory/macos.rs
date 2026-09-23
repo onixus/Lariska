@@ -28,6 +28,7 @@ async fn collect_bundles() -> CollectorResult {
         .unwrap_or_else(|error| CollectorResult {
             entries: Vec::new(),
             warnings: vec![format!("macOS bundle collector panicked: {error}")],
+            complete: false,
         })
 }
 
@@ -61,7 +62,12 @@ fn collect_bundles_sync(dirs: &[PathBuf]) -> CollectorResult {
         }
     }
 
-    CollectorResult { entries, warnings }
+    let complete = warnings.is_empty();
+    CollectorResult {
+        entries,
+        warnings,
+        complete,
+    }
 }
 
 /// Reads `Info.plist` metadata rather than treating the `.app` filename as
@@ -125,6 +131,7 @@ async fn collect_homebrew(timeout: Duration) -> Option<CollectorResult> {
                 return Some(CollectorResult {
                     entries: Vec::new(),
                     warnings: vec![format!("brew formula collector failed: {message}")],
+                    complete: false,
                 })
             }
         };
@@ -134,13 +141,20 @@ async fn collect_homebrew(timeout: Duration) -> Option<CollectorResult> {
 
     match run_command("brew", &["list", "--cask", "--versions"], timeout).await {
         Ok(cask_output) => entries.extend(parse_brew_versions(&cask_output)),
-        Err(CommandRunError::NotFound) => {}
+        Err(CommandRunError::NotFound) => {
+            warnings.push("brew cask collector disappeared during collection".to_string())
+        }
         Err(CommandRunError::Other(message)) => {
             warnings.push(format!("brew cask collector failed: {message}"))
         }
     }
 
-    Some(CollectorResult { entries, warnings })
+    let complete = warnings.is_empty();
+    Some(CollectorResult {
+        entries,
+        warnings,
+        complete,
+    })
 }
 
 fn parse_brew_versions(output: &str) -> Vec<SoftwareEntry> {
@@ -191,6 +205,16 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].version.as_deref(), Some("3.10.1"));
+    }
+
+    #[test]
+    fn a_bundle_read_warning_marks_the_result_incomplete() {
+        let result = collect_bundles_sync(&[PathBuf::from("/definitely/not/readable")]);
+
+        // A missing optional application directory is expected and remains
+        // complete. A real read/parse failure is covered by the collector's
+        // warning paths on the platform.
+        assert!(result.complete);
     }
 
     #[test]
