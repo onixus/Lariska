@@ -25,123 +25,92 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
 
-          path = Path('src/inventory/mod.rs')
-          text = path.read_text(encoding='utf-8')
-          text = text.replace(
-              'use crate::model::SoftwareEntry;\nuse std::time::{Duration, Instant};\n',
-              'use crate::model::SoftwareEntry;\nuse std::path::{Path, PathBuf};\nuse std::time::{Duration, Instant};\n',
-              1,
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          path = Path("src/inventory/mod.rs")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              "pub mod environment;\npub mod runtimes;\n",
+              "mod cache;\npub mod environment;\npub mod runtimes;\n",
+              "cache module declaration",
           )
-          text = text.replace(
-              'pub mod environment;\npub mod runtimes;\n',
-              'mod cache;\npub mod environment;\npub mod runtimes;\n',
-              1,
+          text = replace_once(
+              text,
+              "#[derive(Debug)]\npub struct CollectorResult {",
+              "#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]\npub struct CollectorResult {",
+              "CollectorResult derives",
           )
-          text = text.replace(
-              '#[derive(Debug)]\npub struct CollectorResult {',
-              '#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]\npub struct CollectorResult {',
-              1,
-          )
-          text = text.replace(
-              '''pub async fn collect_all() -> CollectorResult {
+          collect_all = """pub async fn collect_all() -> CollectorResult {
               collect_all_with_timeout(DEFAULT_COLLECTOR_TIMEOUT).await
           }
-          ''',
-              '''pub async fn collect_all() -> CollectorResult {
-              collect_all_with_timeout(DEFAULT_COLLECTOR_TIMEOUT).await
-          }
-
+          """
+          collect_all_cached = collect_all + """
           /// Uses persistent per-collector fingerprints for the daemon path.
           /// Diagnostic collection deliberately bypasses this so an operator
           /// asking for inventory always gets a fresh read of the host.
           pub async fn collect_all_cached(state_dir: &Path, max_age: Duration) -> CollectorResult {
               cache::collect_all_cached(state_dir, DEFAULT_COLLECTOR_TIMEOUT, max_age).await
           }
-          ''',
-              1,
-          )
-          text = text.replace('\nuse std::path::{Path, PathBuf};\n\n#[cfg(target_os = "linux")]', '\n#[cfg(target_os = "linux")]', 1)
-          path.write_text(text, encoding='utf-8')
+          """
+          text = replace_once(text, collect_all, collect_all_cached, "cached entry point")
+          path.write_text(text, encoding="utf-8")
 
           for file_name, old, new in [
-              ('src/inventory/runtimes/python.rs', 'fn candidate_python_dirs() -> Vec<PathBuf>', 'pub(crate) fn candidate_python_dirs() -> Vec<PathBuf>'),
-              ('src/inventory/runtimes/nodejs.rs', 'fn candidate_node_modules_dirs() -> Vec<PathBuf>', 'pub(crate) fn candidate_node_modules_dirs() -> Vec<PathBuf>'),
-              ('src/inventory/runtimes/java.rs', 'fn candidate_jvm_dirs() -> Vec<PathBuf>', 'pub(crate) fn candidate_jvm_dirs() -> Vec<PathBuf>'),
+              (
+                  "src/inventory/runtimes/python.rs",
+                  "fn candidate_python_dirs() -> Vec<PathBuf>",
+                  "pub(crate) fn candidate_python_dirs() -> Vec<PathBuf>",
+              ),
+              (
+                  "src/inventory/runtimes/nodejs.rs",
+                  "fn candidate_node_modules_dirs() -> Vec<PathBuf>",
+                  "pub(crate) fn candidate_node_modules_dirs() -> Vec<PathBuf>",
+              ),
+              (
+                  "src/inventory/runtimes/java.rs",
+                  "fn candidate_jvm_dirs() -> Vec<PathBuf>",
+                  "pub(crate) fn candidate_jvm_dirs() -> Vec<PathBuf>",
+              ),
           ]:
-              path = Path(file_name)
-              text = path.read_text(encoding='utf-8')
-              assert old in text, (file_name, old)
-              path.write_text(text.replace(old, new, 1), encoding='utf-8')
+              runtime_path = Path(file_name)
+              runtime_text = runtime_path.read_text(encoding="utf-8")
+              runtime_text = replace_once(runtime_text, old, new, file_name)
+              runtime_path.write_text(runtime_text, encoding="utf-8")
 
-          path = Path('src/app.rs')
-          text = path.read_text(encoding='utf-8')
-          old = '''    let inventory_loop = inventory_loop(
-              &delivery_client,
-              &identity.agent_id,
-              &hostname,
-              runtime_rx,
-              shutdown_rx,
-          );
-          '''
-          new = '''    let inventory_loop = inventory_loop(
-              &delivery_client,
-              &identity.agent_id,
-              &hostname,
-              &config.state_dir,
-              config.inventory_full_refresh_interval,
-              runtime_rx,
-              shutdown_rx,
-          );
-          '''
-          assert old in text
-          text = text.replace(old, new, 1)
-
-          old = '''async fn inventory_loop(
-              delivery_client: &DeliveryClient,
-              agent_id: &str,
-              hostname: &str,
-              mut runtime: tokio::sync::watch::Receiver<managed::Runtime>,
-              mut shutdown: tokio::sync::watch::Receiver<bool>,
-          ) {
-          '''
-          new = '''async fn inventory_loop(
-              delivery_client: &DeliveryClient,
-              agent_id: &str,
-              hostname: &str,
-              state_dir: &Path,
-              cache_max_age: Duration,
-              mut runtime: tokio::sync::watch::Receiver<managed::Runtime>,
-              mut shutdown: tokio::sync::watch::Receiver<bool>,
-          ) {
-          '''
-          assert old in text
-          text = text.replace(old, new, 1)
-
-          old = 'collect_and_submit(delivery_client, agent_id, hostname).await'
-          new = 'collect_and_submit(delivery_client, agent_id, hostname, state_dir, cache_max_age).await'
-          assert old in text
-          text = text.replace(old, new, 1)
-
-          old = '''async fn collect_and_submit(
-              delivery_client: &DeliveryClient,
-              agent_id: &str,
-              hostname: &str,
-          ) -> Result<(), String> {
-              let collected = inventory::collect_all().await;
-          '''
-          new = '''async fn collect_and_submit(
-              delivery_client: &DeliveryClient,
-              agent_id: &str,
-              hostname: &str,
-              state_dir: &Path,
-              cache_max_age: Duration,
-          ) -> Result<(), String> {
-              let collected = inventory::collect_all_cached(state_dir, cache_max_age).await;
-          '''
-          assert old in text
-          text = text.replace(old, new, 1)
-          path.write_text(text, encoding='utf-8')
+          path = Path("src/app.rs")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              "        &hostname,\n        runtime_rx,\n        shutdown_rx,\n    );",
+              "        &hostname,\n        &config.state_dir,\n        config.inventory_full_refresh_interval,\n        runtime_rx,\n        shutdown_rx,\n    );",
+              "inventory loop call",
+          )
+          text = replace_once(
+              text,
+              "    hostname: &str,\n    mut runtime: tokio::sync::watch::Receiver<managed::Runtime>,\n    mut shutdown: tokio::sync::watch::Receiver<bool>,\n) {\n    let initial_delay",
+              "    hostname: &str,\n    state_dir: &Path,\n    cache_max_age: Duration,\n    mut runtime: tokio::sync::watch::Receiver<managed::Runtime>,\n    mut shutdown: tokio::sync::watch::Receiver<bool>,\n) {\n    let initial_delay",
+              "inventory loop signature",
+          )
+          text = replace_once(
+              text,
+              "collect_and_submit(delivery_client, agent_id, hostname).await",
+              "collect_and_submit(delivery_client, agent_id, hostname, state_dir, cache_max_age).await",
+              "cached collection call",
+          )
+          text = replace_once(
+              text,
+              "    hostname: &str,\n) -> Result<(), String> {\n    let collected = inventory::collect_all().await;",
+              "    hostname: &str,\n    state_dir: &Path,\n    cache_max_age: Duration,\n) -> Result<(), String> {\n    let collected = inventory::collect_all_cached(state_dir, cache_max_age).await;",
+              "collect_and_submit signature",
+          )
+          path.write_text(text, encoding="utf-8")
           PY
 
           cargo fmt --all
