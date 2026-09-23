@@ -8,6 +8,7 @@ use crate::inventory::{self, CollectorResult};
 use crate::managed;
 use crate::model::{EndpointIdentifier, InventorySnapshot};
 use crate::{service, telemetry};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -17,6 +18,10 @@ use std::time::Duration;
 /// misconfigured/revoked provisioning key must fail fast.
 const REGISTER_MAX_ATTEMPTS: u32 = 5;
 const REGISTER_BASE_BACKOFF: Duration = Duration::from_secs(1);
+const BATTERY_INTERVAL_MULTIPLIER: u64 = 4;
+const MAX_EFFECTIVE_INVENTORY_INTERVAL: Duration = Duration::from_secs(86_400);
+const MAX_STARTUP_JITTER: Duration = Duration::from_secs(300);
+const INVENTORY_JITTER_DIVISOR: u64 = 10;
 
 pub fn run(config_path: &Path, running_as_service: bool) -> Result<(), String> {
     run_internal(config_path, running_as_service, None)
@@ -201,9 +206,13 @@ async fn run_async(
     Ok(())
 }
 
-/// Runs independently of the heartbeat loop on `inventory_interval`: a slow
-/// collector must not delay heartbeats, and a failed heartbeat must not
-/// touch the delivery spool (Plan.md §9.3, applied symmetrically here).
+/// Runs independently of the heartbeat loop. A one-shot timer is scheduled
+/// only after the previous collection finishes, so a slow endpoint never
+/// accumulates catch-up ticks or runs two inventory scans concurrently.
+///
+/// The first scan is staggered by at most five minutes to avoid a fleet-wide
+/// boot/update storm. Later scans use a deterministic per-agent jitter and are
+/// stretched on battery power, while remaining capped at one day.
 async fn inventory_loop(
     delivery_client: &DeliveryClient,
     agent_id: &str,
@@ -211,25 +220,53 @@ async fn inventory_loop(
     mut runtime: tokio::sync::watch::Receiver<managed::Runtime>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut ticker = tokio::time::interval(runtime.borrow().inventory_interval);
+    let initial_delay = startup_inventory_delay(runtime.borrow().inventory_interval, agent_id);
+    let mut timer = Box::pin(tokio::time::sleep(initial_delay));
+    tracing::debug!(
+        delay_secs = initial_delay.as_secs(),
+        "scheduled initial inventory collection"
+    );
 
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
+            _ = &mut timer => {
                 if let Err(error) = collect_and_submit(delivery_client, agent_id, hostname).await {
                     tracing::warn!(%error, "inventory collection/submission failed");
                 }
+
+                let on_battery = crate::qos::is_on_battery();
+                let delay = scheduled_inventory_delay(
+                    runtime.borrow().inventory_interval,
+                    agent_id,
+                    on_battery,
+                );
+                tracing::debug!(
+                    delay_secs = delay.as_secs(),
+                    on_battery,
+                    "scheduled next inventory collection"
+                );
+                timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + delay);
             }
             changed = runtime.changed() => {
                 if changed.is_err() {
                     break;
                 }
-                // `interval` cannot be re-paced, so it is replaced. The first
-                // tick of a fresh interval fires immediately and is consumed
-                // here: a policy change must not trigger an extra collection
-                // on top of the schedule it just set.
-                ticker = tokio::time::interval(runtime.borrow().inventory_interval);
-                ticker.tick().await;
+                let on_battery = crate::qos::is_on_battery();
+                let delay = scheduled_inventory_delay(
+                    runtime.borrow().inventory_interval,
+                    agent_id,
+                    on_battery,
+                );
+                timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + delay);
+                tracing::info!(
+                    delay_secs = delay.as_secs(),
+                    on_battery,
+                    "rescheduled inventory after managed interval change"
+                );
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -238,6 +275,36 @@ async fn inventory_loop(
             }
         }
     }
+}
+
+fn startup_inventory_delay(base: Duration, agent_id: &str) -> Duration {
+    let max_jitter_secs = (base.as_secs() / INVENTORY_JITTER_DIVISOR)
+        .min(MAX_STARTUP_JITTER.as_secs());
+    Duration::from_secs(stable_jitter_secs(agent_id, max_jitter_secs))
+}
+
+fn scheduled_inventory_delay(base: Duration, agent_id: &str, on_battery: bool) -> Duration {
+    let multiplier = if on_battery {
+        BATTERY_INTERVAL_MULTIPLIER
+    } else {
+        1
+    };
+    let max_secs = MAX_EFFECTIVE_INVENTORY_INTERVAL.as_secs();
+    let effective_secs = base.as_secs().saturating_mul(multiplier).min(max_secs);
+    let jitter_room = max_secs.saturating_sub(effective_secs);
+    let max_jitter_secs = (effective_secs / INVENTORY_JITTER_DIVISOR).min(jitter_room);
+    let jitter_secs = stable_jitter_secs(agent_id, max_jitter_secs);
+    Duration::from_secs(effective_secs.saturating_add(jitter_secs))
+}
+
+fn stable_jitter_secs(agent_id: &str, max_secs: u64) -> u64 {
+    if max_secs == 0 {
+        return 0;
+    }
+    let digest = Sha256::digest(agent_id.as_bytes());
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest[..prefix.len()]);
+    u64::from_be_bytes(prefix) % max_secs.saturating_add(1)
 }
 
 async fn collect_and_submit(
@@ -462,6 +529,38 @@ mod tests {
             .expect_err("partial data must not be submitted as an authoritative snapshot");
 
         assert!(error.contains("not spooled or submitted"));
+    }
+
+    #[test]
+    fn startup_jitter_is_bounded_and_stable() {
+        let base = Duration::from_secs(3_600);
+        let first = startup_inventory_delay(base, "agent_test");
+        let second = startup_inventory_delay(base, "agent_test");
+
+        assert_eq!(first, second);
+        assert!(first <= MAX_STARTUP_JITTER);
+        assert!(first <= base / INVENTORY_JITTER_DIVISOR as u32);
+    }
+
+    #[test]
+    fn battery_schedule_is_slower_but_still_bounded() {
+        let base = Duration::from_secs(3_600);
+        let ac = scheduled_inventory_delay(base, "agent_test", false);
+        let battery = scheduled_inventory_delay(base, "agent_test", true);
+
+        assert!(battery > ac);
+        assert!(battery <= MAX_EFFECTIVE_INVENTORY_INTERVAL);
+    }
+
+    #[test]
+    fn schedule_never_exceeds_one_day() {
+        let delay = scheduled_inventory_delay(
+            MAX_EFFECTIVE_INVENTORY_INTERVAL,
+            "agent_test",
+            true,
+        );
+
+        assert_eq!(delay, MAX_EFFECTIVE_INVENTORY_INTERVAL);
     }
 
     #[test]
