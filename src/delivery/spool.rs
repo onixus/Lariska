@@ -1,7 +1,7 @@
 use crate::model::InventorySnapshot;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -26,10 +26,18 @@ impl fmt::Display for SpoolError {
 
 impl std::error::Error for SpoolError {}
 
+#[derive(Debug)]
+struct PendingFile {
+    path: PathBuf,
+    modified: SystemTime,
+    size: u64,
+}
+
 /// Durable local queue of not-yet-acknowledged inventory snapshots. A
 /// snapshot is written here *before* any network submission is attempted,
-/// so killing the process mid-upload never loses it. The next
-/// `list_pending` call after restart picks it back up.
+/// so killing the process mid-upload never loses it. Pending entries are
+/// enumerated as paths and decoded one at a time, keeping memory bounded by a
+/// single snapshot rather than by the whole outage backlog.
 pub struct Spool {
     dir: PathBuf,
     quarantine_dir: PathBuf,
@@ -57,8 +65,6 @@ impl Spool {
         let path = self.entry_path(&snapshot.snapshot_id);
         let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
         let payload = snapshot.to_canonical_json();
-        let compressed = zstd::encode_all(payload.as_bytes(), 3)
-            .map_err(|error| SpoolError::Io(format!("failed to compress spool entry: {error}")))?;
 
         if payload.len() > MAX_SNAPSHOT_BYTES {
             return Err(SpoolError::Capacity(format!(
@@ -69,17 +75,32 @@ impl Spool {
             )));
         }
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)
-            .map_err(|error| {
-                SpoolError::Io(format!("failed to create spool temp file: {error}"))
-            })?;
-        file.write_all(&compressed)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| SpoolError::Io(format!("failed to write spool entry: {error}")))?;
+        let write_result = (|| -> Result<(), SpoolError> {
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)
+                .map_err(|error| {
+                    SpoolError::Io(format!("failed to create spool temp file: {error}"))
+                })?;
+            let mut encoder = zstd::stream::write::Encoder::new(file, 3)
+                .map_err(|error| SpoolError::Io(format!("failed to start compression: {error}")))?;
+            encoder
+                .write_all(payload.as_bytes())
+                .map_err(|error| SpoolError::Io(format!("failed to compress snapshot: {error}")))?;
+            let file = encoder
+                .finish()
+                .map_err(|error| SpoolError::Io(format!("failed to finish compression: {error}")))?;
+            file.sync_all()
+                .map_err(|error| SpoolError::Io(format!("failed to sync spool entry: {error}")))?;
+            Ok(())
+        })();
+
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
 
         fs::rename(&temp_path, &path)
             .map_err(|error| SpoolError::Io(format!("failed to persist spool entry: {error}")))?;
@@ -136,11 +157,8 @@ impl Spool {
         Ok(())
     }
 
-    /// Pending snapshots, oldest first by file modification time. Entries
-    /// that fail to parse, exceed the per-entry byte limit, or fail snapshot
-    /// validation are quarantined rather than returned.
-    pub fn list_pending(&self) -> Result<Vec<(PathBuf, InventorySnapshot)>, SpoolError> {
-        let mut candidates: Vec<(PathBuf, SystemTime)> = Vec::new();
+    fn pending_files(&self) -> Result<Vec<PendingFile>, SpoolError> {
+        let mut candidates = Vec::new();
 
         for dir_entry in fs::read_dir(&self.dir)
             .map_err(|error| SpoolError::Io(format!("failed to read spool dir: {error}")))?
@@ -153,56 +171,74 @@ impl Spool {
             if !is_spool_file {
                 continue;
             }
-            let modified = dir_entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            candidates.push((path, modified));
+            let metadata = dir_entry.metadata().map_err(|error| {
+                SpoolError::Io(format!("failed to stat {}: {error}", path.display()))
+            })?;
+            candidates.push(PendingFile {
+                path,
+                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                size: metadata.len(),
+            });
         }
 
-        candidates.sort_by_key(|(_, modified)| *modified);
+        candidates.sort_by_key(|entry| entry.modified);
+        Ok(candidates)
+    }
 
-        let mut pending = Vec::with_capacity(candidates.len());
-        for (path, _) in candidates {
-            match read_entry(&path) {
-                Ok(snapshot) => pending.push((path, snapshot)),
-                Err(_) => self.quarantine(&path)?,
+    /// Pending entry paths, oldest first. No JSON is parsed and no zstd stream
+    /// is expanded here, so a long outage costs only path metadata in memory.
+    pub fn pending_paths(&self) -> Result<Vec<PathBuf>, SpoolError> {
+        self.pending_files()
+            .map(|entries| entries.into_iter().map(|entry| entry.path).collect())
+    }
+
+    /// Decode and validate one pending entry. Corrupt, oversized and invalid
+    /// entries are quarantined and skipped so they cannot block newer data.
+    pub fn read_pending(&self, path: &Path) -> Result<Option<InventorySnapshot>, SpoolError> {
+        match read_entry(path) {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "quarantining invalid spool entry"
+                );
+                self.quarantine(path)?;
+                Ok(None)
             }
         }
+    }
 
+    /// Test/diagnostic helper. Production delivery uses `pending_paths` and
+    /// `read_pending`, so it never retains all decoded snapshots at once.
+    #[cfg(test)]
+    pub fn list_pending(&self) -> Result<Vec<(PathBuf, InventorySnapshot)>, SpoolError> {
+        let mut pending = Vec::new();
+        for path in self.pending_paths()? {
+            if let Some(snapshot) = self.read_pending(&path)? {
+                pending.push((path, snapshot));
+            }
+        }
         Ok(pending)
     }
 
     /// Evicts oldest pending entries until both the configured entry limit
-    /// and the hard spool byte limit are satisfied. The newest unsent
-    /// snapshot is always retained.
+    /// and the hard spool byte limit are satisfied. This operates only on file
+    /// metadata: enforcing capacity must not decode an entire offline backlog.
     pub fn enforce_limit(&self, max_entries: usize) -> Result<Vec<String>, SpoolError> {
-        let pending = self.list_pending()?;
-        if pending.is_empty() {
+        let entries = self.pending_files()?;
+        if entries.is_empty() {
             return Ok(Vec::new());
         }
 
         let max_entries = max_entries.max(1);
-        let mut entries = Vec::with_capacity(pending.len());
-        let mut total_bytes = 0_u64;
-
-        for (path, snapshot) in pending {
-            let size = fs::metadata(&path)
-                .map_err(|error| {
-                    SpoolError::Io(format!(
-                        "failed to stat spool entry {}: {error}",
-                        path.display()
-                    ))
-                })?
-                .len();
-            total_bytes = total_bytes.saturating_add(size);
-            entries.push((path, snapshot, size));
-        }
-
+        let mut total_bytes = entries
+            .iter()
+            .fold(0_u64, |total, entry| total.saturating_add(entry.size));
         let mut remaining_entries = entries.len();
         let mut evicted = Vec::new();
 
-        for (path, snapshot, size) in entries {
+        for entry in entries {
             if remaining_entries <= max_entries && total_bytes <= MAX_SPOOL_BYTES {
                 break;
             }
@@ -210,16 +246,27 @@ impl Spool {
                 break;
             }
 
-            fs::remove_file(&path)
+            fs::remove_file(&entry.path)
                 .map_err(|error| SpoolError::Io(format!("failed to evict spool entry: {error}")))?;
-            sync_parent_dir(&path)?;
+            sync_parent_dir(&entry.path)?;
             remaining_entries -= 1;
-            total_bytes = total_bytes.saturating_sub(size);
-            evicted.push(snapshot.snapshot_id);
+            total_bytes = total_bytes.saturating_sub(entry.size);
+            evicted.push(snapshot_id_from_path(&entry.path));
         }
 
         Ok(evicted)
     }
+}
+
+fn snapshot_id_from_path(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    name.strip_suffix(".json.zst")
+        .or_else(|| name.strip_suffix(".json"))
+        .unwrap_or(name)
+        .to_string()
 }
 
 fn is_zstd_magic(bytes: &[u8]) -> bool {
@@ -227,24 +274,34 @@ fn is_zstd_magic(bytes: &[u8]) -> bool {
 }
 
 fn read_entry(path: &Path) -> Result<InventorySnapshot, String> {
-    let file = File::open(path).map_err(|error| error.to_string())?;
-    let mut content = Vec::new();
-    file.take((MAX_SNAPSHOT_BYTES + 1) as u64)
-        .read_to_end(&mut content)
-        .map_err(|error| error.to_string())?;
-
-    if content.len() > MAX_SNAPSHOT_BYTES {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let compressed_size = file.metadata().map_err(|error| error.to_string())?.len();
+    if compressed_size > MAX_SNAPSHOT_BYTES as u64 {
         return Err(format!(
-            "spool entry exceeds the {MAX_SNAPSHOT_BYTES} byte limit"
+            "spool entry exceeds the {MAX_SNAPSHOT_BYTES} byte compressed-input limit"
         ));
     }
 
-    let json_bytes = if path.to_string_lossy().ends_with(".zst") || is_zstd_magic(&content) {
-        zstd::decode_all(&content[..])
-            .map_err(|error| format!("failed to decompress spool entry: {error}"))?
+    let mut magic = [0_u8; 4];
+    let magic_len = file.read(&mut magic).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let compressed = path.to_string_lossy().ends_with(".zst")
+        || is_zstd_magic(&magic[..magic_len]);
+
+    let mut json_bytes = Vec::with_capacity(64 * 1024);
+    if compressed {
+        let decoder = zstd::stream::read::Decoder::new(file)
+            .map_err(|error| format!("failed to open compressed spool entry: {error}"))?;
+        decoder
+            .take((MAX_SNAPSHOT_BYTES + 1) as u64)
+            .read_to_end(&mut json_bytes)
+            .map_err(|error| format!("failed to decompress spool entry: {error}"))?;
     } else {
-        content
-    };
+        file.take((MAX_SNAPSHOT_BYTES + 1) as u64)
+            .read_to_end(&mut json_bytes)
+            .map_err(|error| error.to_string())?;
+    }
 
     if json_bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(format!(
@@ -361,6 +418,24 @@ mod tests {
     }
 
     #[test]
+    fn compressed_expansion_is_bounded_and_quarantined() {
+        let state_dir = temp_state_dir("compression_bomb");
+        let spool = Spool::open(&state_dir).expect("spool should open");
+        let path = state_dir.join(SPOOL_SUBDIR).join("bomb.json.zst");
+        let oversized = vec![b'x'; MAX_SNAPSHOT_BYTES + 1];
+        let compressed = zstd::encode_all(&oversized[..], 3).expect("test payload should compress");
+        fs::write(&path, compressed).expect("compressed payload should be written");
+
+        assert!(spool.list_pending().expect("list should succeed").is_empty());
+        assert!(state_dir
+            .join(QUARANTINE_SUBDIR)
+            .join("bomb.json.zst")
+            .exists());
+
+        fs::remove_dir_all(&state_dir).ok();
+    }
+
+    #[test]
     fn enforce_limit_evicts_oldest_first_never_the_newest() {
         let state_dir = temp_state_dir("evict");
         let spool = Spool::open(&state_dir).expect("spool should open");
@@ -382,6 +457,26 @@ mod tests {
         assert!(pending
             .iter()
             .any(|(_, snapshot)| snapshot.snapshot_id == "snap-4"));
+
+        fs::remove_dir_all(&state_dir).ok();
+    }
+
+    #[test]
+    fn capacity_enforcement_does_not_decode_entries() {
+        let state_dir = temp_state_dir("metadata_only_eviction");
+        let spool = Spool::open(&state_dir).expect("spool should open");
+        let spool_dir = state_dir.join(SPOOL_SUBDIR);
+        for index in 0..3 {
+            fs::write(spool_dir.join(format!("corrupt-{index}.json")), b"not-json")
+                .expect("corrupt entry should be written");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let evicted = spool.enforce_limit(1).expect("limit should be enforced");
+
+        assert_eq!(evicted, vec!["corrupt-0", "corrupt-1"]);
+        assert_eq!(spool.pending_paths().expect("paths should list").len(), 1);
+        assert!(state_dir.join(QUARANTINE_SUBDIR).read_dir().is_ok());
 
         fs::remove_dir_all(&state_dir).ok();
     }
