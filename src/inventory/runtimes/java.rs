@@ -1,3 +1,4 @@
+use crate::inventory::read_text_file_limited;
 use crate::model::{SoftwareEntry, SoftwareSource};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ pub fn collect_java_runtimes() -> Vec<SoftwareEntry> {
                 continue;
             }
 
-            // macOS JDK bundles have Contents/Home/release
+            // macOS JDK bundles have Contents/Home/release.
             let release_file = if path.join("Contents/Home/release").is_file() {
                 path.join("Contents/Home/release")
             } else if path.join("release").is_file() {
@@ -30,7 +31,7 @@ pub fn collect_java_runtimes() -> Vec<SoftwareEntry> {
                 continue;
             };
 
-            if let Ok(content) = fs::read_to_string(&release_file) {
+            if let Some(content) = read_text_file_limited(&release_file) {
                 if let Some(entry) = parse_java_release(&content, &path) {
                     entries.push(entry);
                 }
@@ -49,11 +50,11 @@ pub fn parse_java_release(content: &str, install_dir: &Path) -> Option<SoftwareE
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(val) = trimmed.strip_prefix("JAVA_VERSION=") {
-            version = Some(val.trim_matches('"').trim().to_string());
+            version = non_empty_release_value(val);
         } else if let Some(val) = trimmed.strip_prefix("IMPLEMENTOR=") {
-            implementor = Some(val.trim_matches('"').trim().to_string());
+            implementor = non_empty_release_value(val);
         } else if let Some(val) = trimmed.strip_prefix("OS_ARCH=") {
-            arch = Some(val.trim_matches('"').trim().to_string());
+            arch = non_empty_release_value(val);
         }
     }
 
@@ -72,6 +73,11 @@ pub fn parse_java_release(content: &str, install_dir: &Path) -> Option<SoftwareE
         source: SoftwareSource::Java,
         install_location: Some(install_dir.display().to_string()),
     })
+}
+
+fn non_empty_release_value(value: &str) -> Option<String> {
+    let value = value.trim_matches('"').trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn candidate_jvm_dirs() -> Vec<PathBuf> {
@@ -99,6 +105,8 @@ fn candidate_jvm_dirs() -> Vec<PathBuf> {
         }
     }
 
+    dirs.sort();
+    dirs.dedup();
     dirs
 }
 
@@ -121,5 +129,10 @@ OS_ARCH="x86_64"
         assert_eq!(entry.publisher.as_deref(), Some("Eclipse Adoptium"));
         assert_eq!(entry.architecture.as_deref(), Some("x86_64"));
         assert_eq!(entry.source, SoftwareSource::Java);
+    }
+
+    #[test]
+    fn rejects_a_release_without_a_version() {
+        assert!(parse_java_release("IMPLEMENTOR=\"Example\"", Path::new("/tmp/jdk")).is_none());
     }
 }

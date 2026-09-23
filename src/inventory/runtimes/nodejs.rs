@@ -1,5 +1,7 @@
+use crate::inventory::read_text_file_limited;
 use crate::model::{SoftwareEntry, SoftwareSource};
 use serde::Deserialize;
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -7,14 +9,8 @@ use std::path::{Path, PathBuf};
 struct PackageJson {
     name: Option<String>,
     version: Option<String>,
-    author: Option<PackageAuthor>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum PackageAuthor {
-    String(String),
-    Object { name: String },
+    #[serde(default)]
+    author: Option<Value>,
 }
 
 /// Collects globally installed Node.js packages.
@@ -41,7 +37,7 @@ pub fn collect_nodejs_packages() -> Vec<SoftwareEntry> {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
 
-            // Handle scoped packages like @angular/cli
+            // Handle scoped packages like @angular/cli.
             if file_name.starts_with('@') {
                 if let Ok(scoped_dir) = fs::read_dir(&path) {
                     for scoped_item in scoped_dir.flatten() {
@@ -64,7 +60,7 @@ pub fn collect_nodejs_packages() -> Vec<SoftwareEntry> {
 
 fn check_package_json(module_dir: &Path) -> Option<SoftwareEntry> {
     let pkg_file = module_dir.join("package.json");
-    let content = fs::read_to_string(pkg_file).ok()?;
+    let content = read_text_file_limited(&pkg_file)?;
     parse_package_json(&content, module_dir)
 }
 
@@ -79,24 +75,7 @@ pub fn parse_package_json(content: &str, install_dir: &Path) -> Option<SoftwareE
         .version
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
-    let publisher = parsed.author.and_then(|a| match a {
-        PackageAuthor::String(s) => {
-            let s = s.trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        }
-        PackageAuthor::Object { name } => {
-            let s = name.trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        }
-    });
+    let publisher = parsed.author.and_then(package_author_name);
 
     Some(SoftwareEntry {
         name,
@@ -106,6 +85,22 @@ pub fn parse_package_json(content: &str, install_dir: &Path) -> Option<SoftwareE
         source: SoftwareSource::Npm,
         install_location: Some(install_dir.display().to_string()),
     })
+}
+
+/// npm accepts several shapes for `author`. Unknown-but-valid shapes must not
+/// make the entire package disappear from inventory; they only mean the
+/// optional publisher field is unavailable.
+fn package_author_name(author: Value) -> Option<String> {
+    let raw = match author {
+        Value::String(value) => Some(value),
+        Value::Object(values) => values
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }?;
+    let value = raw.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn candidate_node_modules_dirs() -> Vec<PathBuf> {
@@ -133,6 +128,8 @@ fn candidate_node_modules_dirs() -> Vec<PathBuf> {
         }
     }
 
+    dirs.sort();
+    dirs.dedup();
     dirs
 }
 
@@ -155,5 +152,19 @@ mod tests {
         assert_eq!(entry.version.as_deref(), Some("5.4.5"));
         assert_eq!(entry.publisher.as_deref(), Some("Microsoft Corp."));
         assert_eq!(entry.source, SoftwareSource::Npm);
+    }
+
+    #[test]
+    fn keeps_package_when_author_has_an_unknown_shape() {
+        let json = r#"{
+            "name": "example-package",
+            "version": "1.2.3",
+            "author": {"email": "maintainer@example.test"}
+        }"#;
+
+        let entry = parse_package_json(json, Path::new("/tmp/example-package"))
+            .expect("package should not be dropped because an optional field is unusual");
+        assert_eq!(entry.name, "example-package");
+        assert_eq!(entry.publisher, None);
     }
 }

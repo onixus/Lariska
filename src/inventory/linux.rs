@@ -1,25 +1,47 @@
 use super::{non_empty, run_command, CollectorResult, CommandRunError};
 use crate::model::{SoftwareEntry, SoftwareSource};
+use std::path::Path;
 use std::time::Duration;
 
-/// Runs every Linux package-manager collector that is actually present on
-/// this system (Plan.md §10.1 "detect available package managers"). A
-/// missing binary is not an error; a binary that exists but fails is.
+const DPKG_DATABASES: &[&str] = &["/var/lib/dpkg/status"];
+const RPM_DATABASES: &[&str] = &["/usr/lib/sysimage/rpm", "/var/lib/rpm"];
+const PACMAN_DATABASES: &[&str] = &["/var/lib/pacman/local"];
+
+/// Runs the Linux package-manager collectors that own a package database on
+/// this host. Merely having a client binary installed is not enough: build
+/// images and administrator toolboxes frequently contain `rpm` on Debian or
+/// `dpkg-query` on RPM systems, and querying all of them wastes I/O and can
+/// produce duplicate/confusing inventory.
+///
+/// If no standard database location is found, fall back to probing available
+/// binaries. This preserves compatibility with installations that relocate a
+/// package database instead of silently returning an empty inventory.
 pub async fn collect(timeout: Duration) -> CollectorResult {
     let mut result = CollectorResult::default();
     let mut any_manager_present = false;
 
-    if let Some(dpkg) = collect_dpkg(timeout).await {
-        any_manager_present = true;
-        result.merge(dpkg);
+    let dpkg_database = database_present(DPKG_DATABASES);
+    let rpm_database = database_present(RPM_DATABASES);
+    let pacman_database = database_present(PACMAN_DATABASES);
+    let any_database = dpkg_database || rpm_database || pacman_database;
+
+    if should_probe_manager(dpkg_database, any_database) {
+        if let Some(dpkg) = collect_dpkg(timeout).await {
+            any_manager_present = true;
+            result.merge(dpkg);
+        }
     }
-    if let Some(rpm) = collect_rpm(timeout).await {
-        any_manager_present = true;
-        result.merge(rpm);
+    if should_probe_manager(rpm_database, any_database) {
+        if let Some(rpm) = collect_rpm(timeout).await {
+            any_manager_present = true;
+            result.merge(rpm);
+        }
     }
-    if let Some(pacman) = collect_pacman(timeout).await {
-        any_manager_present = true;
-        result.merge(pacman);
+    if should_probe_manager(pacman_database, any_database) {
+        if let Some(pacman) = collect_pacman(timeout).await {
+            any_manager_present = true;
+            result.merge(pacman);
+        }
     }
 
     if !any_manager_present {
@@ -29,6 +51,14 @@ pub async fn collect(timeout: Duration) -> CollectorResult {
     }
 
     result
+}
+
+fn database_present(paths: &[&str]) -> bool {
+    paths.iter().any(|path| Path::new(path).exists())
+}
+
+fn should_probe_manager(its_database_is_present: bool, any_database_is_present: bool) -> bool {
+    its_database_is_present || !any_database_is_present
 }
 
 async fn collect_dpkg(timeout: Duration) -> Option<CollectorResult> {
@@ -170,5 +200,16 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "curl");
+    }
+
+    #[test]
+    fn probes_only_the_manager_with_database_evidence() {
+        assert!(should_probe_manager(true, true));
+        assert!(!should_probe_manager(false, true));
+    }
+
+    #[test]
+    fn falls_back_to_binary_probing_when_databases_are_relocated() {
+        assert!(should_probe_manager(false, false));
     }
 }

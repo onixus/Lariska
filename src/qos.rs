@@ -28,7 +28,7 @@ fn enforce_macos_efficiency_cores() {
         const PRIO_DARWIN_BG: libc::c_int = 0x1000;
         libc::setpriority(libc::PRIO_PROCESS, 0, PRIO_DARWIN_BG);
 
-        // Also set thread QoS to background (0x09)
+        // Also set thread QoS to background (0x09).
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0);
     }
 }
@@ -36,11 +36,11 @@ fn enforce_macos_efficiency_cores() {
 #[cfg(target_os = "linux")]
 fn enforce_linux_efficiency_cores() {
     unsafe {
-        // Standard nice 19 (lowest CPU priority for CFS scheduler)
+        // Standard nice 19 (lowest CPU priority for CFS scheduler).
         libc::setpriority(libc::PRIO_PROCESS, 0, 19);
     }
 
-    // Try to detect and pin to E-cores on hybrid Linux systems (Intel Atom / ARM LITTLE)
+    // Try to detect and pin to E-cores on hybrid Linux systems (Intel Atom / ARM LITTLE).
     if let Some(e_cores) = detect_linux_efficiency_cores() {
         if !e_cores.is_empty() {
             pin_to_cpu_indices(&e_cores);
@@ -53,7 +53,7 @@ fn detect_linux_efficiency_cores() -> Option<Vec<usize>> {
     use std::fs;
     use std::path::Path;
 
-    // 1. Intel Hybrid CPUs (Linux 5.18+): /sys/devices/system/cpu/types/cpu_atom/cpus
+    // 1. Intel Hybrid CPUs (Linux 5.18+): /sys/devices/system/cpu/types/cpu_atom/cpus.
     let atom_path = Path::new("/sys/devices/system/cpu/types/cpu_atom/cpus");
     if let Ok(content) = fs::read_to_string(atom_path) {
         let cores = parse_cpulist(content.trim());
@@ -62,7 +62,7 @@ fn detect_linux_efficiency_cores() -> Option<Vec<usize>> {
         }
     }
 
-    // 2. ARM big.LITTLE: check /sys/devices/system/cpu/cpu*/cpu_capacity
+    // 2. ARM big.LITTLE: check /sys/devices/system/cpu/cpu*/cpu_capacity.
     let mut core_capacities: Vec<(usize, u64)> = Vec::new();
     let cpu_dir = Path::new("/sys/devices/system/cpu");
     if let Ok(entries) = fs::read_dir(cpu_dir) {
@@ -93,7 +93,7 @@ fn detect_linux_efficiency_cores() -> Option<Vec<usize>> {
             .min()
             .unwrap_or(0);
 
-        // If heterogeneous core capacities are present (e.g. 300 LITTLE vs 1024 big)
+        // If heterogeneous core capacities are present (e.g. 300 LITTLE vs 1024 big).
         if max_capacity > min_capacity {
             let e_cores: Vec<usize> = core_capacities
                 .into_iter()
@@ -106,7 +106,7 @@ fn detect_linux_efficiency_cores() -> Option<Vec<usize>> {
         }
     }
 
-    // 3. AMD Zen 4c / Zen 5c & x86 CPPC (acpi_cppc/highest_perf or cpuinfo_max_freq)
+    // 3. AMD Zen 4c / Zen 5c & x86 CPPC (acpi_cppc/highest_perf or cpuinfo_max_freq).
     let mut core_cppc: Vec<(usize, u64)> = Vec::new();
     if let Ok(entries) = fs::read_dir(cpu_dir) {
         for entry in entries.flatten() {
@@ -121,7 +121,7 @@ fn detect_linux_efficiency_cores() -> Option<Vec<usize>> {
                         }
                     }
 
-                    // Fallback to max frequency check
+                    // Fallback to max frequency check.
                     let freq_file = entry.path().join("cpufreq/cpuinfo_max_freq");
                     if let Ok(val_str) = fs::read_to_string(freq_file) {
                         if let Ok(freq) = val_str.trim().parse::<u64>() {
@@ -137,7 +137,7 @@ fn detect_linux_efficiency_cores() -> Option<Vec<usize>> {
         let max_perf = core_cppc.iter().map(|(_, p)| *p).max().unwrap_or(0);
         let min_perf = core_cppc.iter().map(|(_, p)| *p).min().unwrap_or(0);
 
-        // If heterogeneous cores exist (e.g. Zen 5 vs Zen 5c)
+        // If heterogeneous cores exist (e.g. Zen 5 vs Zen 5c).
         if max_perf > min_perf && min_perf > 0 {
             let e_cores: Vec<usize> = core_cppc
                 .into_iter()
@@ -217,11 +217,11 @@ fn enforce_windows_eco_qos() {
 
     unsafe {
         let process = GetCurrentProcess();
-        // 1. Lower process priority class
+        // 1. Lower process priority class.
         SetPriorityClass(process, IDLE_PRIORITY_CLASS);
 
-        // 2. Enable Windows 11 / 10 EcoQoS (Power Throttling)
-        // This instructs Intel Thread Director / Windows Scheduler to execute on Efficiency cores
+        // 2. Enable Windows 11 / 10 EcoQoS (Power Throttling).
+        // This instructs Intel Thread Director / Windows Scheduler to execute on E-cores.
         let throttle = ProcessPowerThrottlingState {
             version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
             control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
@@ -306,7 +306,38 @@ fn check_macos_battery() -> bool {
 
 #[cfg(target_os = "windows")]
 fn check_windows_battery() -> bool {
-    false
+    #[repr(C)]
+    struct SystemPowerStatus {
+        ac_line_status: u8,
+        battery_flag: u8,
+        battery_life_percent: u8,
+        system_status_flag: u8,
+        battery_life_time: u32,
+        battery_full_life_time: u32,
+    }
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn GetSystemPowerStatus(status: *mut SystemPowerStatus) -> i32;
+    }
+
+    let mut status = SystemPowerStatus {
+        ac_line_status: u8::MAX,
+        battery_flag: u8::MAX,
+        battery_life_percent: u8::MAX,
+        system_status_flag: 0,
+        battery_life_time: u32::MAX,
+        battery_full_life_time: u32::MAX,
+    };
+
+    let succeeded = unsafe { GetSystemPowerStatus(&mut status) } != 0;
+    succeeded && ac_line_status_is_battery(status.ac_line_status)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn ac_line_status_is_battery(status: u8) -> bool {
+    // SYSTEM_POWER_STATUS: 0 = offline/DC, 1 = online/AC, 255 = unknown.
+    status == 0
 }
 
 #[cfg(test)]
@@ -321,6 +352,13 @@ mod tests {
     #[test]
     fn is_on_battery_returns_boolean() {
         let _on_battery = is_on_battery();
+    }
+
+    #[test]
+    fn windows_ac_status_mapping_is_conservative() {
+        assert!(ac_line_status_is_battery(0));
+        assert!(!ac_line_status_is_battery(1));
+        assert!(!ac_line_status_is_battery(u8::MAX));
     }
 
     #[cfg(target_os = "linux")]

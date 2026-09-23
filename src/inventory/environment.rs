@@ -31,7 +31,7 @@ impl EnvironmentInfo {
 /// Detects whether the agent is running on physical hardware, inside a virtual machine,
 /// or inside a container.
 pub fn detect_environment() -> EnvironmentInfo {
-    // 1. Check for container environment first (highest specificity)
+    // 1. Check for container environment first (highest specificity).
     if let Some(container_engine) = detect_container() {
         return EnvironmentInfo {
             env_type: "container",
@@ -41,7 +41,7 @@ pub fn detect_environment() -> EnvironmentInfo {
         };
     }
 
-    // 2. Check for hypervisor / virtualization
+    // 2. Check for hypervisor / virtualization.
     let (hypervisor, cloud) = detect_hypervisor();
     if hypervisor.is_some() || cloud.is_some() {
         return EnvironmentInfo {
@@ -52,7 +52,7 @@ pub fn detect_environment() -> EnvironmentInfo {
         };
     }
 
-    // 3. Physical hardware fallback
+    // 3. Physical hardware fallback.
     EnvironmentInfo {
         env_type: "physical",
         container_engine: None,
@@ -100,8 +100,12 @@ fn detect_hypervisor() -> (Option<&'static str>, Option<&'static str>) {
 
     #[cfg(target_os = "macos")]
     {
-        // macOS sysctl check for Virtual Machine guest
-        let output = std::process::Command::new("sysctl")
+        // Never search the service's ambient PATH: use the same trusted binary
+        // resolution policy as package-manager collectors.
+        let Some(sysctl) = crate::inventory::find_trusted_binary("sysctl") else {
+            return (None, None);
+        };
+        let output = std::process::Command::new(sysctl)
             .args(["-n", "kern.hv_vmm_present"])
             .output();
 
@@ -156,31 +160,154 @@ fn classify_dmi(vendor: &str, product: &str) -> (Option<&'static str>, Option<&'
 }
 
 /// Product name and version of the running OS, as the inventory schema wants
-/// them: `name` is what an operator calls the machine's OS ("Windows 11 Pro"),
-/// `version` is what a matcher parses ("10.0.22631.4169"). Either may be
-/// `None` on a platform whose collector has not been written yet; the caller
-/// falls back to `std::env::consts::OS` for the name and sends no version.
+/// them: `name` is what an operator calls the OS ("Ubuntu 24.04.1 LTS",
+/// "macOS", "Windows 11 Pro"), and `version` is what the server-side matcher
+/// parses ("24.04", "15.0", "10.0.22631.4169").
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OsRelease {
     pub name: Option<String>,
     pub version: Option<String>,
 }
 
-/// Reads the OS product name and version from the platform.
-///
-/// Windows is the only platform implemented here (#358). Linux and macOS still
-/// report `std::env::consts::OS` with no version, which is why their inventory
-/// matches as `unknown_distro` server-side — tracked separately.
+/// Reads the OS product name and version from native, read-only metadata.
 pub fn detect_os_release() -> OsRelease {
+    #[cfg(target_os = "linux")]
+    {
+        linux_os_release()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos_os_release()
+    }
+
     #[cfg(target_os = "windows")]
     {
         windows_os_release()
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         OsRelease::default()
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_os_release() -> OsRelease {
+    // `/etc/os-release` takes precedence over the vendor fallback according to
+    // the os-release contract. Both files are tiny and read through the same
+    // bounded metadata helper used by runtime collectors.
+    for path in ["/etc/os-release", "/usr/lib/os-release"] {
+        if let Some(content) = crate::inventory::read_text_file_limited(Path::new(path)) {
+            let release = parse_linux_os_release(&content);
+            if release.name.is_some() || release.version.is_some() {
+                return release;
+            }
+        }
+    }
+    OsRelease::default()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_linux_os_release(content: &str) -> OsRelease {
+    let mut values = BTreeMap::<String, String>::new();
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        values
+            .entry(key.to_string())
+            .or_insert_with(|| decode_os_release_value(raw_value));
+    }
+
+    let name = values
+        .get("PRETTY_NAME")
+        .or_else(|| values.get("NAME"))
+        .and_then(|value| non_blank(value));
+    let version = values
+        .get("VERSION_ID")
+        .or_else(|| values.get("VERSION_CODENAME"))
+        .or_else(|| values.get("UBUNTU_CODENAME"))
+        .and_then(|value| non_blank(value));
+
+    OsRelease { name, version }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn decode_os_release_value(raw: &str) -> String {
+    let value = raw.trim();
+    let (value, unescape) = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        (&value[1..value.len() - 1], true)
+    } else if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        (&value[1..value.len() - 1], false)
+    } else {
+        (value, true)
+    };
+
+    if !unescape {
+        return value.to_string();
+    }
+
+    let mut decoded = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            if let Some(escaped) = characters.next() {
+                decoded.push(escaped);
+            } else {
+                decoded.push(character);
+            }
+        } else {
+            decoded.push(character);
+        }
+    }
+    decoded
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn non_blank(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_os_release() -> OsRelease {
+    const SYSTEM_VERSION_PLIST: &str = "/System/Library/CoreServices/SystemVersion.plist";
+
+    let value = match plist::Value::from_file(SYSTEM_VERSION_PLIST) {
+        Ok(value) => value,
+        Err(_) => return OsRelease::default(),
+    };
+    let Some(dictionary) = value.as_dictionary() else {
+        return OsRelease::default();
+    };
+
+    let name = dictionary
+        .get("ProductName")
+        .and_then(plist::Value::as_string)
+        .and_then(non_empty_owned);
+    let version = dictionary
+        .get("ProductUserVisibleVersion")
+        .or_else(|| dictionary.get("ProductVersion"))
+        .and_then(plist::Value::as_string)
+        .and_then(non_empty_owned);
+
+    OsRelease { name, version }
+}
+
+#[cfg(target_os = "macos")]
+fn non_empty_owned(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -341,5 +468,33 @@ mod tests {
         let (hv, cloud) = classify_dmi("Dell Inc.", "PowerEdge R640");
         assert_eq!(hv, None);
         assert_eq!(cloud, None);
+    }
+
+    #[test]
+    fn parses_ubuntu_os_release_for_server_matching() {
+        let release = parse_linux_os_release(
+            r#"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+PRETTY_NAME="Ubuntu 24.04.1 LTS"
+VERSION_CODENAME=noble
+"#,
+        );
+
+        assert_eq!(release.name.as_deref(), Some("Ubuntu 24.04.1 LTS"));
+        assert_eq!(release.version.as_deref(), Some("24.04"));
+    }
+
+    #[test]
+    fn falls_back_to_linux_codename_when_version_id_is_absent() {
+        let release = parse_linux_os_release(
+            "NAME=Debian GNU/Linux\nPRETTY_NAME='Debian GNU/Linux 12 (bookworm)'\nVERSION_CODENAME=bookworm\n",
+        );
+
+        assert_eq!(
+            release.name.as_deref(),
+            Some("Debian GNU/Linux 12 (bookworm)")
+        );
+        assert_eq!(release.version.as_deref(), Some("bookworm"));
     }
 }
