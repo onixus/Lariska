@@ -108,19 +108,34 @@ impl DeliveryClient {
         last.digest != digest || due_for_refresh
     }
 
-    /// Submits every pending spool entry, oldest first. Safe to call at
-    /// startup to resume delivery of anything left over from a prior crash.
+    /// Submits every pending spool entry, oldest first. Paths are enumerated
+    /// first, then each entry is decoded, submitted and dropped before the next
+    /// one is opened. A long outage therefore cannot turn the whole queue into
+    /// one giant in-memory vector.
     pub async fn drain_spool(&self) -> Result<(), String> {
-        let pending = self
+        let pending_paths = self
             .spool
-            .list_pending()
+            .pending_paths()
             .map_err(|error| format!("failed to read spool: {error}"))?;
 
-        for (_, snapshot) in pending {
+        for path in pending_paths {
+            let Some(snapshot) = self
+                .spool
+                .read_pending(&path)
+                .map_err(|error| format!("failed to read spool entry: {error}"))?
+            else {
+                continue;
+            };
+
             let digest = content_digest(&snapshot);
             match self.submit_one(&snapshot).await {
                 Ok(()) => {
-                    self.spool.remove(&snapshot.snapshot_id).ok();
+                    self.spool.remove(&snapshot.snapshot_id).map_err(|error| {
+                        format!(
+                            "snapshot {} was accepted but could not be removed from spool: {error}",
+                            snapshot.snapshot_id
+                        )
+                    })?;
                     let mut last = self.last_accepted.lock().await;
                     *last = Some(LastAccepted {
                         digest,
