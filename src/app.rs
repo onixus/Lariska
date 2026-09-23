@@ -162,6 +162,8 @@ async fn run_async(
         &delivery_client,
         &identity.agent_id,
         &hostname,
+        &config.state_dir,
+        config.inventory_full_refresh_interval,
         runtime_rx,
         shutdown_rx,
     );
@@ -217,6 +219,8 @@ async fn inventory_loop(
     delivery_client: &DeliveryClient,
     agent_id: &str,
     hostname: &str,
+    state_dir: &Path,
+    cache_max_age: Duration,
     mut runtime: tokio::sync::watch::Receiver<managed::Runtime>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -230,7 +234,7 @@ async fn inventory_loop(
     loop {
         tokio::select! {
             _ = &mut timer => {
-                if let Err(error) = collect_and_submit(delivery_client, agent_id, hostname).await {
+                if let Err(error) = collect_and_submit(delivery_client, agent_id, hostname, state_dir, cache_max_age).await {
                     tracing::warn!(%error, "inventory collection/submission failed");
                 }
 
@@ -311,8 +315,10 @@ async fn collect_and_submit(
     delivery_client: &DeliveryClient,
     agent_id: &str,
     hostname: &str,
+    state_dir: &Path,
+    cache_max_age: Duration,
 ) -> Result<(), String> {
-    let collected = inventory::collect_all().await;
+    let collected = inventory::collect_all_cached(state_dir, cache_max_age).await;
     for warning in &collected.warnings {
         tracing::warn!(%warning, "inventory collector warning");
     }

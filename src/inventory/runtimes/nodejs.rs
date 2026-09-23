@@ -103,7 +103,7 @@ fn package_author_name(author: Value) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn candidate_node_modules_dirs() -> Vec<PathBuf> {
+pub(crate) fn candidate_node_modules_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
     #[cfg(target_os = "linux")]

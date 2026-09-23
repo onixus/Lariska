@@ -10,6 +10,7 @@ It collects software inventory, runtime packages, virtualization/container metad
 * **Low Host Impact**:
   * **Background Scheduling**: Uses background/idle process priority (`nice 19`, Windows EcoQoS, Darwin background QoS) and makes a best-effort preference for efficiency cores on supported hybrid systems.
   * **Bounded Collection**: External commands have time and output limits; metadata files, spool entries, and response bodies are read with explicit size ceilings.
+  * **Persistent Collector Cache**: Versioned, bounded cache entries reuse normalized platform and runtime inventory when cheap metadata fingerprints are unchanged; periodic full refreshes prevent stale data from becoming permanent.
   * **Battery & Fleet Awareness**: Detects AC/battery state, stretches inventory frequency on battery power, prevents overlapping collections, and applies deterministic per-agent jitter to avoid fleet-wide scan bursts.
 * **Deep Inventory & Shadow IT Detection**:
   * **OS Packages**: Linux (`dpkg`, `rpm`, `pacman`), Windows Registry (64-bit and 32-bit `Uninstall` views plus selected servicing updates), and macOS application bundles/Homebrew.
