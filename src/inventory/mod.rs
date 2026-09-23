@@ -86,7 +86,7 @@ pub async fn collect_all_with_timeout(timeout: Duration) -> CollectorResult {
     result.entries.extend(runtime_entries);
 
     tracing::debug!(
-        elapsed_ms = started.elapsed().as_millis(),
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         entries = result.entries.len(),
         warnings = result.warnings.len(),
         "inventory collection completed"
@@ -188,9 +188,10 @@ pub(crate) async fn run_command(
     };
 
     let captured = tokio::time::timeout(timeout, async {
-        let stdout = child.stdout.take().ok_or_else(|| {
-            CommandRunError::Other(format!("failed to capture {program} stdout"))
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CommandRunError::Other(format!("failed to capture {program} stdout")))?;
         let mut stdout = stdout.take((MAX_OUTPUT_BYTES + 1) as u64);
         let mut bytes = Vec::with_capacity(64 * 1024);
         stdout.read_to_end(&mut bytes).await.map_err(|error| {
@@ -283,10 +284,8 @@ mod tests {
 
     #[test]
     fn metadata_reader_refuses_oversized_files() {
-        let path = std::env::temp_dir().join(format!(
-            "lariska-metadata-limit-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("lariska-metadata-limit-{}", std::process::id()));
         fs::write(&path, vec![b'x'; MAX_METADATA_FILE_BYTES + 1])
             .expect("test metadata should be written");
 
