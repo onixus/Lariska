@@ -278,8 +278,8 @@ async fn inventory_loop(
 }
 
 fn startup_inventory_delay(base: Duration, agent_id: &str) -> Duration {
-    let max_jitter_secs = (base.as_secs() / INVENTORY_JITTER_DIVISOR)
-        .min(MAX_STARTUP_JITTER.as_secs());
+    let max_jitter_secs =
+        (base.as_secs() / INVENTORY_JITTER_DIVISOR).min(MAX_STARTUP_JITTER.as_secs());
     Duration::from_secs(stable_jitter_secs(agent_id, max_jitter_secs))
 }
 
@@ -303,7 +303,7 @@ fn stable_jitter_secs(agent_id: &str, max_secs: u64) -> u64 {
     }
     let digest = Sha256::digest(agent_id.as_bytes());
     let mut prefix = [0_u8; 8];
-    prefix.copy_from_slice(&digest[..prefix.len()]);
+    prefix.copy_from_slice(&digest[..8]);
     u64::from_be_bytes(prefix) % max_secs.saturating_add(1)
 }
 
@@ -554,11 +554,7 @@ mod tests {
 
     #[test]
     fn schedule_never_exceeds_one_day() {
-        let delay = scheduled_inventory_delay(
-            MAX_EFFECTIVE_INVENTORY_INTERVAL,
-            "agent_test",
-            true,
-        );
+        let delay = scheduled_inventory_delay(MAX_EFFECTIVE_INVENTORY_INTERVAL, "agent_test", true);
 
         assert_eq!(delay, MAX_EFFECTIVE_INVENTORY_INTERVAL);
     }
