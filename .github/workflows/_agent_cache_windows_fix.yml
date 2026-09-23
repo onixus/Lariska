@@ -1,0 +1,47 @@
+name: Fix collector cache Windows lint
+
+on:
+  push:
+    branches:
+      - perf/collector-cache
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/collector-cache
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Scope platform-specific helper
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/inventory/cache.rs")
+          text = path.read_text(encoding="utf-8")
+          old = "    fn add_tree(&mut self, path: &Path, depth: usize) -> Result<(), String> {"
+          new = "    #[cfg(any(target_os = \"linux\", target_os = \"macos\"))]\n" + old
+          if text.count(old) != 1:
+              raise RuntimeError("expected one FingerprintBuilder::add_tree method")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+
+          cargo fmt --all
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/_agent_cache_windows_fix.yml
+          git add src/inventory/cache.rs
+          git commit -m "fix: scope cache tree walker to Unix platforms"
+          git push origin HEAD:perf/collector-cache
