@@ -1,32 +1,34 @@
 # Lariska
 
-Lariska is a high-performance, lightweight, cross-platform endpoint inventory agent designed for the Shapoclyack platform.
-It collects software inventory, runtime packages (Shadow IT detection), virtualization/container environment metadata, and delivers compressed, versioned snapshots with local spooling and crash recovery.
+Lariska is a lightweight, cross-platform endpoint inventory agent for the Shapoclyack platform.
+It collects software inventory, runtime packages, virtualization/container metadata, and submits versioned endpoint snapshots with compressed local spooling and crash recovery.
 
 ---
 
 ## ⚡ Key Features
 
-* **Zero Footprint & Low Host Impact (QoS & E-Core Pinning)**:
-  * **E-Core Isolation**: Automatically detects and restricts execution strictly to Efficiency cores (E-cores / LITTLE cores / compact cores) on **Apple Silicon (M1–M4)**, **Intel Hybrid (Alder/Raptor Lake, Core Ultra)**, **AMD Hybrid (Zen 4c / Zen 5c via CPPC)**, and **ARM big.LITTLE**, avoiding interference with user and foreground processes.
-  * **QoS & EcoQoS**: Sets background priority (`nice 19` / `IDLE_PRIORITY_CLASS` / `ProcessPowerThrottling` / Darwin BG).
-  * **Battery & Power Awareness**: Detects battery vs AC power (`host.power_source`), adapting inventory frequency.
+* **Low Host Impact**:
+  * **Background Scheduling**: Uses background/idle process priority (`nice 19`, Windows EcoQoS, Darwin background QoS) and makes a best-effort preference for efficiency cores on supported hybrid systems.
+  * **Bounded Collection**: External commands have time and output limits; metadata files, spool entries, and response bodies are read with explicit size ceilings.
+  * **Battery & Fleet Awareness**: Detects AC/battery state, stretches inventory frequency on battery power, prevents overlapping collections, and applies deterministic per-agent jitter to avoid fleet-wide scan bursts.
 * **Deep Inventory & Shadow IT Detection**:
-  * **OS Packages**: Linux (`dpkg`, `rpm`, `pacman`), Windows (Registry / 64-bit & 32-bit `Uninstall`), macOS (`/Applications` `Info.plist` + `brew list --versions`).
-  * **Runtime Packages**: Python (`site-packages` / `*.dist-info/METADATA` parser without spawning interpreters), Node.js (global `npm` packages and `package.json`), Java (JVM / JDK `release` metadata).
-  * **Environment Classifier**: Auto-detects Docker, Podman, Kubernetes, containerd, KVM/QEMU, VMware, VirtualBox, Hyper-V, AWS EC2, and GCP.
+  * **OS Packages**: Linux (`dpkg`, `rpm`, `pacman`), Windows Registry (64-bit and 32-bit `Uninstall` views plus selected servicing updates), and macOS application bundles/Homebrew.
+  * **Runtime Packages**: Python (`site-packages` and `*.dist-info/METADATA` without spawning interpreters), global Node.js packages, and installed Java runtimes/JDKs.
+  * **Environment Classifier**: Detects common container, hypervisor, and cloud environments including Docker, Podman, Kubernetes, containerd, KVM/QEMU, VMware, VirtualBox, Hyper-V, AWS, and GCP.
 * **Security & Hardening**:
-  * **PATH-Hijacking Protection**: Strict executable resolution against trusted system directories with directory traversal prevention.
-  * **Identifier Hashing**: One-way SHA-256 pseudonymized hardware identifiers (`/etc/machine-id`, `MachineGuid`, `IOPlatformUUID`).
-  * **Zero-Leak Telemetry**: Redacted secret paths, in-memory-only JWTs, bounded sanitized error messages.
+  * **Trusted Executable Resolution**: External collectors are resolved only from approved system directories instead of the ambient `PATH`.
+  * **Identifier Hashing**: Platform identifiers are normalized and one-way hashed before submission.
+  * **Secret-Safe Telemetry**: Provisioning keys and JWTs are not logged; error details and response bodies are bounded.
+  * **Authoritative Snapshots Only**: A timed-out or failed collector does not publish a partial snapshot that could be misinterpreted as mass software removal.
 * **Remote Management**:
-  * **Settings without a restart**: heartbeat/inventory intervals and log level are set from the Shapoclyack console and take effect on the next tick; `server_url`, the provisioning key, `state_dir` and the transport-security switches are deliberately local-only.
-  * **Verified Self-Upgrade**: an offered build is downloaded over the agent's own TLS trust, checked against a published SHA-256, installed with the previous binary kept beside it, and refused outright over plain HTTP or for a foreign target triple.
-* **Resilient Delivery & Delta Sync**:
-  * **zstd Compression**: Spool entries saved as `.json.zst` and transmitted with `Content-Encoding: zstd`.
-  * **Spool-then-Submit**: Durable local SQLite/file-based FIFO queue with exponential jittered backoff, terminal quarantine, and crash recovery.
-  * **Delta-Sync Engine**: Computes granular `added` / `removed` / `modified` diffs between snapshots.
-  * **Crash Reporter**: Global panic hook writing `crash_report.json` to disk, recovered and logged on restart.
+  * **Settings without Restart**: Heartbeat/inventory intervals and log level can be managed through Shapoclyack; server URL, credentials, state paths, and transport-security switches remain local-only.
+  * **Verified Self-Upgrade**: An offered build is downloaded through the configured TLS trust, checked against the published SHA-256, refused for a foreign target triple, and installed while retaining the previous binary for rollback.
+* **Resilient Delivery**:
+  * **Compressed Local Spool**: Pending snapshots are stored as `.json.zst`; HTTP inventory submission currently uses the full versioned JSON contract.
+  * **Spool-then-Submit**: A durable file-based FIFO queue provides atomic persistence, bounded retry, terminal quarantine, and restart recovery.
+  * **Bounded Recovery**: Pending snapshots are decoded and delivered one at a time; compressed and decompressed sizes are limited.
+  * **Local Diff Model**: The model can calculate `added`, `removed`, and `modified` software entries. The current delivery contract submits full snapshots and lets Shapoclyack compute persisted changes.
+  * **Crash Reporter**: A panic hook writes a bounded local crash report that is detected on the next start.
 
 ---
 
@@ -34,7 +36,7 @@ It collects software inventory, runtime packages (Shadow IT detection), virtuali
 
 Download the archive for your platform from the [latest GitHub release](https://github.com/onixus/Lariska/releases/latest), create a tenant provisioning key in Shapoclyack, and configure Lariska with the Shapoclyack server URL and the path to that key.
 
-See [Installation and Shapoclyack connection](docs/INSTALL.md) for complete Linux, macOS, and Windows instructions, service setup, verification, and troubleshooting.
+See [Installation and Shapoclyack connection](docs/INSTALL.md) for Linux, macOS, and Windows setup, service installation, verification, and troubleshooting.
 
 ---
 
@@ -47,15 +49,14 @@ cargo fmt --check
 # Strict Clippy linter
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Full test suite (51 library tests + 2 binary tests)
+# Full test suite
 cargo test --all-targets --all-features
 
 # Build optimized release binary
 cargo build --release
 ```
 
-### Local Jenkins CI Pipeline
-Lariska includes a declarative [Jenkinsfile](file:///Users/onixus/Git/Lariska/Jenkinsfile) configured for local Jenkins at `http://localhost:8081/job/lariska/`. Every push runs formatting, clippy, test matrix, and release artifact builds in an isolated `rust:1-bookworm` container.
+GitHub Actions runs formatting, Clippy, tests on Linux/Windows/macOS, dependency and license checks, secret scanning, APEX contract validation, and a cross-repository Shapoclyack fixture. A declarative [Jenkinsfile](Jenkinsfile) is also included for local CI deployments.
 
 ---
 
@@ -67,6 +68,8 @@ Lariska includes a declarative [Jenkinsfile](file:///Users/onixus/Git/Lariska/Je
 # Print normalized canonical inventory JSON to stdout
 cargo run -- inventory --output json
 ```
+
+Diagnostic output may include partial results and collector warnings. The daemon is stricter: it submits only authoritative snapshots for which all required collectors completed.
 
 ### Validate Configuration
 
@@ -88,8 +91,8 @@ lariska run --config /etc/lariska/lariska.toml --service
 
 ## 📖 Documentation Reference
 
-* **[docs/INSTALL.md](file:///Users/onixus/Git/Lariska/docs/INSTALL.md)** — Step-by-step deployment and service configuration guide.
-* **[docs/hardening.md](file:///Users/onixus/Git/Lariska/docs/hardening.md)** — Security architecture, data collection bounds, hashing policy, and secrets management.
-* **[docs/RELEASE.md](file:///Users/onixus/Git/Lariska/docs/RELEASE.md)** — Release procedures, service installation, upgrade, rollback, and disaster recovery.
-* **[CHANGELOG.md](file:///Users/onixus/Git/Lariska/CHANGELOG.md)** — Complete version history and release notes.
-* **[packaging/](file:///Users/onixus/Git/Lariska/packaging)** — Native service definitions for `systemd`, `launchd`, and Windows SCM.
+* **[Installation](docs/INSTALL.md)** — Deployment, service configuration, verification, and troubleshooting.
+* **[Security hardening](docs/hardening.md)** — Collection bounds, hashing policy, secrets management, and service isolation.
+* **[Release procedures](docs/RELEASE.md)** — Publishing, upgrade, rollback, and disaster recovery.
+* **[Changelog](CHANGELOG.md)** — Version history and release notes.
+* **[Packaging](packaging/)** — Native service definitions and installers for systemd, launchd, and Windows SCM.
