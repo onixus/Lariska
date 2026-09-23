@@ -69,10 +69,10 @@ lariska check-config --config /path/to/lariska.toml
 
 ## 3. Linux
 
-Choose `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu` from the [latest release](https://github.com/onixus/Lariska/releases/latest). The source version at the time of this document is `0.3.1`; use the actual release tag being installed.
+Choose `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu` from the [latest release](https://github.com/onixus/Lariska/releases/latest). The source version at the time of this document is `0.4.0`; use the actual release tag being installed.
 
 ```bash
-VERSION=0.3.1
+VERSION=0.4.0
 TARGET=x86_64-unknown-linux-gnu
 curl -fLO "https://github.com/onixus/Lariska/releases/download/v${VERSION}/lariska-v${VERSION}-${TARGET}.tar.gz"
 curl -fLO "https://github.com/onixus/Lariska/releases/download/v${VERSION}/lariska-v${VERSION}-${TARGET}.tar.gz.sha256"
@@ -101,7 +101,7 @@ sudo -u lariska /usr/bin/lariska inventory --output json
 Install the supplied unit:
 
 ```bash
-VERSION=0.3.1
+VERSION=0.4.0
 curl -fsSL \
   "https://raw.githubusercontent.com/onixus/Lariska/v${VERSION}/packaging/systemd/lariska.service" \
   | sudo tee /etc/systemd/system/lariska.service >/dev/null
@@ -118,7 +118,7 @@ The hardened unit writes state under `/var/lib/lariska`. Self-replacement of a p
 Choose `aarch64-apple-darwin` for Apple Silicon or `x86_64-apple-darwin` for Intel.
 
 ```bash
-VERSION=0.3.1
+VERSION=0.4.0
 TARGET=aarch64-apple-darwin
 curl -fLO "https://github.com/onixus/Lariska/releases/download/v${VERSION}/lariska-v${VERSION}-${TARGET}.tar.gz"
 curl -fLO "https://github.com/onixus/Lariska/releases/download/v${VERSION}/lariska-v${VERSION}-${TARGET}.tar.gz.sha256"
@@ -141,7 +141,7 @@ sudo install -d -m 0700 "/Library/Application Support/Lariska/state"
 sudo install -d -m 0755 /Library/Logs/Lariska
 sudo install -m 0600 provisioning.key "/Library/Application Support/Lariska/provisioning.key"
 sudo install -m 0600 lariska.toml "/Library/Application Support/Lariska/lariska.toml"
-VERSION=0.3.1
+VERSION=0.4.0
 sudo curl -fsSL \
   "https://raw.githubusercontent.com/onixus/Lariska/v${VERSION}/packaging/launchd/com.shapoclyack.lariska.plist" \
   -o /Library/LaunchDaemons/com.shapoclyack.lariska.plist
@@ -161,7 +161,7 @@ Release archives are not yet signed/notarized, so test Gatekeeper behavior in th
 Download the `x86_64-pc-windows-msvc` ZIP and matching `.sha256` file from the latest release. From an elevated Command Prompt:
 
 ```bat
-certutil -hashfile lariska-v0.3.1-x86_64-pc-windows-msvc.zip SHA256
+certutil -hashfile lariska-v0.4.0-x86_64-pc-windows-msvc.zip SHA256
 install-lariska.cmd https://shapoclyack.example.com octo-pk-...
 ```
 
