@@ -1,6 +1,4 @@
-use super::{
-    non_empty, run_command, CollectorResult, CommandRunError, MAX_METADATA_FILE_BYTES,
-};
+use super::{non_empty, run_command, CollectorResult, CommandRunError, MAX_METADATA_FILE_BYTES};
 use crate::model::{compare_versions, SoftwareEntry, SoftwareSource};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -159,9 +157,7 @@ fn parse_brew_versions(output: &str) -> Vec<SoftwareEntry> {
             // one deterministically instead of whichever token appeared first.
             let version = fields
                 .map(ToOwned::to_owned)
-                .max_by(|left, right| {
-                    compare_versions(Some(left.as_str()), Some(right.as_str()))
-                });
+                .max_by(|left, right| compare_versions(Some(left.as_str()), Some(right.as_str())));
             Some(SoftwareEntry {
                 name: name.to_string(),
                 version,
