@@ -89,9 +89,9 @@ impl Spool {
             encoder
                 .write_all(payload.as_bytes())
                 .map_err(|error| SpoolError::Io(format!("failed to compress snapshot: {error}")))?;
-            let file = encoder
-                .finish()
-                .map_err(|error| SpoolError::Io(format!("failed to finish compression: {error}")))?;
+            let file = encoder.finish().map_err(|error| {
+                SpoolError::Io(format!("failed to finish compression: {error}"))
+            })?;
             file.sync_all()
                 .map_err(|error| SpoolError::Io(format!("failed to sync spool entry: {error}")))?;
             Ok(())
@@ -286,8 +286,7 @@ fn read_entry(path: &Path) -> Result<InventorySnapshot, String> {
     let magic_len = file.read(&mut magic).map_err(|error| error.to_string())?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| error.to_string())?;
-    let compressed = path.to_string_lossy().ends_with(".zst")
-        || is_zstd_magic(&magic[..magic_len]);
+    let compressed = path.to_string_lossy().ends_with(".zst") || is_zstd_magic(&magic[..magic_len]);
 
     let mut json_bytes = Vec::with_capacity(64 * 1024);
     if compressed {
@@ -426,7 +425,10 @@ mod tests {
         let compressed = zstd::encode_all(&oversized[..], 3).expect("test payload should compress");
         fs::write(&path, compressed).expect("compressed payload should be written");
 
-        assert!(spool.list_pending().expect("list should succeed").is_empty());
+        assert!(spool
+            .list_pending()
+            .expect("list should succeed")
+            .is_empty());
         assert!(state_dir
             .join(QUARANTINE_SUBDIR)
             .join("bomb.json.zst")
