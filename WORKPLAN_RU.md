@@ -1,250 +1,302 @@
-# План работ по Lariska Endpoint Inventory Agent
+# Актуальный план работ Lariska
 
-## Цель
+Статус на 23 сентября 2026 года. Документ описывает оставшуюся работу после стабилизации ветки 0.3.x и заменяет исторический список задач, большая часть которого уже выполнена.
 
-Сделать Lariska production-ready endpoint-агентом для платформы Shapoclyack. Первый производственный сценарий — инвентаризация установленного ПО на Linux, Windows и macOS, регистрация агента, heartbeat и надёжная доставка версионированных inventory snapshots в API Shapoclyack.
+## 1. Цель продукта
 
-## Этап 0 — Основа проекта
+Lariska должна быть production-ready endpoint-агентом Shapoclyack, который:
 
-Цель: привести репозиторий к стандартной структуре Rust-проекта и добиться базовой сборки.
+- достоверно собирает системное и runtime-ПО на Linux, Windows и macOS;
+- создаёт предсказуемо малую нагрузку на конечный хост;
+- не теряет данные при перезапуске, сетевом сбое или недоступности API;
+- не превращает частичный сбор в ложные удаления и переустановки;
+- безопасно принимает ограниченную управляющую политику;
+- обновляется проверяемым и восстанавливаемым способом;
+- предоставляет оператору измеримые показатели свежести, полноты и влияния на хост.
 
-Задачи:
+## 2. Текущий baseline 0.3.x
 
-- переименовать `cargo.toml` в `Cargo.toml`;
-- добавить секцию `[package]`, Rust edition и минимальную metadata;
-- перенести `main.rs` в `src/main.rs`;
-- добавить `.gitignore`;
-- убрать вывод placeholder JWT и любых секретов;
-- описать contributor commands в `README.md`;
-- добавить CI skeleton;
-- добиться прохождения `cargo fmt`, `cargo clippy` и `cargo test`.
+| Направление | Статус | Что уже есть |
+| --- | --- | --- |
+| Основа Rust-проекта | Выполнено | Модульная структура, CLI, cross-platform build и CI |
+| Identity и auth | Выполнено | Persistent `agent_id`, hashed identifiers, provisioning exchange, JWT refresh |
+| Heartbeat и управление | Выполнено | Registration/heartbeat, managed intervals и log level с локальной валидацией |
+| Коллекторы ОС | Выполнено для v1 | dpkg/RPM/pacman, Windows Registry/CBS, macOS bundles/Homebrew |
+| Runtime-инвентаризация | Выполнено для v1 | Python, глобальный Node.js, Java/JDK |
+| Низкое влияние | Выполнено на архитектурном уровне | Background QoS, лимиты, jitter, battery-aware schedule, запрет overlapping scans |
+| Cache | Выполнено | Persistent fingerprint cache, ограничения размера/обхода, forced full refresh |
+| Полнота | Выполнена консервативная модель | Неполный цикл не публикуется целиком |
+| Delivery | Выполнено | zstd spool, independent worker, retry, quarantine, persisted accepted digest |
+| Packaging | Частично | systemd/launchd/Windows SCM и заготовки deb/RPM; production signing не завершён |
+| Self-update | Частично | TLS policy, target triple и SHA-256; нет signed manifest и health rollback |
+| Документация | Актуализируется | README EN/RU, versioned wiki, Plan и этот roadmap |
 
-Критерии приёмки:
+## 3. Приоритет P0: точность данных
 
-- clean checkout собирается стабильным Rust;
-- тесты проходят локально;
-- CI запускается минимум на Linux;
-- в логах нет секретов или токенов.
+### 3.1 Inventory schema v2: installation identity
 
-## Этап 1 — Архитектура, конфигурация и identity
-
-Цель: заложить модульную архитектуру агента без сетевой отправки inventory.
-
-Задачи:
-
-- разделить код на модули `app`, `config`, `identity`, `model`, `telemetry`;
-- реализовать загрузку TOML-конфига и environment overrides;
-- валидировать `server_url`, `provisioning_key_file`, `state_dir`, интервалы и HTTPS policy;
-- реализовать persistent `agent_id` в защищённом state directory;
-- создавать identity атомарно;
-- детектировать повреждённый state без молчаливого создания второго identity;
-- добавить команды `lariska run`, `lariska check-config`, `lariska inventory --output json`.
-
-Критерии приёмки:
-
-- перезапуск сохраняет тот же `agent_id`;
-- повреждённый identity-файл приводит к понятной ошибке;
-- secrets не попадают в diagnostics.
-
-## Этап 2 — Wire models и API-контракт
-
-Цель: зафиксировать формат обмена с Shapoclyack API.
+Проблема: schema v1 использует product comparison key без installation instance. Параллельные версии JDK, Visual C++ Runtime, Python environments и другие side-by-side установки могут схлопываться, скрывая старую уязвимую копию.
 
 Задачи:
 
-- добавить versioned Serde-модели для auth, registration, heartbeat и inventory;
-- отделить transport-модели от внутренних domain-моделей;
-- добавить `schema_version` для inventory payload;
-- подготовить shared JSON fixtures;
-- согласовать с сервером endpoints:
-  - `POST /api/v1/auth/exchange`;
-  - `POST /api/agent/register`;
-  - `POST /api/agent/heartbeat`;
-  - `POST /api/v1/endpoint/inventory`;
-- согласовать payload limits, idempotency behavior и response codes.
+- отделить `product_identity` от `installation_identity`;
+- добавить стабильный `package_id` там, где он существует: MSI ProductCode, bundle ID, package-manager ID;
+- добавить `scope`: system, user, runtime, container;
+- добавить privacy-safe `install_instance_id`;
+- передавать нормализованный или хешированный install location только когда он нужен для различения;
+- различать архитектуру, канал и user scope без передачи имени пользователя;
+- подготовить migration/dual-read в Shapoclyack;
+- обновить golden fixtures в обоих репозиториях;
+- сохранить приём schema v1 на период обновления флота.
 
 Критерии приёмки:
 
-- golden JSON fixture совпадает с контрактом сервера;
-- модели сериализуются детерминированно;
-- неизвестные или optional-значения обрабатываются явно.
+- JDK 17 и JDK 21 на одном хосте остаются двумя записями;
+- уязвимая старая версия не скрывается более новой;
+- повторная отправка не создаёт дубликаты installation instances;
+- mixed fleet из v1/v2 агентов корректно отображается на сервере.
 
-## Этап 3 — Authentication, registration и heartbeat
+Зависимость: синхронный PR в Shapoclyack для schema, хранения, diff и CVE matching.
 
-Цель: реализовать безопасный жизненный цикл агента.
+### 3.2 Source-aware completeness
+
+Проблема: текущая безопасная модель отклоняет весь snapshot, если один обязательный collector неполон. Это исключает ложные удаления, но задерживает обновления здоровых источников.
 
 Задачи:
 
-- реализовать HTTP-клиент с timeout, TLS verification и ограничением размера ответов;
-- обменивать provisioning key на short-lived JWT;
-- хранить JWT только в памяти;
-- обновлять JWT до истечения срока с jitter;
-- на `401` выполнять один refresh и один retry исходного запроса;
-- реализовать idempotent registration;
-- реализовать heartbeat loop со статусами `idle`, `busy`, `error`;
-- редактировать логи так, чтобы в них не попадали токены и authorization headers.
+- добавить статусы источников: `complete`, `partial`, `failed`, `not_applicable`;
+- добавить timestamp последнего полного результата по источнику;
+- передавать collector version и bounded diagnostic code;
+- научить Shapoclyack сохранять предыдущий effective set для failed/partial source;
+- разрешать diff/removal только для источника со статусом `complete`;
+- не запускать CVE rematch для источника, чьё effective state не изменилось;
+- сохранить fallback «не публиковать весь snapshot» для старого сервера.
 
 Критерии приёмки:
 
-- mock-server lifecycle tests проходят;
-- transient network/server errors восстанавливаются без restart;
-- provisioning key и JWT отсутствуют в captured logs.
+- падение Python collector не мешает обновить dpkg inventory;
+- падение dpkg не создаёт ни одного `removed` для пакетов dpkg;
+- восстановление источника создаёт только реальные изменения;
+- UI показывает degraded source и возраст последнего полного результата.
 
-## Этап 4 — Inventory collectors
+Зависимость: server-side effective inventory и обратная совместимость контракта.
 
-Цель: реализовать кроссплатформенный сбор установленного ПО.
+## 4. Приоритет P0: безопасное обновление агента
 
-Задачи:
+### 4.1 Streaming download и строгие лимиты
 
-- добавить общий collector trait;
-- добавить абстракцию command execution для тестов;
-- реализовать Linux collectors для `dpkg-query`, `rpm`, `pacman`, опционально Snap и Flatpak;
-- реализовать Windows collectors через uninstall registry, не используя `Win32_Product`;
-- реализовать macOS collectors для application bundles, Homebrew и `pkgutil`;
-- нормализовать whitespace, Unicode, architecture и source names;
-- удалять exact duplicates;
-- сортировать entries детерминированно;
-- возвращать warnings при частичных ошибках collector-ов.
+- использовать `size_bytes` из update policy;
+- ввести hard maximum независимо от ответа сервера;
+- писать download в staging-файл потоково;
+- считать SHA-256 в процессе записи;
+- выполнять `fsync` файла и каталога до swap;
+- удалять staging при любой ошибке.
 
-Критерии приёмки:
+### 4.2 Подписанный release manifest
 
-- fixture tests покрывают каждый поддерживаемый source;
-- command timeout и non-zero exit не приводят к panic;
-- одинаковый input даёт одинаковый canonical output.
+- выбрать Ed25519 для подписи manifest;
+- встроить доверенный public key или версионированный keyring;
+- подписывать version, platform, size, SHA-256 и срок действия;
+- добавить rotation/revocation procedure;
+- запретить rollback ниже зафиксированной безопасной версии, кроме локального аварийного override.
 
-## Этап 5 — Durable delivery и retry policy
+### 4.3 Native install и health rollback
 
-Цель: гарантировать доставку inventory при временных сбоях сети или сервера.
-
-Задачи:
-
-- реализовать локальную durable spool queue;
-- записывать snapshot атомарно до отправки;
-- генерировать `snapshot_id` один раз и сохранять его между retries;
-- сериализовать canonical JSON;
-- считать SHA-256 digest;
-- не отправлять unchanged snapshot до full-refresh deadline;
-- отправлять inventory с `Idempotency-Key`;
-- удалять snapshot только после server acknowledgement;
-- retry-ить network errors, `408`, `425`, `429` и `5xx`;
-- уважать `Retry-After`;
-- использовать exponential backoff with full jitter;
-- quarantine malformed spool entries.
+- Linux package installs обновлять через deb/RPM path, а не записью в `/usr/bin` из непривилегированного service;
+- Windows использовать signed MSI/service updater;
+- macOS использовать signed/notarized package;
+- после restart требовать health acknowledgement;
+- автоматически восстанавливать previous build при отсутствии healthy heartbeat;
+- сохранять bounded update history и причину rollback.
 
 Критерии приёмки:
 
-- crash во время upload не теряет snapshot;
-- duplicate delivery создаёт один server-side snapshot;
-- disk limits и malformed spool files покрыты тестами.
+- interrupted, oversized, foreign-platform, unsigned и downgraded build не меняет текущий executable;
+- неуспешный запуск новой версии автоматически возвращает предыдущую;
+- стандартная hardened service-конфигурация не конфликтует с update path.
 
-## Этап 6 — Service lifecycle и packaging
+## 5. Приоритет P1: budgets, метрики и benchmark
 
-Цель: подготовить агент к запуску как native background service.
+### 5.1 Общий collection budget
 
-Задачи:
+Добавить cooperative budget:
 
-- реализовать graceful shutdown по SIGTERM/Ctrl-C;
-- добавить single-instance lock для одного `state_dir`;
-- подготовить systemd unit для Linux;
-- подготовить Windows Service integration;
-- подготовить launchd plist для macOS;
-- задокументировать platform-specific paths;
-- добавить hardened service settings;
-- описать upgrade, rollback и uninstall behavior.
+- общий deadline цикла;
+- deadline каждого источника;
+- `max_files`, `max_entries`, `max_bytes_read`;
+- cancellation token при shutdown;
+- статус `partial` при исчерпании бюджета;
+- отсутствие detached blocking work после остановки service.
+
+### 5.2 Наблюдаемость по источникам
+
+Логировать и агрегировать без раскрытия inventory:
+
+- duration, CPU time и item count;
+- cache hit/miss и причина invalidation;
+- complete/partial/failed;
+- число файлов и прочитанных байтов;
+- external process count и timeout;
+- queue depth, oldest entry age, retries и quarantine count;
+- время последнего accepted snapshot.
+
+### 5.3 Benchmark suite
+
+Сценарии:
+
+- 1 000, 10 000 и 50 000 software entries;
+- cold scan и warm-cache scan;
+- 1, 50 и 200 spool entries;
+- сутки offline;
+- compression bomb и повреждённый cache/spool;
+- battery/AC;
+- collector timeout;
+- shutdown во время filesystem scan и upload;
+- массовый fleet restart с одинаковой policy.
+
+Результаты должны публиковать wall time, process CPU, peak RSS, disk reads/files, cache ratio и freshness. Числовые regression thresholds фиксируются после получения baseline на типовых workstation/server profiles, а не выбираются методом корпоративной астрологии.
+
+## 6. Приоритет P1: расширение покрытия
+
+### Linux
+
+- Snap и Flatpak;
+- RPM epoch и distro-specific package identity;
+- явный source для pacman вместо `other`;
+- container image/package scope только при безопасной и ограниченной модели.
+
+### Windows
+
+- MSIX/AppX;
+- ARM64 и эмуляционные views;
+- package IDs для non-MSI uninstall entries;
+- улучшенная user-scope модель без монтирования offline hives;
+- code-signing publisher evidence при приемлемой стоимости.
+
+### macOS
+
+- `pkgutil` receipts;
+- MacPorts при наличии;
+- bundle ID и signing team ID;
+- корректная архитектура universal/native приложений.
+
+### Runtime ecosystems
+
+- opt-in user-level Python/pyenv/venv;
+- nvm и дополнительные Node.js roots;
+- SDKMAN;
+- .NET runtimes/SDK;
+- строгие бюджеты и privacy policy для user scope.
+
+Зависимость: параллельное развитие advisory providers и matching в Shapoclyack. Собирать данные, которыми сервер не умеет пользоваться, можно, но это дорогой способ пополнять JSON.
+
+## 7. Приоритет P1: production packaging
+
+- реально собирать и устанавливать `.deb`/RPM в CI;
+- добавить package smoke tests в контейнерах/VM;
+- подготовить signed MSI;
+- подготовить signed/notarized macOS pkg;
+- определить ownership конфигурации, identity и cache при upgrade/uninstall;
+- проверить upgrade N-1 → N и rollback N → N-1;
+- выпускать SBOM, provenance/attestation и checksums;
+- документировать минимальные версии ОС и архитектуры.
 
 Критерии приёмки:
 
-- install/start/restart/stop работает на каждой целевой платформе;
-- state переживает upgrade;
-- сервис запускается с минимальными привилегиями.
+- clean install, restart, upgrade, rollback и uninstall проверяются автоматически;
+- identity и pending spool не теряются при штатном upgrade;
+- package manager остаётся владельцем установленного binary.
 
-## Этап 7 — Observability и security hardening
+## 8. Приоритет P2: транспорт
 
-Цель: сделать агент безопасным и сопровождаемым в production.
+### Wire compression
 
-Задачи:
+- добавить bounded streaming zstd decode в Shapoclyack;
+- проверять compressed и decompressed size;
+- отклонять неизвестный `Content-Encoding`;
+- включить agent wire compression только после server hardening;
+- измерить реальный выигрыш CPU/network.
 
-- добавить structured logs;
-- логировать event name, snapshot id, durations, counts, retry decisions и status codes;
-- не логировать provisioning keys, JWT, Authorization headers, raw machine identifiers и полный software inventory;
-- добавить counters/timings для collection, queue, upload, auth refresh и heartbeat;
-- включить TLS verification по умолчанию;
-- добавить dependency audit;
-- добавить license policy;
-- добавить secret scanning;
-- задокументировать собираемые данные и privacy implications.
+### Delta transport
 
-Критерии приёмки:
+- определить base snapshot acknowledgement;
+- хранить full snapshot recovery point;
+- обрабатывать потерянную базу и out-of-order delivery;
+- периодически отправлять full snapshot;
+- не усложнять v2 rollout одновременно с installation identity без отдельного решения.
 
-- production diagnostics не раскрывают чувствительные данные;
-- audit и secret scanning проходят в CI;
-- security expectations описаны в документации.
+Критерий: delta никогда не может оставить сервер в состоянии, которое нельзя восстановить полной отправкой.
 
-## Этап 8 — Testing strategy
+## 9. Приоритет P2: операторская диагностика
 
-Цель: покрыть критичные сценарии автоматизированными тестами.
+Добавить `lariska diagnostics` с безопасным bounded output:
 
-Задачи:
+- версия и target triple;
+- возраст identity без raw identifier;
+- статус/возраст cache по источникам;
+- последний complete collection;
+- queue depth и oldest age;
+- last accepted timestamp;
+- managed revision и причина последнего rejection;
+- update staging/rollback state;
+- проверка прав на state/config/secret paths;
+- connectivity probe без вывода credentials.
 
-- unit tests для config, identity, collectors, normalization, retry, spool и redaction;
-- contract tests с mock server для auth/register/heartbeat/inventory;
-- platform smoke tests на Linux, Windows и macOS;
-- end-to-end test с disposable Shapoclyack stack.
+Подготовить runbooks:
 
-Критерии приёмки:
+- server unavailable;
+- invalid provisioning key;
+- collector timeout;
+- incomplete inventory;
+- growing spool;
+- corrupt cache/spool;
+- failed update and rollback;
+- duplicate identity after manual state deletion.
 
-- тесты не зависят от конкретного набора ПО на машине разработчика;
-- контрактные fixtures защищают client/server integration;
-- CI проверяет все целевые платформы.
+## 10. Рекомендуемые PR-границы
 
-## Этап 9 — CI/CD и release
+1. Schema v2 models и fixtures в Lariska.
+2. Schema v2 ingest/storage/diff в Shapoclyack.
+3. Dual-stack rollout и migration tests.
+4. Source completeness model в агенте.
+5. Effective per-source inventory в сервере.
+6. Streaming update download и size limits.
+7. Signed manifest и key rotation.
+8. Platform-native updater/rollback отдельно для каждой ОС.
+9. Collection budget и cancellation.
+10. Per-source telemetry и benchmark harness.
+11. Linux collector expansion.
+12. Windows collector expansion.
+13. macOS/runtime expansion.
+14. Native packaging CI.
+15. Wire compression.
+16. Operator diagnostics и runbooks.
 
-Цель: автоматизировать сборку, проверку и выпуск артефактов.
+Не объединять cross-repository schema, updater и новые collectors в один PR. Такое изменение сложно проверить, откатить и даже честно описать.
 
-Задачи:
+## 11. Definition of Done для каждого изменения
 
-- настроить build matrix для Linux, Windows и macOS;
-- публиковать binaries для x86_64/aarch64, где применимо;
-- генерировать SHA-256 checksums;
-- генерировать SBOM;
-- вести changelog и upgrade notes;
-- подготовить `.deb`, `.rpm`, MSI и macOS package после стабилизации binary workflow.
+- `cargo fmt --check`;
+- strict Clippy без warnings;
+- полный Rust test suite;
+- native CI на Linux, Windows и macOS;
+- dependency/license policy и secret scan;
+- APEX contract validation;
+- cross-repository fixture при изменении wire model;
+- тесты malformed/oversized/interrupted path;
+- документация и upgrade/rollback notes;
+- отсутствие новых неограниченных чтений, очередей и background tasks;
+- измеримый performance impact для изменений collectors/cache/delivery.
 
-Критерии приёмки:
+## 12. Риски и решения
 
-- release artifacts проверяемы;
-- checksums опубликованы;
-- rollback и upgrade procedures документированы.
-
-## Рекомендуемые PR-границы
-
-1. Cargo layout, README и CI skeleton.
-2. CLI, config loading и validation.
-3. Persistent identity.
-4. Wire models и JSON fixtures.
-5. HTTP client, auth exchange и JWT refresh.
-6. Registration и heartbeat.
-7. Linux inventory collector.
-8. Windows inventory collector.
-9. macOS inventory collector.
-10. Normalization и deduplication.
-11. Durable spool queue.
-12. Inventory submission и retry policy.
-13. Service lifecycle.
-14. Packaging и platform service files.
-15. End-to-end tests и release workflow.
-
-## Открытые решения
-
-Перед реализацией production delivery нужно согласовать:
-
-- финальный inventory API contract;
-- server payload limits;
-- inventory retention period;
-- необходимость compression;
-- identifier hashing/privacy policy;
-- необходимость user-scope inventory для Windows/macOS service mode;
-- правила software canonicalization;
-- periodic full snapshot policy для unchanged endpoints;
-- минимальные поддерживаемые версии ОС и CPU architectures;
-- ownership и custody для code-signing keys.
+| Риск | Мера |
+| --- | --- |
+| Ложные удаления из-за неполного сбора | Authoritative-only v1; source-aware carry-forward в v2 |
+| Скрытая старая версия ПО | Installation identity в schema v2 |
+| Рост I/O на больших runtime trees | Fingerprint cache, budgets, opt-in user scope |
+| OOM на backlog или сжатом payload | Поштучная обработка и лимиты до/во время распаковки |
+| Fleet thundering herd | Детерминированный jitter и rollout waves |
+| Компрометация update control plane | Signed manifest, anti-rollback, health rollback |
+| Несогласованный rollout client/server | Dual-stack contract, fixtures, documented order |
+| Документация снова отстанет от кода | README/wiki/Plan обновляются в том же PR, где меняется поведение |

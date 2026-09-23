@@ -1,604 +1,278 @@
-# Lariska Endpoint Inventory Agent вЂ” AI Implementation Plan
+# Lariska Technical Plan
 
-## 1. Purpose
+Status: active architecture and delivery plan for the 0.3.x line. Last reviewed: 2026-09-23.
 
-Lariska is a cross-platform endpoint agent for the
-[Shapoclyack](https://github.com/onixus/Shapoclyack) platform. Its first
-production capability is software inventory: identify the endpoint, collect a
-normalized list of installed software, and deliver versioned inventory
-snapshots to the Shapoclyack API.
+## 1. Purpose and boundary
 
-Lariska is not the existing Shapoclyack remote network-scanner agent. Do not
-implement scan-job claim or scan-result archive upload in this project unless a
-later design explicitly merges the two roles.
+Lariska is the endpoint-side inventory agent for [Shapoclyack](https://github.com/onixus/Shapoclyack). It owns local identity, bounded collection, durable queueing, heartbeat, remote policy application, and delivery of versioned endpoint snapshots.
 
-## 2. Definition of done
+Lariska does **not** own vulnerability matching, advisory ingestion, tenant asset policy, findings lifecycle, or network-scan jobs. Those remain server responsibilities. The endpoint communicates only through the documented Shapoclyack HTTP API; it never connects directly to Shapoclyack databases, Kafka, NATS, or internal workers.
 
-The initial production release is complete when:
+## 2. Current production baseline
 
-- the project builds with stable Rust on Linux, Windows, and macOS;
-- the agent obtains a short-lived JWT using a Shapoclyack provisioning key;
-- the agent registers and sends periodic heartbeats;
-- each supported OS produces a normalized software inventory;
-- the agent submits a versioned inventory payload over HTTPS;
-- delivery is idempotent and survives temporary server/network failure;
-- secrets and JWTs never appear in logs;
-- the process can run as a native background service;
-- unit, contract, and platform smoke tests run in CI;
-- release artifacts and checksums are published for all supported platforms.
+The following capabilities are implemented in the current source tree:
 
-## 3. Required coordination
+- stable Rust project building on Linux, Windows, and macOS;
+- persistent random agent identity and hashed platform evidence;
+- provisioning-key exchange for short-lived JWTs;
+- idempotent registration and independent heartbeat loop;
+- Linux, Windows, macOS, Python, Node.js, and Java inventory collectors;
+- deterministic normalization and inventory schema v1;
+- authoritative-only daemon submission when all required collectors complete;
+- persistent per-collector cache with bounded fingerprints and forced full refresh;
+- battery-aware, jittered, non-overlapping inventory scheduling;
+- compressed durable spool with bounded decompression and quarantine;
+- a delivery worker decoupled from inventory collection;
+- persistent accepted-state digest across restarts;
+- locally validated managed intervals and log levels;
+- service integration for systemd, launchd, and Windows SCM;
+- verified target/SHA-256 self-update path;
+- cross-platform CI, dependency policy, secret scanning, APEX contract validation, and shared Shapoclyack fixtures.
 
-This implementation depends on the server work described in
-`SHAPOCLYACK_BACKLOG.md`.
+The historical bootstrap phases are complete. This document therefore describes the architecture that must be preserved and the next changes that remain, rather than pretending the repository is still waiting for `Cargo.toml` to appear.
 
-Before implementing network submission, freeze these server contracts:
-
-1. Authentication: `POST /api/v1/auth/exchange`.
-2. Registration: `POST /api/agent/register`.
-3. Heartbeat: `POST /api/agent/heartbeat`.
-4. Inventory ingest: proposed `POST /api/v1/endpoint/inventory`.
-5. Inventory schema version: initial value `1`.
-6. Maximum payload size and maximum number of software entries.
-7. Idempotency behavior and expected response codes.
-
-Use a shared JSON fixture in both repositories to prevent contract drift.
-
-## 4. Non-goals for the first release
-
-- vulnerability assessment of installed packages;
-- automatic software removal or remediation;
-- arbitrary remote command execution;
-- user activity collection;
-- file-content scanning;
-- direct database or NATS access from an endpoint;
-- using hostname alone as the permanent device identity;
-- replacing Shapoclyack's existing network-scanner agent.
-
-## 5. Target architecture
-
-Keep the executable small and divide responsibilities into explicit modules:
+## 3. Architecture
 
 ```text
-src/
-  main.rs                 CLI entry point and exit codes
-  app.rs                  orchestration and lifecycle
-  config.rs               configuration loading and validation
-  identity.rs             stable endpoint identity
-  model.rs                versioned wire/domain models
-  auth.rs                 provisioning-key exchange and token refresh
-  api.rs                  Shapoclyack HTTP client
-  heartbeat.rs            registration and heartbeat loop
-  inventory/
-    mod.rs                collector trait and normalization
-    linux.rs
-    windows.rs
-    macos.rs
-  delivery/
-    mod.rs                submission policy
-    spool.rs              durable local queue
-    retry.rs
-  service.rs              service lifecycle integration
-  telemetry.rs            structured logs and metrics
-tests/
-  fixtures/
-  contract/
+CLI / native service entry
+        |
+        v
+app lifecycle ---------------------------------------------------+
+  |               |                    |                         |
+  v               v                    v                         v
+heartbeat     inventory scheduler   managed policy          shutdown/update
+  |               |                    |                         |
+  |               v                    |                         |
+  |       platform/runtime collectors  |                         |
+  |               |                    |                         |
+  |          fingerprint cache <-------+                         |
+  |               |                                              |
+  |         normalization and validation                         |
+  |               |                                              |
+  |         authoritative snapshot                               |
+  |               |                                              |
+  |          durable zstd spool                                  |
+  |               |                                              |
+  +----------> delivery worker ----------------------------------+
+                  |
+                  v
+             Shapoclyack API
 ```
 
-Use dependency injection around command execution, clocks, randomness, file
-storage, and HTTP so tests do not depend on the host machine.
+### Module responsibilities
 
-## 6. Configuration contract
-
-Support a configuration file plus environment overrides. Select one documented
-format, preferably TOML. Do not accept secrets as normal CLI arguments because
-they are visible in process listings.
-
-Required settings:
-
-| Setting | Purpose |
+| Module | Responsibility |
 | --- | --- |
-| `server_url` | Shapoclyack base URL |
-| `provisioning_key_file` | Path to a protected file containing the bootstrap key |
-| `state_dir` | Persistent identity and queue storage |
-| `inventory_interval` | Full inventory collection interval |
-| `heartbeat_interval` | Agent heartbeat interval |
-| `request_timeout` | Per-request timeout |
-| `tls_ca_file` | Optional private CA bundle |
-| `log_level` | Runtime log filtering |
+| `main.rs` | CLI dispatch and process exit status |
+| `app.rs` | lifecycle orchestration, scheduling, shutdown, wiring of independent loops |
+| `config.rs` | TOML/environment loading, local security policy, bounds validation |
+| `identity.rs` | persistent agent identity and platform identifier hashing |
+| `model.rs` | schema v1 wire model, normalization, deterministic ordering, local diff model |
+| `auth.rs` | provisioning-key exchange, in-memory token cache, refresh |
+| `api.rs` | bounded HTTP client and response classification |
+| `heartbeat.rs` | registration, heartbeat, managed directive reception |
+| `managed.rs` | validation/application of remote settings and staged update handling |
+| `inventory/*` | platform/runtime collection, completeness, environment detection, cache fingerprints |
+| `delivery/*` | queue policy, persisted accepted state, HTTP retry, quarantine, spool lifecycle |
+| `qos.rs` | background priority, efficiency-core preference, power-source detection |
+| `service.rs` | instance locking, native service integration, shutdown signals |
+| `telemetry.rs` | structured logs and runtime log filtering |
+| `crash.rs` | bounded panic report and recovery notice |
 
-Optional settings:
+## 4. Non-negotiable invariants
 
-- explicit proxy configuration;
-- maximum spool size and retention;
-- jitter percentage;
-- platform collector timeouts;
-- labels such as site, environment, or department;
-- development-only allowance for plain HTTP, disabled by default.
+Every change must preserve these properties:
 
-Validation requirements:
+1. **No partial state becomes authoritative.** A failed required collector cannot cause server-side removal events.
+2. **Collection is independent from delivery.** Authentication, network retry, and server outages cannot block or stretch the local collection schedule.
+3. **One collection at a time.** Slow hosts do not accumulate catch-up scans or overlapping filesystem walks.
+4. **Memory is proportional to one bounded item.** Command output, files, cache entries, HTTP bodies, and spool recovery are capped before unbounded allocation.
+5. **Disk state is atomic.** Identity, snapshots, cache entries, and accepted-state metadata are written through temporary files and rename where applicable.
+6. **Secrets remain local and absent from logs.** Provisioning keys are read from protected files; JWTs stay in memory.
+7. **Remote policy has a local safety boundary.** The endpoint validates all managed values and never accepts remote changes to server URL, credential paths, state paths, or transport-security switches.
+8. **The ambient `PATH` is not trusted.** External collectors resolve commands only from approved system directories and do not invoke a shell.
+9. **Retries are idempotent.** Snapshot IDs survive retries, and successful acknowledgement is the only condition for removal from the spool.
+10. **Contract changes are cross-repository changes.** Any incompatible inventory model change requires Shapoclyack support, fixtures in both repositories, migration behavior, and documented rollout order.
 
-- reject missing server URL and unreadable secret file;
-- require HTTPS unless development mode is explicitly enabled;
-- enforce safe minimum/maximum intervals and timeouts;
-- reject relative state paths when running as a system service;
-- never serialize secret values into diagnostics.
+## 5. Runtime flows
 
-## 7. Wire models
+### 5.1 Startup
 
-Create versioned Serde models. Keep domain models separate from transport
-responses.
+1. Load TOML and environment overrides.
+2. Validate URL policy, intervals, timeout, secret path, and service-mode paths.
+3. Initialize safe telemetry and crash recovery.
+4. Apply background scheduling policy.
+5. Acquire the state-directory single-instance lock.
+6. Load or create the stable agent identity.
+7. Build the API/auth clients and restore delivery state.
+8. Register with bounded startup retry.
+9. Start heartbeat, inventory, delivery, shutdown, and update control paths.
 
-Proposed inventory request:
+### 5.2 Inventory
+
+1. Compute the agent-specific scheduled delay.
+2. Stretch the recurring interval when the endpoint is on battery.
+3. Fingerprint supported sources.
+4. Reuse a complete, compatible, unexpired cache entry when the fingerprint is unchanged.
+5. Otherwise execute the collector under its output/time/file limits.
+6. Merge platform and runtime results while propagating completeness.
+7. Normalize, sort, and deduplicate according to schema v1.
+8. If incomplete, log bounded warnings and keep the last accepted server state unchanged.
+9. If complete, atomically enqueue the snapshot and wake the delivery worker.
+
+### 5.3 Delivery
+
+1. Enumerate pending paths oldest first without decoding the whole backlog.
+2. Decode and validate one snapshot under compressed and decompressed limits.
+3. Obtain or refresh an in-memory JWT.
+4. Submit with `Idempotency-Key: <snapshot_id>`.
+5. Retry transient failures with bounded exponential jitter and `Retry-After` support.
+6. Quarantine payload-specific terminal failures and continue to later entries.
+7. Stop the current drain on systemic network/auth failures and retry at the worker cadence.
+8. On acknowledgement, persist the semantic digest and acceptance time, then remove the spool entry.
+
+### 5.4 Managed policy
+
+Managed heartbeat interval, inventory interval, and log level are optional. A revision is applied atomically only when every supplied value is locally valid. Invalid revisions are rejected without changing runtime state or falsely marking the revision as applied.
+
+## 6. Inventory contract v1
+
+The request remains a flat, versioned document:
 
 ```json
 {
   "schema_version": 1,
-  "snapshot_id": "018f...",
+  "snapshot_id": "...",
   "agent_id": "agent_...",
-  "collected_at": "2026-07-24T08:00:00Z",
-  "agent": {
-    "version": "0.1.0",
-    "hostname": "workstation-17",
-    "labels": {
-      "site": "helsinki"
-    }
-  },
-  "os": {
-    "family": "windows",
-    "name": "Windows 11 Pro",
-    "version": "24H2",
-    "architecture": "x86_64"
-  },
-  "identifiers": [
-    {
-      "type": "machine_id",
-      "value": "..."
-    },
-    {
-      "type": "fqdn",
-      "value": "workstation-17.example.local"
-    }
-  ],
-  "software": [
-    {
-      "name": "Mozilla Firefox",
-      "version": "141.0",
-      "publisher": "Mozilla",
-      "architecture": "x86_64",
-      "source": "registry",
-      "install_location": null
-    }
-  ]
+  "collected_at": "2026-09-23T10:00:00Z",
+  "hostname": "workstation-17",
+  "os_family": "linux",
+  "os_name": "Ubuntu 24.04.3 LTS",
+  "os_version": "24.04",
+  "os_arch": "x86_64",
+  "agent_version": "0.3.1",
+  "labels": {},
+  "identifiers": [],
+  "software": [],
+  "collector_warnings": []
 }
 ```
 
-Rules:
+The shared fixture in `tests/fixtures/inventory_v1.json` is the executable contract. Schema v1 comparison identity is based on normalized name, publisher, architecture, and source; version is an attribute. This limitation is why multiple side-by-side installation instances can collapse and why schema v2 is a priority rather than a decorative future idea.
 
-- `snapshot_id` is generated once and retained across retries;
-- timestamps use UTC RFC 3339;
-- optional data is represented as `null` or omitted consistently;
-- software entries are sorted deterministically before hashing/submission;
-- strings are trimmed and bounded;
-- empty names are discarded;
-- exact duplicates are removed;
-- unknown versions remain absent rather than guessed.
+## 7. Local state
 
-## 8. Stable endpoint identity
+The configured `state_dir` can contain:
 
-Implement identity before authentication and inventory submission.
+- persistent agent identity and the process lock;
+- `spool/*.json.zst` pending snapshots;
+- `spool/quarantine/` invalid or terminally rejected snapshots;
+- `inventory-cache-v1/` bounded platform/Python/Node.js/Java cache documents;
+- `delivery-state-v1.json` with the last accepted semantic digest and timestamp;
+- a bounded crash report after an unexpected panic;
+- staged update files and the retained previous executable when the update path is used.
 
-Recommended behavior:
+Operators may inspect metadata and logs, but must not hand-edit queue/cache files while the service is running. Deleting cache is recoverable and forces a fresh scan; deleting identity creates a different endpoint and is therefore not routine cleanup.
 
-1. On first start, create a random agent UUID and persist it atomically in the
-   protected state directory.
-2. Reuse the value on every subsequent start.
-3. Collect platform identifiers as matching evidence, not as the sole local
-   primary key.
-4. Never derive identity from MAC address or hostname alone.
-5. Detect unreadable/corrupt state and fail with a recovery-oriented error;
-   never silently create a second identity.
+## 8. Performance and host-impact policy
 
-Platform evidence:
+The agent prefers predictable ceilings over optimistic average behavior:
 
-- Linux: `/etc/machine-id` when available;
-- Windows: `MachineGuid` and optionally hardware serial where permitted;
-- macOS: `IOPlatformUUID`;
-- all platforms: FQDN and hostname as secondary identifiers.
+- process priority is background/idle where supported;
+- efficiency-core affinity is best effort, never a correctness dependency;
+- command execution has wall-clock and output limits;
+- metadata reads and cache files are bounded;
+- cache fingerprints are capped by item count;
+- runtime filesystem collectors run without racing each other for disk bandwidth;
+- startup and recurring jitter spread fleet load;
+- battery operation increases the interval;
+- delivery backlog is decoded one entry at a time;
+- no network operation runs on the inventory critical path.
 
-Document privacy implications. Hash identifiers client-side only if the server
-contract adopts the same normalization and hashing algorithm.
+Published benchmark baselines are still required. They must report collection wall time, process CPU time, peak RSS, bytes/files read, external command count, cache hit ratio, queue age, and source completeness on representative workstation and server profiles.
 
-## 9. Authentication and agent lifecycle
+## 9. Security model
 
-### 9.1 Token exchange
+Trust boundaries:
 
-Call `POST /api/v1/auth/exchange` with:
+- the local configuration and provisioning key are operator-controlled;
+- the Shapoclyack API is trusted only through configured TLS roots and authenticated responses;
+- package databases, registry values, plist files, and runtime metadata are untrusted input;
+- ambient environment variables and `PATH` are not trusted command sources;
+- spool/cache files are untrusted after a crash or external modification and must be bounded and validated.
 
-```json
-{
-  "provisioning_key": "...",
-  "agent_id": "agent_..."
-}
+Current update verification checks TLS policy, target triple, and SHA-256. The target design adds a signed release manifest, streaming size enforcement, anti-rollback policy, native package installation, post-restart health acknowledgement, and automatic rollback.
+
+## 10. Testing and release gates
+
+Required pull-request gates:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
 ```
 
-Requirements:
+CI must additionally cover Linux, Windows, and macOS; dependency advisories; license/source policy; secret scanning; APEX contract validation; and the Shapoclyack fixture. Contract, queue, cache, scheduler, and updater changes require focused regression tests for malformed, oversized, interrupted, and replayed inputs.
 
-- read the provisioning key only when required;
-- keep JWTs in memory;
-- refresh before expiration with randomized jitter;
-- on `401`, refresh once and retry the original request once;
-- distinguish invalid/revoked provisioning keys from transient errors;
-- redact authorization headers and response bodies containing tokens.
+Release artifacts should include binaries, SHA-256 checksums, SBOM, release notes, and documented provenance. Production distribution additionally requires native package signing/notarization where the platform supports it.
 
-### 9.2 Registration
+## 11. Active roadmap
 
-Register after obtaining a JWT. Submit the stable `agent_id`, hostname, agent
-version, and configured labels. Treat registration as idempotent.
+### P0: Inventory schema v2 and source-aware completeness
 
-### 9.3 Heartbeat
+- represent product identity separately from installation identity;
+- carry package ID, scope, instance ID, and privacy-safe location/user evidence;
+- preserve side-by-side versions;
+- add per-source `complete`, `partial`, `failed`, and `not_applicable` status;
+- let Shapoclyack carry forward failed sources instead of rejecting the whole cycle;
+- provide dual-read/dual-write rollout and v1 fallback.
 
-Send heartbeats independently of the inventory schedule. Use states:
-`idle`, `busy`, and `error`. Include a short, sanitized detail string on
-collector or delivery degradation. A failed heartbeat must not discard queued
-inventory.
+Acceptance: a failed Python collector cannot remove Python entries, while a complete dpkg result can still update Linux packages; JDK 17 and JDK 21 remain distinct installations.
 
-## 10. Platform collectors
+### P0: Signed, streaming, recoverable updates
 
-Define a common collector trait that returns structured entries plus warnings.
-A partial inventory is preferable to a crash, but the payload must say when a
-collector was incomplete.
+- enforce declared and hard maximum size while streaming to disk;
+- hash during download and fsync before installation;
+- verify an embedded-key signed release manifest;
+- enforce anti-rollback policy;
+- use platform-native package/update mechanisms where required;
+- require health acknowledgement after restart and rollback automatically on failure.
 
-### 10.1 Linux
+Acceptance: an interrupted, oversized, foreign, unsigned, downgraded, or unhealthy update leaves the previous agent operational.
 
-Initial sources:
+### P1: Collection budgets and measurable SLOs
 
-- Debian/Ubuntu: `dpkg-query`;
-- Fedora/RHEL-family: `rpm`;
-- Arch-family: `pacman`;
-- optional universal sources: Snap and Flatpak.
+- add a shared cooperative deadline/file/byte/item budget;
+- expose per-source duration, cache hit, completeness, and item counts;
+- add benchmark and soak scenarios for large inventories and long offline queues;
+- publish workstation/server baselines and regression thresholds.
 
-Requirements:
+### P1: Collector and advisory coverage
 
-- detect available package managers;
-- call commands directly without a shell;
-- apply command timeouts and output-size limits;
-- preserve package version and architecture;
-- allow multiple sources on the same endpoint;
-- report unsupported distributions without panicking.
+- Linux: Snap, Flatpak, RPM epoch/distribution identity;
+- Windows: MSIX/AppX, stronger package IDs, ARM64 distinctions;
+- macOS: package receipts, bundle identifiers, signing team metadata;
+- runtimes: opt-in user environments and additional ecosystems;
+- coordinate Shapoclyack advisory providers so extra data is actually actionable.
 
-### 10.2 Windows
+### P1: Production packaging
 
-Initial sources:
+- verify `.deb` and RPM builds in native packaging CI;
+- produce signed MSI and notarized macOS package;
+- define upgrade ownership for package-managed installations;
+- test install, upgrade, rollback, and uninstall while preserving identity/state.
 
-- 64-bit and 32-bit uninstall registry locations;
-- both machine and current-user scopes where service permissions allow;
-- avoid `Win32_Product` because it is slow and can trigger MSI repair.
+### P2: Transport efficiency
 
-Collect display name, version, publisher, architecture/view, and install
-location when present. Use native Windows APIs or a well-maintained crate in
-preference to parsing human-formatted PowerShell output.
+- negotiate bounded zstd HTTP request decoding in Shapoclyack;
+- enable wire compression only after server-side decompression-bomb protection;
+- evaluate delta submission with explicit base snapshot acknowledgement and full-snapshot recovery.
 
-### 10.3 macOS
+### P2: Operator diagnostics
 
-Initial sources:
+- add a bounded local diagnostics command that reports source status, cache age, queue depth/age, and last accepted state without exposing secrets or full inventory;
+- document supported cleanup and recovery procedures;
+- surface endpoint freshness and degraded-source state in Shapoclyack.
 
-- application bundles under system and user application directories;
-- Homebrew formulae and casks when Homebrew exists;
-- optional package receipts through `pkgutil`.
-
-Read bundle metadata rather than treating filenames as authoritative product
-versions.
-
-### 10.4 Normalization
-
-Do not aggressively merge different products. Normalize whitespace, Unicode,
-case-insensitive comparison keys, architecture names, and source names while
-preserving original display values.
-
-Unit tests must cover:
-
-- malformed command output;
-- missing versions;
-- non-UTF-8 or replacement decoding;
-- duplicate entries;
-- very large inventories;
-- command timeout and non-zero exit;
-- platform-specific fixtures.
-
-## 11. Durable delivery
-
-Inventory collection and upload must be decoupled.
-
-Workflow:
-
-1. Collect and normalize inventory.
-2. Serialize canonical JSON.
-3. Compute a SHA-256 content digest.
-4. If unchanged since the last acknowledged snapshot, send only when the
-   configured full-refresh deadline is reached.
-5. Write the snapshot atomically to the spool before sending.
-6. Submit with `Idempotency-Key: <snapshot_id>`.
-7. Remove it only after a successful server acknowledgement.
-
-Retry policy:
-
-- retry network errors, `408`, `425`, `429`, and `5xx`;
-- honor `Retry-After`;
-- use exponential backoff with full jitter and a maximum delay;
-- do not retry validation errors indefinitely;
-- refresh authentication once on `401`;
-- stop and surface authorization errors on `403`;
-- cap disk usage without deleting the newest unsent snapshot;
-- quarantine malformed queue entries instead of looping forever.
-
-The endpoint talks only to Shapoclyack HTTP. Shapoclyack owns any NATS publish.
-
-## 12. Process lifecycle
-
-Provide:
-
-- `lariska run` for the long-running service;
-- `lariska inventory --output json` for local diagnostics with no upload;
-- `lariska check-config`;
-- `lariska enroll` only if an explicit enrollment flow is later required;
-- graceful shutdown on SIGTERM/Ctrl-C;
-- single-instance locking for one state directory;
-- explicit, documented exit codes.
-
-Do not print the complete inventory by default because it can contain sensitive
-organization data.
-
-## 13. Native service packaging
-
-### Linux
-
-- systemd unit;
-- dedicated non-login user;
-- `/etc/lariska/lariska.toml`;
-- state under `/var/lib/lariska`;
-- hardened unit options compatible with collectors;
-- `.deb` and `.rpm` packages after the binary workflow is stable.
-
-### Windows
-
-- Windows Service wrapper/integration;
-- protected configuration and state under ProgramData;
-- MSI or another signed enterprise-deployable installer;
-- clean uninstall that preserves state only when explicitly requested.
-
-### macOS
-
-- launchd plist;
-- configuration and state locations following platform conventions;
-- signed/notarized package when production signing is available.
-
-## 14. Observability and security
-
-Structured logs should include event names, snapshot IDs, durations, counts,
-status codes, and retry decisions. They must not include:
-
-- provisioning keys;
-- JWTs;
-- authorization headers;
-- raw machine identifiers at normal log levels;
-- complete software inventories.
-
-Add counters/timings for collection success, entries collected, queue depth,
-upload result, authentication refresh, and heartbeat result. Start with logs;
-add a metrics endpoint only if the deployment model requires one.
-
-Security requirements:
-
-- TLS verification enabled by default;
-- explicit request and response size limits;
-- dependency audit and license checks;
-- least-privilege service identity;
-- no shell interpolation;
-- atomic state writes and restrictive file permissions;
-- bounded memory when parsing collector output;
-- document the collected data and retention expectations.
-
-## 15. Testing strategy
-
-### Unit tests
-
-- config parsing/validation;
-- identity persistence and corruption handling;
-- collector parsers with fixtures;
-- normalization/deduplication;
-- token refresh decisions;
-- retry classification/backoff;
-- spool recovery and size limits;
-- redaction.
-
-### Contract tests
-
-Run against a mock server using the shared fixtures:
-
-- successful exchange/register/heartbeat/inventory;
-- expired JWT refresh;
-- invalid provisioning key;
-- `429 Retry-After`;
-- duplicate idempotency key;
-- schema validation failure;
-- server outage followed by recovery.
-
-### Platform smoke tests
-
-CI must compile on Linux, Windows, and macOS. Run collector smoke tests on each
-native runner without asserting a specific installed-software count.
-
-### End-to-end test
-
-Use a disposable Shapoclyack stack:
-
-1. create a tenant and provisioning key;
-2. start Lariska with a fixture collector;
-3. wait for registration and inventory acknowledgement;
-4. query Shapoclyack and verify tenant, asset linkage, and software entries;
-5. send an updated fixture and verify generated change events.
-
-## 16. CI and release
-
-Required checks:
-
-- `cargo fmt --check`;
-- `cargo clippy --all-targets --all-features -- -D warnings`;
-- `cargo test --all-features`;
-- cross-platform build matrix;
-- dependency vulnerability audit;
-- dependency license policy;
-- secret scanning;
-- contract fixture validation.
-
-Release artifacts:
-
-- versioned binaries for Linux x86_64/aarch64, Windows x86_64, and macOS
-  x86_64/aarch64;
-- SHA-256 checksums;
-- generated SBOM;
-- changelog and upgrade notes;
-- reproducible or documented build provenance where practical.
-
-## 17. Implementation sequence and PR boundaries
-
-Each phase should be a small reviewable PR. Do not combine server and agent
-changes in one repository.
-
-### Phase L0 вЂ” Repair project foundation
-
-Tasks:
-
-- rename `cargo.toml` to `Cargo.toml`;
-- add `[package]`, Rust edition, metadata, and a minimal dependency set;
-- move `main.rs` to `src/main.rs`;
-- add `.gitignore`, license decision, contributor commands, and CI skeleton;
-- make `cargo fmt`, `cargo clippy`, and `cargo test` pass.
-
-Acceptance:
-
-- clean checkout builds with stable Rust;
-- no placeholder token is printed;
-- CI passes on three operating systems.
-
-### Phase L1 вЂ” Models, configuration, and identity
-
-Tasks:
-
-- add versioned models;
-- implement config precedence and secret redaction;
-- implement persistent agent identity;
-- add diagnostic/check-config commands.
-
-Acceptance:
-
-- restart preserves `agent_id`;
-- corrupted state is detected;
-- golden JSON fixture matches the proposed API contract.
-
-### Phase L2 вЂ” Authentication, registration, and heartbeat
-
-Tasks:
-
-- implement bounded HTTP client;
-- implement JWT exchange/refresh;
-- implement idempotent registration;
-- implement heartbeat loop.
-
-Acceptance:
-
-- mock-server lifecycle tests pass;
-- secrets are absent from captured logs;
-- transient errors recover without process restart.
-
-### Phase L3 вЂ” Inventory collectors
-
-Tasks:
-
-- introduce collector trait and command abstraction;
-- implement Linux collectors;
-- implement Windows collectors;
-- implement macOS collectors;
-- normalize and deduplicate.
-
-Acceptance:
-
-- fixture tests cover every supported source;
-- collector failure produces warnings, not a process panic;
-- deterministic input produces deterministic canonical output.
-
-### Phase L4 вЂ” Spool and inventory submission
-
-Tasks:
-
-- implement atomic durable queue;
-- implement content digest and unchanged-snapshot suppression;
-- implement idempotent upload and retry policy;
-- expose queue state through sanitized diagnostics.
-
-Acceptance:
-
-- killing the process during upload does not lose the snapshot;
-- duplicate delivery produces one server-side snapshot;
-- disk limits and malformed spool files are tested.
-
-### Phase L5 вЂ” Service integration and hardening
-
-Tasks:
-
-- graceful shutdown and single-instance lock;
-- systemd, Windows Service, and launchd integration;
-- permissions and hardening guidance;
-- structured telemetry.
-
-Acceptance:
-
-- install/start/restart/stop works on each target platform;
-- state survives upgrade;
-- service runs without administrator/root privileges except where a collector
-  has a documented platform requirement.
-
-### Phase L6 вЂ” End-to-end and releases
-
-Tasks:
-
-- shared contract fixtures;
-- Shapoclyack end-to-end test;
-- installers/packages;
-- release workflow, checksums, SBOM, and documentation.
-
-Acceptance:
-
-- the full definition of done is met;
-- rollback and upgrade procedures are documented;
-- a release candidate survives a multi-day soak test with simulated outages.
-
-## 18. Instructions for the implementing AI
-
-For every phase:
-
-1. Inspect the current repository and latest Shapoclyack API before editing.
-2. State assumptions and list exact files to change.
-3. Preserve unrelated user changes.
-4. Add tests with the implementation, not later.
-5. Prefer small modules and typed errors over a large `main.rs`.
-6. Do not log secrets or add development credentials.
-7. Run the relevant formatter, linter, tests, and build matrix where available.
-8. Update documentation and contract fixtures in the same PR.
-9. Report commands run, results, unresolved risks, and server dependencies.
-10. Stop and ask for a decision when the server contract conflicts with this
-    plan; do not silently invent a second API.
-
-## 19. Open decisions
-
-Resolve before Phase L4:
-
-- inventory retention period and server payload limits;
-- whether snapshots may be compressed;
-- identifier hashing/privacy policy;
-- whether user-scope Windows/macOS inventory is required for a system service;
-- exact software canonicalization rules;
-- whether unchanged endpoints must submit a periodic full snapshot;
-- supported minimum OS versions and CPU architectures;
-- code-signing ownership and release-key custody.
+The executable Russian roadmap, milestones, dependencies, and acceptance criteria are maintained in [WORKPLAN_RU.md](WORKPLAN_RU.md).
