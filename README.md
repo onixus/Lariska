@@ -4,7 +4,7 @@
 
 Lariska is a lightweight, cross-platform endpoint inventory agent for the [Shapoclyack](https://github.com/onixus/Shapoclyack) platform. It inventories operating-system and runtime packages, classifies the host environment, and delivers authoritative endpoint snapshots without turning a workstation into an unwilling benchmark machine.
 
-The source tree currently identifies itself as version **0.3.1**.
+The source tree currently identifies itself as version **0.4.0**.
 
 ## What it does
 

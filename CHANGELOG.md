@@ -4,6 +4,60 @@ All notable changes to the Lariska endpoint inventory agent will be documented i
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-23
+
+### Changed
+- **Breaking: the agent speaks the versioned API (APEX Architecture Contract
+  v1).** Token exchange, registration, heartbeat and inventory moved to
+  `/api/v1/auth/agent/token`, `/api/v1/agent/register`,
+  `/api/v1/agent/heartbeat` and `/api/v1/endpoint/inventory`. A server that
+  serves only the unversioned paths cannot talk to this build — upgrade
+  Shapoclyack first, then the fleet. CI now validates the integration
+  boundary against the pinned contract.
+- **Collection and delivery are separate loops.** The inventory loop only
+  collects and enqueues to the spool; a dedicated worker drains it, retries
+  on its own cadence and keeps going past a quarantined entry. An unreachable
+  server no longer stretches the scan schedule. The last accepted digest
+  survives a restart, so an unchanged host is not resubmitted after one.
+- **Scans are staggered and battery-aware.** Each agent gets a deterministic
+  jitter (at most five minutes on start) so a fleet restart does not scan in
+  lockstep; the next scan is scheduled after the previous one finishes, so
+  cycles never overlap or catch up. On battery the inventory interval is
+  stretched fourfold, capped at one day.
+
+### Added
+- **Per-collector cache.** Linux package databases, macOS applications and
+  Homebrew, and Python/Node.js/Java runtimes are fingerprinted; unchanged
+  evidence reuses the previous normalized result instead of re-running the
+  collector. A real collection is forced every
+  `inventory_full_refresh_interval_secs` (default 86400;
+  `LARISKA_INVENTORY_FULL_REFRESH_INTERVAL_SECS`). `lariska inventory` is
+  never cached; incomplete results are never stored.
+- Linux and macOS snapshots report the real OS release metadata that
+  Shapoclyack's package identity resolver needs for CVE matching.
+- Windows reports battery/AC state via `GetSystemPowerStatus`.
+
+### Fixed
+- **A partial inventory is never published.** If any authoritative collector
+  times out, panics or fails to read, the snapshot is kept for local
+  diagnostics but neither spooled nor submitted — the server would otherwise
+  read every missing package as removed, then reinstalled next cycle.
+- **Managed settings are validated before they apply.** Intervals must be
+  within 10–86400 s and the log level one of `error`/`warn`/`info`/`debug`/
+  `trace`; one invalid field rejects the whole revision, and a rejected
+  revision is not reported as applied.
+- **Spool memory is bounded by one snapshot.** Pending entries are decoded
+  one at a time, eviction works on file metadata, and zstd input and output
+  are both capped — a corrupt, highly compressible entry is quarantined
+  instead of expanded.
+- External collectors are time- and memory-bounded while reading, killed and
+  reaped on timeout, and package managers that do not own an active package
+  database are not invoked. Metadata reads for Python, Node.js, Java and
+  macOS bundles are size-bounded.
+- Homebrew reports the newest of several installed versions; Node packages
+  with unusual `author` metadata are no longer dropped; macOS hypervisor
+  detection resolves binaries from trusted paths only.
+
 ## [0.3.1] - 2026-09-15
 
 ### Fixed
