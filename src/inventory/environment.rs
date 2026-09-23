@@ -245,10 +245,7 @@ fn parse_linux_os_release(content: &str) -> OsRelease {
 #[cfg(any(test, target_os = "linux"))]
 fn decode_os_release_value(raw: &str) -> String {
     let value = raw.trim();
-    let (value, unescape) = if value.len() >= 2
-        && value.starts_with('"')
-        && value.ends_with('"')
-    {
+    let (value, unescape) = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
         (&value[1..value.len() - 1], true)
     } else if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
         (&value[1..value.len() - 1], false)
