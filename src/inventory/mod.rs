@@ -27,12 +27,24 @@ pub(crate) const MAX_METADATA_FILE_BYTES: usize = 512 * 1024;
 const DEFAULT_COLLECTOR_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Result of running every collector available on this platform. A single
-/// collector's failure never aborts the whole run — it becomes a warning
-/// instead (Plan.md §10 "partial inventory is preferable to a crash").
-#[derive(Debug, Default)]
+/// collector's failure never crashes the whole run: the partial entries and
+/// warnings remain available for diagnostics, while `complete` prevents that
+/// partial view from replacing the last authoritative server-side inventory.
+#[derive(Debug)]
 pub struct CollectorResult {
     pub entries: Vec<SoftwareEntry>,
     pub warnings: Vec<String>,
+    pub complete: bool,
+}
+
+impl Default for CollectorResult {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            warnings: Vec::new(),
+            complete: true,
+        }
+    }
 }
 
 impl CollectorResult {
@@ -40,6 +52,7 @@ impl CollectorResult {
     fn merge(&mut self, mut other: CollectorResult) {
         self.entries.append(&mut other.entries);
         self.warnings.append(&mut other.warnings);
+        self.complete &= other.complete;
     }
 }
 
@@ -72,6 +85,7 @@ pub async fn collect_all_with_timeout(timeout: Duration) -> CollectorResult {
                 warnings: vec![
                     "software collection is not supported on this operating system".to_string(),
                 ],
+                complete: false,
             }
         }
     };
@@ -80,15 +94,21 @@ pub async fn collect_all_with_timeout(timeout: Duration) -> CollectorResult {
     // async runtime, but deliberately run only one blocking task at a time: a
     // short scan with low peak I/O is preferable to three ecosystems racing
     // over the endpoint disk.
-    let runtime_entries = tokio::task::spawn_blocking(runtimes::collect_all_runtimes)
-        .await
-        .unwrap_or_default();
-    result.entries.extend(runtime_entries);
+    match tokio::task::spawn_blocking(runtimes::collect_all_runtimes).await {
+        Ok(runtime_entries) => result.entries.extend(runtime_entries),
+        Err(error) => {
+            result.complete = false;
+            result
+                .warnings
+                .push(format!("runtime collectors panicked: {error}"));
+        }
+    }
 
     tracing::debug!(
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         entries = result.entries.len(),
         warnings = result.warnings.len(),
+        complete = result.complete,
         "inventory collection completed"
     );
 
@@ -280,6 +300,19 @@ mod tests {
             sh.is_some(),
             "expected to locate 'sh' in trusted system directories"
         );
+    }
+
+    #[test]
+    fn merging_an_incomplete_collector_marks_the_whole_run_incomplete() {
+        let mut aggregate = CollectorResult::default();
+        aggregate.merge(CollectorResult {
+            entries: Vec::new(),
+            warnings: vec!["collector failed".to_string()],
+            complete: false,
+        });
+
+        assert!(!aggregate.complete);
+        assert_eq!(aggregate.warnings, vec!["collector failed"]);
     }
 
     #[test]
