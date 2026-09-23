@@ -50,34 +50,49 @@ pub async fn collect(_timeout: Duration) -> CollectorResult {
         .unwrap_or_else(|error| CollectorResult {
             entries: Vec::new(),
             warnings: vec![format!("windows registry collector panicked: {error}")],
+            complete: false,
         })
 }
 
 fn collect_sync() -> CollectorResult {
     let mut entries = Vec::new();
     let mut warnings = Vec::new();
+    let mut complete = true;
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
 
     for (subkey_path, architecture) in UNINSTALL_KEYS {
         match hklm.open_subkey_with_flags(subkey_path, KEY_READ) {
             Ok(uninstall_key) => {
-                collect_from_key(&uninstall_key, architecture, &mut entries, &mut warnings)
+                complete &= collect_from_key(
+                    &uninstall_key,
+                    architecture,
+                    &mut entries,
+                    &mut warnings,
+                )
             }
             // The Wow6432Node view does not exist on 32-bit-only Windows —
             // that is expected, not a collector failure.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => warnings.push(format!("failed to open {subkey_path}: {error}")),
+            Err(error) => {
+                complete = false;
+                warnings.push(format!("failed to open {subkey_path}: {error}"));
+            }
         }
     }
 
-    collect_user_scope(&mut entries, &mut warnings);
-    collect_updates(&hklm, &mut entries, &mut warnings);
+    complete &= collect_user_scope(&mut entries, &mut warnings);
+    complete &= collect_updates(&hklm, &mut entries, &mut warnings);
 
     if entries.is_empty() && warnings.is_empty() {
+        complete = false;
         warnings.push("no entries found under either uninstall registry view".to_string());
     }
 
-    CollectorResult { entries, warnings }
+    CollectorResult {
+        entries,
+        warnings,
+        complete,
+    }
 }
 
 /// Per-user installs, read out of the loaded profiles under `HKEY_USERS`.
@@ -92,32 +107,64 @@ fn collect_sync() -> CollectorResult {
 /// passed over in silence, so the gap is in the snapshot and not only in this
 /// comment. Mounting every profile's `NTUSER.DAT` is the alternative, and is not
 /// something a background inventory agent should be doing to a machine.
-fn collect_user_scope(entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<String>) {
+fn collect_user_scope(entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<String>) -> bool {
     let users = RegKey::predef(HKEY_USERS);
     let mut profiles = 0usize;
+    let mut complete = true;
 
     for name in users.enum_keys() {
-        let Ok(name) = name else { continue };
+        let name = match name {
+            Ok(name) => name,
+            Err(error) => {
+                complete = false;
+                warnings.push(format!("failed to enumerate a user profile hive: {error}"));
+                continue;
+            }
+        };
         if !is_user_profile_sid(&name) {
             continue;
         }
-        let Ok(hive) = users.open_subkey_with_flags(&name, KEY_READ) else {
-            continue;
+        let hive = match users.open_subkey_with_flags(&name, KEY_READ) {
+            Ok(hive) => hive,
+            Err(error) => {
+                complete = false;
+                warnings.push(format!("failed to open user profile hive {name}: {error}"));
+                continue;
+            }
         };
         profiles += 1;
 
         for (subkey_path, architecture) in USER_UNINSTALL_KEYS {
-            if let Ok(uninstall_key) = hive.open_subkey_with_flags(subkey_path, KEY_READ) {
-                collect_from_key(&uninstall_key, architecture, entries, warnings);
+            match hive.open_subkey_with_flags(subkey_path, KEY_READ) {
+                Ok(uninstall_key) => {
+                    complete &= collect_from_key(
+                        &uninstall_key,
+                        architecture,
+                        entries,
+                        warnings,
+                    )
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    complete = false;
+                    warnings.push(format!(
+                        "failed to open {subkey_path} for user profile {name}: {error}"
+                    ));
+                }
             }
         }
     }
 
     if profiles == 0 {
+        // This is a coverage limitation, not a failed read. Treating it as a
+        // fatal collection failure would prevent unattended Windows servers
+        // from ever reporting their system-wide software inventory.
         warnings.push(
             "no user profiles are loaded, so per-user installs were not collected".to_string(),
         );
     }
+
+    complete
 }
 
 /// Whether a `HKEY_USERS` subkey is a real user's profile.
@@ -159,18 +206,26 @@ fn collect_from_key(
     architecture: &str,
     entries: &mut Vec<SoftwareEntry>,
     warnings: &mut Vec<String>,
-) {
+) -> bool {
+    let mut complete = true;
+
     for name in uninstall_key.enum_keys() {
         let name = match name {
             Ok(name) => name,
             Err(error) => {
+                complete = false;
                 warnings.push(format!("failed to enumerate uninstall subkey: {error}"));
                 continue;
             }
         };
 
-        let Ok(subkey) = uninstall_key.open_subkey(&name) else {
-            continue;
+        let subkey = match uninstall_key.open_subkey(&name) {
+            Ok(subkey) => subkey,
+            Err(error) => {
+                complete = false;
+                warnings.push(format!("failed to open uninstall entry {name}: {error}"));
+                continue;
+            }
         };
 
         // Patches/system components without a DisplayName are not
@@ -197,6 +252,8 @@ fn collect_from_key(
             install_location: install_location.as_deref().and_then(non_empty),
         });
     }
+
+    complete
 }
 
 /// The separately-identified `KB` updates applied to the running Windows build.
@@ -221,33 +278,50 @@ fn collect_from_key(
 /// Only packages in state `112` are reported. A package key exists for staged,
 /// superseded and removed packages too, and counting those would claim a patch
 /// level the host does not have.
-fn collect_updates(hklm: &RegKey, entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<String>) {
+fn collect_updates(
+    hklm: &RegKey,
+    entries: &mut Vec<SoftwareEntry>,
+    warnings: &mut Vec<String>,
+) -> bool {
     let packages = match hklm.open_subkey_with_flags(CBS_PACKAGES, KEY_READ) {
         Ok(key) => key,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             warnings.push("Component Based Servicing has no package list".to_string());
-            return;
+            return true;
         }
         Err(error) => {
             warnings.push(format!("failed to read installed updates: {error}"));
-            return;
+            return false;
         }
     };
 
     // One KB is many packages — one per component, per architecture — and the
     // inventory wants the update, not its parts.
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut complete = true;
 
     for name in packages.enum_keys() {
-        let Ok(name) = name else { continue };
+        let name = match name {
+            Ok(name) => name,
+            Err(error) => {
+                complete = false;
+                warnings.push(format!("failed to enumerate an installed update: {error}"));
+                continue;
+            }
+        };
         let Some(kb) = kb_id_from_package_name(&name) else {
             continue;
         };
         if seen.contains(&kb) {
             continue;
         }
-        let Ok(package) = packages.open_subkey_with_flags(&name, KEY_READ) else {
-            continue;
+        let package = match packages.open_subkey_with_flags(&name, KEY_READ) {
+            Ok(package) => package,
+            Err(error) => {
+                complete = false;
+                warnings.push(format!("failed to open installed update {name}: {error}"));
+                continue;
+            }
         };
         if package.get_value::<u32, _>("CurrentState").ok() != Some(CBS_STATE_INSTALLED) {
             continue;
@@ -269,6 +343,8 @@ fn collect_updates(hklm: &RegKey, entries: &mut Vec<SoftwareEntry>, warnings: &m
     if seen.is_empty() {
         warnings.push("no installed updates found under Component Based Servicing".to_string());
     }
+
+    complete
 }
 
 /// Extracts `KB5034123` from `Package_for_KB5034123~31bf3856ad364e35~amd64~~10.0.1.7`.
