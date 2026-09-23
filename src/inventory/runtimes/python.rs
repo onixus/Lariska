@@ -1,3 +1,4 @@
+use crate::inventory::read_text_file_limited;
 use crate::model::{SoftwareEntry, SoftwareSource};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,7 @@ pub fn collect_python_packages() -> Vec<SoftwareEntry> {
             let path = item.path();
             if path.is_dir() && path.extension().and_then(|ext| ext.to_str()) == Some("dist-info") {
                 let metadata_path = path.join("METADATA");
-                if let Ok(content) = fs::read_to_string(&metadata_path) {
+                if let Some(content) = read_text_file_limited(&metadata_path) {
                     if let Some(entry) = parse_python_metadata(&content, &dir) {
                         entries.push(entry);
                     }
@@ -38,20 +39,28 @@ pub fn parse_python_metadata(content: &str, install_dir: &Path) -> Option<Softwa
     let mut author = None;
 
     for line in content.lines() {
-        if line.is_empty() {
-            // End of header section in RFC 822 / Core Metadata
+        if line.trim().is_empty() {
+            // End of header section in RFC 822 / Core Metadata.
             break;
         }
+        let Some((key, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = raw_value.trim();
 
-        if let Some(val) = line.strip_prefix("Name: ") {
-            name = Some(val.trim().to_string());
-        } else if let Some(val) = line.strip_prefix("Version: ") {
-            version = Some(val.trim().to_string());
-        } else if let Some(val) = line.strip_prefix("Author: ") {
-            let a = val.trim();
-            if !a.is_empty() && a != "UNKNOWN" {
-                author = Some(a.to_string());
+        if key.eq_ignore_ascii_case("name") {
+            if !value.is_empty() {
+                name = Some(value.to_string());
             }
+        } else if key.eq_ignore_ascii_case("version") {
+            if !value.is_empty() {
+                version = Some(value.to_string());
+            }
+        } else if key.eq_ignore_ascii_case("author")
+            && !value.is_empty()
+            && !value.eq_ignore_ascii_case("unknown")
+        {
+            author = Some(value.to_string());
         }
     }
 
@@ -104,6 +113,8 @@ fn candidate_python_dirs() -> Vec<PathBuf> {
         }
     }
 
+    dirs.sort();
+    dirs.dedup();
     dirs
 }
 
@@ -159,5 +170,16 @@ License: Apache-2.0
             entry.install_location.as_deref(),
             Some("/usr/lib/python3/dist-packages")
         );
+    }
+
+    #[test]
+    fn parses_metadata_without_a_space_after_the_separator() {
+        let metadata = "Name:requests\nVersion:2.32.0\nAuthor:UNKNOWN\n\nbody";
+        let entry = parse_python_metadata(metadata, Path::new("/tmp/site-packages"))
+            .expect("should parse compact headers");
+
+        assert_eq!(entry.name, "requests");
+        assert_eq!(entry.version.as_deref(), Some("2.32.0"));
+        assert_eq!(entry.publisher, None);
     }
 }
