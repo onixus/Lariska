@@ -63,12 +63,8 @@ fn collect_sync() -> CollectorResult {
     for (subkey_path, architecture) in UNINSTALL_KEYS {
         match hklm.open_subkey_with_flags(subkey_path, KEY_READ) {
             Ok(uninstall_key) => {
-                complete &= collect_from_key(
-                    &uninstall_key,
-                    architecture,
-                    &mut entries,
-                    &mut warnings,
-                )
+                complete &=
+                    collect_from_key(&uninstall_key, architecture, &mut entries, &mut warnings)
             }
             // The Wow6432Node view does not exist on 32-bit-only Windows —
             // that is expected, not a collector failure.
@@ -137,12 +133,7 @@ fn collect_user_scope(entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<Strin
         for (subkey_path, architecture) in USER_UNINSTALL_KEYS {
             match hive.open_subkey_with_flags(subkey_path, KEY_READ) {
                 Ok(uninstall_key) => {
-                    complete &= collect_from_key(
-                        &uninstall_key,
-                        architecture,
-                        entries,
-                        warnings,
-                    )
+                    complete &= collect_from_key(&uninstall_key, architecture, entries, warnings)
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
