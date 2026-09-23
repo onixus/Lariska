@@ -45,6 +45,7 @@ pub async fn collect(timeout: Duration) -> CollectorResult {
     }
 
     if !any_manager_present {
+        result.complete = false;
         result.warnings.push(
             "no supported Linux package manager (dpkg-query/rpm/pacman) was found".to_string(),
         );
@@ -83,6 +84,7 @@ async fn collect_dpkg(timeout: Duration) -> Option<CollectorResult> {
     Some(CollectorResult {
         entries: parse_tab_separated(&output, SoftwareSource::Dpkg),
         warnings: Vec::new(),
+        complete: true,
     })
 }
 
@@ -106,6 +108,7 @@ async fn collect_rpm(timeout: Duration) -> Option<CollectorResult> {
     Some(CollectorResult {
         entries: parse_tab_separated(&output, SoftwareSource::Rpm),
         warnings: Vec::new(),
+        complete: true,
     })
 }
 
@@ -143,6 +146,7 @@ async fn collect_pacman(timeout: Duration) -> Option<CollectorResult> {
     Some(CollectorResult {
         entries,
         warnings: Vec::new(),
+        complete: true,
     })
 }
 
@@ -174,6 +178,7 @@ fn collector_failure(collector: &str, message: &str) -> CollectorResult {
     CollectorResult {
         entries: Vec::new(),
         warnings: vec![format!("{collector} collector failed: {message}")],
+        complete: false,
     }
 }
 
@@ -200,6 +205,14 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "curl");
+    }
+
+    #[test]
+    fn a_collector_failure_is_not_authoritative() {
+        let result = collector_failure("dpkg-query", "timed out");
+
+        assert!(!result.complete);
+        assert!(result.entries.is_empty());
     }
 
     #[test]
