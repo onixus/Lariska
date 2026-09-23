@@ -63,10 +63,7 @@ impl DeliveryStateStore {
             ));
         }
         if document.digest.len() != 64
-            || !document
-                .digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+            || !document.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err("delivery state contains an invalid SHA-256 digest".to_string());
         }
@@ -142,7 +139,10 @@ impl DeliveryStateStore {
         sync_parent_dir(&self.path).map_err(|error| {
             format!(
                 "failed to sync delivery state directory {}: {error}",
-                self.path.parent().unwrap_or_else(|| Path::new(".")).display()
+                self.path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .display()
             )
         })?;
         Ok(())
