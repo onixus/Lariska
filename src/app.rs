@@ -140,12 +140,6 @@ async fn run_async(
 
     tracing::info!(agent_id = %identity.agent_id, "Lariska Endpoint Agent started");
 
-    // Resume anything left over from a prior crash/outage before collecting
-    // a fresh snapshot.
-    if let Err(error) = delivery_client.drain_spool().await {
-        tracing::warn!(%error, "startup spool drain did not complete");
-    }
-
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     // What the loops actually run on, as opposed to what the file said at
     // startup: the server can change it while they run (#358).
@@ -158,6 +152,7 @@ async fn run_async(
         &config,
         shutdown_rx.clone(),
     );
+    let delivery_loop = delivery_client.run_loop(shutdown_rx.clone());
     let inventory_loop = inventory_loop(
         &delivery_client,
         &identity.agent_id,
@@ -183,6 +178,9 @@ async fn run_async(
             }
         }
         () = inventory_loop => {}
+        () = delivery_loop => {
+            tracing::warn!("delivery worker stopped unexpectedly");
+        }
         () = service::wait_for_shutdown_signal() => {
             tracing::info!("shutdown signal received, stopping");
             let _ = shutdown_tx.send(true);
@@ -235,7 +233,7 @@ async fn inventory_loop(
         tokio::select! {
             _ = &mut timer => {
                 if let Err(error) = collect_and_submit(delivery_client, agent_id, hostname, state_dir, cache_max_age).await {
-                    tracing::warn!(%error, "inventory collection/submission failed");
+                    tracing::warn!(%error, "inventory collection/queueing failed");
                 }
 
                 let on_battery = crate::qos::is_on_battery();
@@ -327,7 +325,10 @@ async fn collect_and_submit(
     let identifiers = identity::platform_identifiers();
     let snapshot = build_snapshot(agent_id, hostname, identifiers, collected)?;
 
-    delivery_client.submit_if_needed(snapshot).await
+    delivery_client
+        .enqueue_if_needed(snapshot)
+        .await
+        .map(|_| ())
 }
 
 /// A partial snapshot must never replace the last accepted server-side state.
