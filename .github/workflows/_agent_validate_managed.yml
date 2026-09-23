@@ -1,0 +1,355 @@
+name: Apply managed settings validation
+
+on:
+  push:
+    branches:
+      - fix/validate-managed-settings
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/validate-managed-settings
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply validation and tests
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/managed.rs')
+          text = path.read_text(encoding='utf-8')
+
+          imports = '''use std::sync::Arc;
+          use std::time::Duration;
+          '''
+          imports_new = '''use std::sync::Arc;
+          use std::time::Duration;
+
+          // Keep these bounds aligned with both local Config validation and the
+          // Shapoclyack policy API. The server validates first, but the endpoint
+          // remains the final authority over what it will execute.
+          const MIN_MANAGED_INTERVAL_SECS: u64 = 10;
+          const MAX_MANAGED_INTERVAL_SECS: u64 = 86_400;
+          const MANAGED_LOG_LEVELS: &[&str] = &["error", "warn", "info", "debug", "trace"];
+          '''
+          assert imports in text
+          text = text.replace(imports, imports_new, 1)
+
+          old = '''pub fn apply_settings(
+              directive: &ManagedDirective,
+              applied: Option<u64>,
+              runtime: &tokio::sync::watch::Sender<Runtime>,
+          ) -> Option<u64> {
+              let Some(settings) = directive.managed_settings.as_ref() else {
+                  return directive.managed_revision.or(applied);
+              };
+
+              match directive.managed_revision {
+                  Some(revision) if applied == Some(revision) => return applied,
+                  // A policy with no revision on it still has to take effect: an older
+                  // console, or a path that does not stamp one, would otherwise have its
+                  // settings accepted there and silently dropped here. Deduplicated on
+                  // the settings themselves instead, so the repeat on every beat does
+                  // not re-log or reload the filter.
+                  None => {
+                      let mut last = last_unversioned_settings()
+                          .lock()
+                          .unwrap_or_else(|poisoned| poisoned.into_inner());
+                      if last.as_ref() == Some(settings) {
+                          return applied;
+                      }
+                      *last = Some(settings.clone());
+                  }
+                  Some(_) => {}
+              }
+
+              let mut next = *runtime.borrow();
+              if let Some(secs) = settings.heartbeat_interval_secs {
+                  next.heartbeat_interval = Duration::from_secs(secs);
+              }
+              if let Some(secs) = settings.inventory_interval_secs {
+                  next.inventory_interval = Duration::from_secs(secs);
+              }
+              if let Some(level) = settings.log_level.as_deref() {
+                  crate::telemetry::set_log_level(level);
+              }
+
+              // `send_replace`, not `send`: `send` fails when every receiver has been
+              // dropped, and would then leave the published settings at their old value
+              // while reporting nothing. The loops are the receivers, so that is the
+              // shutdown path -- but "no one is listening" must not turn into "the
+              // setting silently did not change".
+              if next != *runtime.borrow() {
+                  runtime.send_replace(next);
+              }
+              tracing::info!(
+                  revision = directive.managed_revision.unwrap_or_default(),
+                  heartbeat_secs = next.heartbeat_interval.as_secs(),
+                  inventory_secs = next.inventory_interval.as_secs(),
+                  log_level = settings.log_level.as_deref().unwrap_or("unchanged"),
+                  "applied managed settings"
+              );
+              directive.managed_revision.or(applied)
+          }
+          '''
+
+          new = '''pub fn apply_settings(
+              directive: &ManagedDirective,
+              applied: Option<u64>,
+              runtime: &tokio::sync::watch::Sender<Runtime>,
+          ) -> Option<u64> {
+              let Some(settings) = directive.managed_settings.as_ref() else {
+                  return directive.managed_revision.or(applied);
+              };
+
+              if matches!(directive.managed_revision, Some(revision) if applied == Some(revision)) {
+                  return applied;
+              }
+
+              let validated = match validate_managed_settings(settings) {
+                  Ok(validated) => {
+                      clear_rejected_settings();
+                      validated
+                  }
+                  Err(error) => {
+                      if remember_rejected_settings(directive.managed_revision, settings) {
+                          tracing::warn!(
+                              revision = directive.managed_revision.unwrap_or_default(),
+                              %error,
+                              "rejected managed settings; keeping the previous runtime configuration"
+                          );
+                      }
+                      // Do not acknowledge a revision that was not applied. The server
+                      // will continue reporting it, which makes the mismatch visible
+                      // instead of silently pretending the endpoint obeyed it.
+                      return applied;
+                  }
+              };
+
+              // A policy with no revision on it still has to take effect: an older
+              // console, or a path that does not stamp one, would otherwise have its
+              // settings accepted there and silently dropped here. Deduplicated on the
+              // raw settings themselves after validation, so an invalid policy is never
+              // remembered as applied.
+              if directive.managed_revision.is_none() {
+                  let mut last = last_unversioned_settings()
+                      .lock()
+                      .unwrap_or_else(|poisoned| poisoned.into_inner());
+                  if last.as_ref() == Some(settings) {
+                      return applied;
+                  }
+                  *last = Some(settings.clone());
+              }
+
+              let mut next = *runtime.borrow();
+              if let Some(interval) = validated.heartbeat_interval {
+                  next.heartbeat_interval = interval;
+              }
+              if let Some(interval) = validated.inventory_interval {
+                  next.inventory_interval = interval;
+              }
+              if let Some(level) = validated.log_level.as_deref() {
+                  crate::telemetry::set_log_level(level);
+              }
+
+              // `send_replace`, not `send`: `send` fails when every receiver has been
+              // dropped, and would then leave the published settings at their old value
+              // while reporting nothing. The loops are the receivers, so that is the
+              // shutdown path -- but "no one is listening" must not turn into "the
+              // setting silently did not change".
+              if next != *runtime.borrow() {
+                  runtime.send_replace(next);
+              }
+              tracing::info!(
+                  revision = directive.managed_revision.unwrap_or_default(),
+                  heartbeat_secs = next.heartbeat_interval.as_secs(),
+                  inventory_secs = next.inventory_interval.as_secs(),
+                  log_level = validated.log_level.as_deref().unwrap_or("unchanged"),
+                  "applied managed settings"
+              );
+              directive.managed_revision.or(applied)
+          }
+
+          #[derive(Debug)]
+          struct ValidatedManagedSettings {
+              heartbeat_interval: Option<Duration>,
+              inventory_interval: Option<Duration>,
+              log_level: Option<String>,
+          }
+
+          fn validate_managed_settings(
+              settings: &ManagedSettings,
+          ) -> Result<ValidatedManagedSettings, String> {
+              Ok(ValidatedManagedSettings {
+                  heartbeat_interval: validate_managed_interval(
+                      "heartbeat_interval_secs",
+                      settings.heartbeat_interval_secs,
+                  )?,
+                  inventory_interval: validate_managed_interval(
+                      "inventory_interval_secs",
+                      settings.inventory_interval_secs,
+                  )?,
+                  log_level: settings
+                      .log_level
+                      .as_deref()
+                      .map(validate_managed_log_level)
+                      .transpose()?,
+              })
+          }
+
+          fn validate_managed_interval(
+              name: &str,
+              seconds: Option<u64>,
+          ) -> Result<Option<Duration>, String> {
+              let Some(seconds) = seconds else {
+                  return Ok(None);
+              };
+              if !(MIN_MANAGED_INTERVAL_SECS..=MAX_MANAGED_INTERVAL_SECS).contains(&seconds) {
+                  return Err(format!(
+                      "{name} must be between {MIN_MANAGED_INTERVAL_SECS} and \
+                       {MAX_MANAGED_INTERVAL_SECS} seconds (got {seconds})"
+                  ));
+              }
+              Ok(Some(Duration::from_secs(seconds)))
+          }
+
+          fn validate_managed_log_level(level: &str) -> Result<String, String> {
+              let normalized = level.trim().to_ascii_lowercase();
+              if MANAGED_LOG_LEVELS.contains(&normalized.as_str()) {
+                  return Ok(normalized);
+              }
+              Err(format!(
+                  "log_level must be one of {} (got {level:?})",
+                  MANAGED_LOG_LEVELS.join(", ")
+              ))
+          }
+
+          #[derive(Clone, Debug, PartialEq, Eq)]
+          struct RejectedManagedSettings {
+              revision: Option<u64>,
+              settings: ManagedSettings,
+          }
+
+          fn remember_rejected_settings(revision: Option<u64>, settings: &ManagedSettings) -> bool {
+              let rejected = RejectedManagedSettings {
+                  revision,
+                  settings: settings.clone(),
+              };
+              let mut last = last_rejected_settings()
+                  .lock()
+                  .unwrap_or_else(|poisoned| poisoned.into_inner());
+              if last.as_ref() == Some(&rejected) {
+                  return false;
+              }
+              *last = Some(rejected);
+              true
+          }
+
+          fn clear_rejected_settings() {
+              let mut last = last_rejected_settings()
+                  .lock()
+                  .unwrap_or_else(|poisoned| poisoned.into_inner());
+              *last = None;
+          }
+
+          fn last_rejected_settings(
+          ) -> &'static std::sync::Mutex<Option<RejectedManagedSettings>> {
+              static LAST: std::sync::OnceLock<
+                  std::sync::Mutex<Option<RejectedManagedSettings>>,
+              > = std::sync::OnceLock::new();
+              LAST.get_or_init(|| std::sync::Mutex::new(None))
+          }
+          '''
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          marker = '''    #[test]
+              fn the_triple_names_this_build() {
+          '''
+          tests = '''    #[test]
+              fn invalid_interval_is_rejected_without_partial_application() {
+                  let sender = watch(base());
+                  let directive = ManagedDirective {
+                      managed_revision: Some(8),
+                      managed_settings: Some(ManagedSettings {
+                          heartbeat_interval_secs: Some(0),
+                          inventory_interval_secs: Some(900),
+                          log_level: None,
+                      }),
+                      ..ManagedDirective::default()
+                  };
+
+                  let applied = apply_settings(&directive, Some(7), &sender);
+
+                  assert_eq!(applied, Some(7));
+                  assert_eq!(*sender.borrow(), base());
+              }
+
+              #[test]
+              fn invalid_log_level_rejects_the_whole_revision() {
+                  let sender = watch(base());
+                  let directive = ManagedDirective {
+                      managed_revision: Some(9),
+                      managed_settings: Some(ManagedSettings {
+                          heartbeat_interval_secs: Some(30),
+                          inventory_interval_secs: None,
+                          log_level: Some("silent".to_string()),
+                      }),
+                      ..ManagedDirective::default()
+                  };
+
+                  let applied = apply_settings(&directive, Some(7), &sender);
+
+                  assert_eq!(applied, Some(7));
+                  assert_eq!(*sender.borrow(), base());
+              }
+
+              #[test]
+              fn managed_values_are_normalized_and_bounds_are_inclusive() {
+                  let validated = validate_managed_settings(&ManagedSettings {
+                      heartbeat_interval_secs: Some(MIN_MANAGED_INTERVAL_SECS),
+                      inventory_interval_secs: Some(MAX_MANAGED_INTERVAL_SECS),
+                      log_level: Some(" DEBUG ".to_string()),
+                  })
+                  .expect("boundary values should be accepted");
+
+                  assert_eq!(
+                      validated.heartbeat_interval,
+                      Some(Duration::from_secs(MIN_MANAGED_INTERVAL_SECS))
+                  );
+                  assert_eq!(
+                      validated.inventory_interval,
+                      Some(Duration::from_secs(MAX_MANAGED_INTERVAL_SECS))
+                  );
+                  assert_eq!(validated.log_level.as_deref(), Some("debug"));
+              }
+
+              #[test]
+              fn the_triple_names_this_build() {
+          '''
+          assert marker in text
+          text = text.replace(marker, tests, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+          cargo fmt --all
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/_agent_validate_managed.yml
+          git add src/managed.rs
+          git commit -m "fix: validate managed settings before applying"
+          git push origin HEAD:fix/validate-managed-settings
