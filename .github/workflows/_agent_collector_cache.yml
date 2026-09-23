@@ -25,13 +25,22 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
-          import re
 
           def replace_once(text: str, old: str, new: str, label: str) -> str:
               count = text.count(old)
               if count != 1:
                   raise RuntimeError(f"{label}: expected one match, found {count}")
               return text.replace(old, new, 1)
+
+          cache_path = Path("src/inventory/cache.rs")
+          cache_text = cache_path.read_text(encoding="utf-8")
+          old_return = "        return Ok(Some(builder.finish()));"
+          if cache_text.count(old_return) != 2:
+              raise RuntimeError("expected Linux and macOS platform fingerprint returns")
+          cache_path.write_text(
+              cache_text.replace(old_return, "        Ok(Some(builder.finish()))"),
+              encoding="utf-8",
+          )
 
           path = Path("src/inventory/mod.rs")
           text = path.read_text(encoding="utf-8")
