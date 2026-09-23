@@ -1,6 +1,7 @@
 use crate::model::SoftwareEntry;
 use std::time::{Duration, Instant};
 
+mod cache;
 pub mod environment;
 pub mod runtimes;
 
@@ -30,7 +31,7 @@ const DEFAULT_COLLECTOR_TIMEOUT: Duration = Duration::from_secs(20);
 /// collector's failure never crashes the whole run: the partial entries and
 /// warnings remain available for diagnostics, while `complete` prevents that
 /// partial view from replacing the last authoritative server-side inventory.
-#[derive(Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CollectorResult {
     pub entries: Vec<SoftwareEntry>,
     pub warnings: Vec<String>,
@@ -59,6 +60,13 @@ impl CollectorResult {
 /// Runs every collector supported on the current OS and merges the results.
 pub async fn collect_all() -> CollectorResult {
     collect_all_with_timeout(DEFAULT_COLLECTOR_TIMEOUT).await
+}
+
+/// Uses persistent per-collector fingerprints for the daemon path.
+/// Diagnostic collection deliberately bypasses this so an operator
+/// asking for inventory always gets a fresh read of the host.
+pub async fn collect_all_cached(state_dir: &Path, max_age: Duration) -> CollectorResult {
+    cache::collect_all_cached(state_dir, DEFAULT_COLLECTOR_TIMEOUT, max_age).await
 }
 
 pub async fn collect_all_with_timeout(timeout: Duration) -> CollectorResult {

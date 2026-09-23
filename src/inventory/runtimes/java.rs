@@ -80,7 +80,7 @@ fn non_empty_release_value(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-fn candidate_jvm_dirs() -> Vec<PathBuf> {
+pub(crate) fn candidate_jvm_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
     #[cfg(target_os = "linux")]

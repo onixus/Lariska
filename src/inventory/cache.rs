@@ -67,11 +67,7 @@ impl InventoryCache {
         self.dir.join(kind.file_name())
     }
 
-    fn load(
-        &self,
-        kind: CacheKind,
-        fingerprint: &str,
-    ) -> Result<Option<CollectorResult>, String> {
+    fn load(&self, kind: CacheKind, fingerprint: &str) -> Result<Option<CollectorResult>, String> {
         let path = self.path(kind);
         let file = match File::open(&path) {
             Ok(file) => file,
@@ -95,8 +91,9 @@ impl InventoryCache {
             ));
         }
 
-        let cached: CachedCollector = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("failed to parse {} inventory cache: {error}", kind.label()))?;
+        let cached: CachedCollector = serde_json::from_slice(&bytes).map_err(|error| {
+            format!("failed to parse {} inventory cache: {error}", kind.label())
+        })?;
         if cached.format_version != CACHE_FORMAT_VERSION
             || cached.agent_version != env!("CARGO_PKG_VERSION")
             || cached.fingerprint != fingerprint
@@ -137,8 +134,12 @@ impl InventoryCache {
             stored_at_unix_secs: unix_time_secs(),
             result: result.clone(),
         };
-        let bytes = serde_json::to_vec(&cached)
-            .map_err(|error| format!("failed to serialize {} inventory cache: {error}", kind.label()))?;
+        let bytes = serde_json::to_vec(&cached).map_err(|error| {
+            format!(
+                "failed to serialize {} inventory cache: {error}",
+                kind.label()
+            )
+        })?;
         if bytes.len() > MAX_CACHE_BYTES {
             return Err(format!(
                 "{} inventory cache is {} bytes, exceeding the {MAX_CACHE_BYTES} byte limit",
@@ -160,7 +161,9 @@ impl InventoryCache {
                 })?;
             file.write_all(&bytes)
                 .and_then(|()| file.sync_all())
-                .map_err(|error| format!("failed to write {} inventory cache: {error}", kind.label()))
+                .map_err(|error| {
+                    format!("failed to write {} inventory cache: {error}", kind.label())
+                })
         })();
         if let Err(error) = write_result {
             let _ = fs::remove_file(&temp);
@@ -200,7 +203,8 @@ pub async fn collect_all_cached(
 
     let mut result = collect_platform_cached(cache.clone(), timeout).await;
     let runtime_cache = cache.clone();
-    match tokio::task::spawn_blocking(move || collect_runtimes_cached(runtime_cache.as_ref())).await {
+    match tokio::task::spawn_blocking(move || collect_runtimes_cached(runtime_cache.as_ref())).await
+    {
         Ok(runtime_result) => result.merge(runtime_result),
         Err(error) => {
             result.complete = false;
@@ -279,7 +283,9 @@ async fn collect_platform(timeout: Duration) -> CollectorResult {
         let _ = timeout;
         CollectorResult {
             entries: Vec::new(),
-            warnings: vec!["software collection is not supported on this operating system".to_string()],
+            warnings: vec![
+                "software collection is not supported on this operating system".to_string(),
+            ],
             complete: false,
         }
     }
@@ -354,7 +360,7 @@ fn platform_fingerprint() -> Result<Option<String>, String> {
         builder.add_tree(Path::new("/usr/lib/sysimage/rpm"), 2)?;
         builder.add_tree(Path::new("/var/lib/rpm"), 2)?;
         builder.add_tree(Path::new("/var/lib/pacman/local"), 2)?;
-        return Ok(Some(builder.finish()));
+        Ok(Some(builder.finish()))
     }
     #[cfg(target_os = "macos")]
     {
@@ -371,7 +377,7 @@ fn platform_fingerprint() -> Result<Option<String>, String> {
         ] {
             builder.add_tree(Path::new(cellar), 2)?;
         }
-        return Ok(Some(builder.finish()));
+        Ok(Some(builder.finish()))
     }
     #[cfg(target_os = "windows")]
     {
@@ -391,7 +397,9 @@ fn python_fingerprint() -> Result<String, String> {
     for dir in runtimes::python::candidate_python_dirs() {
         builder.add_path(&dir)?;
         for path in sorted_children(&dir)? {
-            if path.is_dir() && path.extension().and_then(|value| value.to_str()) == Some("dist-info") {
+            if path.is_dir()
+                && path.extension().and_then(|value| value.to_str()) == Some("dist-info")
+            {
                 builder.add_path(&path)?;
                 builder.add_path(&path.join("METADATA"))?;
             }
@@ -539,8 +547,8 @@ fn sorted_children(path: &Path) -> Result<Vec<PathBuf>, String> {
         return Ok(Vec::new());
     }
     let mut children = Vec::new();
-    for entry in fs::read_dir(path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?
+    for entry in
+        fs::read_dir(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?
     {
         children.push(
             entry

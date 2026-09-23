@@ -79,7 +79,7 @@ pub fn parse_python_metadata(content: &str, install_dir: &Path) -> Option<Softwa
     })
 }
 
-fn candidate_python_dirs() -> Vec<PathBuf> {
+pub(crate) fn candidate_python_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
     #[cfg(target_os = "linux")]
