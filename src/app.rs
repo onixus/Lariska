@@ -249,11 +249,27 @@ async fn collect_and_submit(
     for warning in &collected.warnings {
         tracing::warn!(%warning, "inventory collector warning");
     }
+    ensure_authoritative_collection(&collected)?;
 
     let identifiers = identity::platform_identifiers();
     let snapshot = build_snapshot(agent_id, hostname, identifiers, collected)?;
 
     delivery_client.submit_if_needed(snapshot).await
+}
+
+/// A partial snapshot must never replace the last accepted server-side state.
+/// The ingestion API interprets absence as removal, so submitting the entries
+/// that happened to be collected before a timeout would manufacture removals
+/// and then manufacture reinstalls on the next healthy cycle.
+fn ensure_authoritative_collection(collected: &CollectorResult) -> Result<(), String> {
+    if collected.complete {
+        return Ok(());
+    }
+
+    Err(format!(
+        "inventory collection was incomplete ({} warning(s)); snapshot was not spooled or submitted",
+        collected.warnings.len()
+    ))
 }
 
 fn build_snapshot(
@@ -425,12 +441,27 @@ mod tests {
                 },
             ],
             warnings: Vec::new(),
+            complete: true,
         };
 
         let snapshot = diagnostic_snapshot(collected, Vec::new());
 
         assert_eq!(snapshot.software.len(), 1);
         assert_eq!(snapshot.software[0].name, "bash");
+    }
+
+    #[test]
+    fn incomplete_collection_is_not_publishable() {
+        let collected = CollectorResult {
+            entries: Vec::new(),
+            warnings: vec!["dpkg-query collector failed: timed out".to_string()],
+            complete: false,
+        };
+
+        let error = ensure_authoritative_collection(&collected)
+            .expect_err("partial data must not be submitted as an authoritative snapshot");
+
+        assert!(error.contains("not spooled or submitted"));
     }
 
     #[test]
