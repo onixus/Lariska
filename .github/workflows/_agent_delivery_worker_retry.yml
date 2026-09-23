@@ -1,0 +1,627 @@
+name: Retry independent delivery worker
+
+on:
+  push:
+    branches:
+      - perf/independent-delivery-worker
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/independent-delivery-worker
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply delivery worker and validate
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          delivery = Path("src/delivery/mod.rs")
+          text = delivery.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              "use std::time::{Duration, SystemTime};",
+              "use std::time::Duration;",
+              "delivery time import",
+          )
+          text = replace_once(
+              text,
+              "pub mod retry;\npub mod spool;",
+              "pub mod retry;\npub mod spool;\nmod state;",
+              "delivery modules",
+          )
+          text = replace_once(
+              text,
+              "use spool::{Spool, SpoolError};",
+              "use spool::{Spool, SpoolError};\nuse state::{now_unix_secs, AcceptedState, DeliveryStateStore};",
+              "delivery state imports",
+          )
+          text = replace_once(
+              text,
+              "const MAX_ATTEMPTS_PER_ENTRY: u32 = 6;",
+              "const MAX_ATTEMPTS_PER_ENTRY: u32 = 6;\nconst DELIVERY_RETRY_INTERVAL: Duration = Duration::from_secs(60);",
+              "delivery retry interval",
+          )
+          text = replace_once(
+              text,
+              "struct LastAccepted {\n    digest: String,\n    accepted_at: SystemTime,\n}\n",
+              "enum SubmitFailure {\n    Blocking(String),\n    Quarantined(String),\n}\n",
+              "submit failure type",
+          )
+          text = replace_once(
+              text,
+              "pub struct DeliveryClient {\n    api: ApiClient,\n    auth: AuthClient,\n    spool: Spool,\n    max_spool_entries: usize,\n    full_refresh_interval: Duration,\n    last_accepted: tokio::sync::Mutex<Option<LastAccepted>>,\n}\n",
+              "pub struct DeliveryClient {\n    api: ApiClient,\n    auth: AuthClient,\n    spool: Spool,\n    state_store: DeliveryStateStore,\n    max_spool_entries: usize,\n    full_refresh_interval: Duration,\n    last_accepted: tokio::sync::Mutex<Option<AcceptedState>>,\n    last_enqueued_digest: tokio::sync::Mutex<Option<String>>,\n    wake_delivery: tokio::sync::Notify,\n}\n",
+              "delivery client fields",
+          )
+
+          start = text.index("    pub fn new(")
+          end = text.index("    /// Called once per collection cycle.", start)
+          constructor = '''    pub fn new(
+              api: ApiClient,
+              auth: AuthClient,
+              state_dir: &Path,
+              max_spool_entries: usize,
+              full_refresh_interval: Duration,
+          ) -> Result<Self, SpoolError> {
+              let spool = Spool::open(state_dir)?;
+              let state_store = DeliveryStateStore::new(state_dir);
+              let last_accepted = state_store.load_or_discard_invalid();
+              let last_enqueued_digest = newest_pending_digest(&spool);
+
+              Ok(Self {
+                  api,
+                  auth,
+                  spool,
+                  state_store,
+                  max_spool_entries,
+                  full_refresh_interval,
+                  last_accepted: tokio::sync::Mutex::new(last_accepted),
+                  last_enqueued_digest: tokio::sync::Mutex::new(last_enqueued_digest),
+                  wake_delivery: tokio::sync::Notify::new(),
+              })
+          }
+
+          '''
+          text = text[:start] + constructor + text[end:]
+
+          start = text.index("    /// Called once per collection cycle.")
+          end = text.index("    /// Submits every pending spool entry", start)
+          queue_block = '''    /// Persists a complete snapshot and wakes the delivery worker. No network
+              /// operation is performed here, so a slow or unavailable server cannot
+              /// stretch the inventory schedule.
+              pub async fn enqueue_if_needed(
+                  &self,
+                  snapshot: InventorySnapshot,
+              ) -> Result<bool, String> {
+                  let digest = content_digest(&snapshot);
+                  let due_for_submission = self.due_for_submission(&digest).await;
+                  let mut queued = self.last_enqueued_digest.lock().await;
+
+                  if queued.as_deref() == Some(digest.as_str()) {
+                      return Ok(false);
+                  }
+                  // A snapshot equal to the last accepted state is normally skipped.
+                  // If a different state is already queued, however, this snapshot is
+                  // the return transition and must follow it or the server would stop
+                  // at the stale intermediate state after connectivity recovers.
+                  if !due_for_submission && queued.is_none() {
+                      return Ok(false);
+                  }
+
+                  self.spool
+                      .write(&snapshot)
+                      .map_err(|error| format!("failed to spool snapshot: {error}"))?;
+
+                  match self.spool.enforce_limit(self.max_spool_entries) {
+                      Ok(evicted) => {
+                          for snapshot_id in evicted {
+                              tracing::warn!(
+                                  %snapshot_id,
+                                  max_spool_entries = self.max_spool_entries,
+                                  "spool over limit; evicted oldest unsent snapshot"
+                              );
+                          }
+                      }
+                      Err(error) => tracing::warn!(
+                          %error,
+                          "could not enforce spool capacity after enqueue"
+                      ),
+                  }
+
+                  *queued = Some(digest);
+                  drop(queued);
+                  self.wake_delivery.notify_one();
+                  Ok(true)
+              }
+
+              /// Compatibility helper for diagnostics and contract tests. The daemon
+              /// uses `enqueue_if_needed` and a separate worker instead.
+              pub async fn submit_if_needed(&self, snapshot: InventorySnapshot) -> Result<(), String> {
+                  self.enqueue_if_needed(snapshot).await?;
+                  self.drain_spool().await
+              }
+
+              async fn due_for_submission(&self, digest: &str) -> bool {
+                  let last = self.last_accepted.lock().await;
+                  let Some(last) = last.as_ref() else {
+                      return true;
+                  };
+                  let now = now_unix_secs();
+                  let due_for_refresh = last.accepted_at_unix_secs > now
+                      || now.saturating_sub(last.accepted_at_unix_secs)
+                          >= self.full_refresh_interval.as_secs();
+                  last.digest != digest || due_for_refresh
+              }
+
+          '''
+          text = text[:start] + queue_block + text[end:]
+
+          start = text.index("    /// Submits every pending spool entry")
+          end = text.index("    async fn submit_one", start)
+          drain_block = '''    /// Submits every pending spool entry, oldest first. Paths are enumerated
+              /// first, then each entry is decoded, submitted and dropped before the next
+              /// one is opened. Payload-specific failures are quarantined and do not
+              /// prevent a later valid snapshot from being attempted in the same pass.
+              pub async fn drain_spool(&self) -> Result<(), String> {
+                  let pending_paths = self
+                      .spool
+                      .pending_paths()
+                      .map_err(|error| format!("failed to read spool: {error}"))?;
+                  let mut first_quarantined = None;
+
+                  for path in pending_paths {
+                      let Some(snapshot) = self
+                          .spool
+                          .read_pending(&path)
+                          .map_err(|error| format!("failed to read spool entry: {error}"))?
+                      else {
+                          continue;
+                      };
+
+                      let digest = content_digest(&snapshot);
+                      match self.submit_one(&snapshot).await {
+                          Ok(()) => {
+                              self.spool.remove(&snapshot.snapshot_id).map_err(|error| {
+                                  format!(
+                                      "snapshot {} was accepted but could not be removed from spool: {error}",
+                                      snapshot.snapshot_id
+                                  )
+                              })?;
+                              let accepted = AcceptedState {
+                                  digest,
+                                  accepted_at_unix_secs: now_unix_secs(),
+                              };
+                              if let Err(error) = self.state_store.store(&accepted) {
+                                  tracing::warn!(
+                                      %error,
+                                      "accepted snapshot state could not be persisted"
+                                  );
+                              }
+                              let mut last = self.last_accepted.lock().await;
+                              *last = Some(accepted);
+                          }
+                          Err(SubmitFailure::Quarantined(error)) => {
+                              tracing::warn!(%error, "inventory snapshot was quarantined");
+                              if first_quarantined.is_none() {
+                                  first_quarantined = Some(error);
+                              }
+                          }
+                          Err(SubmitFailure::Blocking(error)) => {
+                              tracing::warn!(%error, "inventory submission failed, left in spool");
+                              return Err(error);
+                          }
+                      }
+                  }
+
+                  self.clear_enqueued_if_spool_empty().await?;
+                  if let Some(error) = first_quarantined {
+                      Err(error)
+                  } else {
+                      Ok(())
+                  }
+              }
+
+              /// Owns retries independently of inventory collection. It drains once at
+              /// startup, wakes immediately for new snapshots, and polls a failed queue
+              /// at a bounded cadence without forcing another host scan.
+              pub async fn run_loop(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+                  loop {
+                      if *shutdown.borrow() {
+                          break;
+                      }
+
+                      if let Err(error) = self.drain_spool().await {
+                          tracing::warn!(%error, "delivery worker could not drain the spool");
+                      }
+
+                      if *shutdown.borrow() {
+                          break;
+                      }
+
+                      if self.has_pending() {
+                          tokio::select! {
+                              _ = self.wake_delivery.notified() => {}
+                              _ = tokio::time::sleep(DELIVERY_RETRY_INTERVAL) => {}
+                              changed = shutdown.changed() => {
+                                  if changed.is_err() || *shutdown.borrow() {
+                                      break;
+                                  }
+                              }
+                          }
+                      } else {
+                          tokio::select! {
+                              _ = self.wake_delivery.notified() => {}
+                              changed = shutdown.changed() => {
+                                  if changed.is_err() || *shutdown.borrow() {
+                                      break;
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              fn has_pending(&self) -> bool {
+                  match self.spool.pending_paths() {
+                      Ok(paths) => !paths.is_empty(),
+                      Err(error) => {
+                          tracing::warn!(%error, "could not inspect the delivery spool");
+                          true
+                      }
+                  }
+              }
+
+              async fn clear_enqueued_if_spool_empty(&self) -> Result<(), String> {
+                  let mut queued = self.last_enqueued_digest.lock().await;
+                  if self
+                      .spool
+                      .pending_paths()
+                      .map_err(|error| format!("failed to inspect spool after drain: {error}"))?
+                      .is_empty()
+                  {
+                      *queued = None;
+                  }
+                  Ok(())
+              }
+
+          '''
+          text = text[:start] + drain_block + text[end:]
+
+          start = text.index("    async fn submit_one")
+          end = text.index("    async fn post", start)
+          submit_one = '''    async fn submit_one(
+                  &self,
+                  snapshot: &InventorySnapshot,
+              ) -> Result<(), SubmitFailure> {
+                  let mut attempt = 0_u32;
+                  let mut refreshed_once = false;
+
+                  loop {
+                      attempt += 1;
+                      let token = self
+                          .auth
+                          .token()
+                          .await
+                          .map_err(|error| SubmitFailure::Blocking(error.to_string()))?;
+
+                      let error = match self.post(snapshot, &token).await {
+                          Ok(()) => return Ok(()),
+                          Err(ApiError::Auth) if !refreshed_once => {
+                              refreshed_once = true;
+                              let token = self
+                                  .auth
+                                  .force_refresh()
+                                  .await
+                                  .map_err(|error| SubmitFailure::Blocking(error.to_string()))?;
+                              match self.post(snapshot, &token).await {
+                                  Ok(()) => return Ok(()),
+                                  Err(error) => error,
+                              }
+                          }
+                          Err(error) => error,
+                      };
+
+                      if matches!(
+                          error,
+                          ApiError::Conflict(_)
+                              | ApiError::Validation(_)
+                              | ApiError::PayloadTooLarge(_)
+                      ) {
+                          let message = format!(
+                              "snapshot {} rejected and quarantined: {error}",
+                              snapshot.snapshot_id
+                          );
+                          self.spool
+                              .quarantine_by_id(&snapshot.snapshot_id)
+                              .map_err(|quarantine_error| {
+                                  SubmitFailure::Blocking(format!(
+                                      "{message}; failed to quarantine it: {quarantine_error}"
+                                  ))
+                              })?;
+                          return Err(SubmitFailure::Quarantined(message));
+                      }
+
+                      match classify(&error, attempt) {
+                          RetryDecision::RetryAfter(delay)
+                              if attempt < MAX_ATTEMPTS_PER_ENTRY =>
+                          {
+                              tracing::warn!(
+                                  attempt,
+                                  %error,
+                                  retry_in = ?delay,
+                                  snapshot_id = %snapshot.snapshot_id,
+                                  "inventory submission attempt failed"
+                              );
+                              tokio::time::sleep(delay).await;
+                          }
+                          _ => return Err(SubmitFailure::Blocking(error.to_string())),
+                      }
+                  }
+              }
+
+          '''
+          text = text[:start] + submit_one + text[end:]
+
+          helper_marker = "/// SHA-256 over the fields that describe actual endpoint state"
+          helper = '''fn newest_pending_digest(spool: &Spool) -> Option<String> {
+              let paths = match spool.pending_paths() {
+                  Ok(paths) => paths,
+                  Err(error) => {
+                      tracing::warn!(%error, "could not inspect pending spool at startup");
+                      return None;
+                  }
+              };
+
+              for path in paths.into_iter().rev() {
+                  match spool.read_pending(&path) {
+                      Ok(Some(snapshot)) => return Some(content_digest(&snapshot)),
+                      Ok(None) => {}
+                      Err(error) => tracing::warn!(
+                          %error,
+                          path = %path.display(),
+                          "could not inspect pending snapshot digest"
+                      ),
+                  }
+              }
+              None
+          }
+
+          '''
+          text = replace_once(text, helper_marker, helper + helper_marker, "pending digest helper")
+
+          test_marker = "    #[tokio::test]\n    async fn crash_recovery_resumes_pending_spool_entries()"
+          extra_tests = '''    #[tokio::test]
+              async fn enqueue_is_disk_only() {
+                  let server = MockServer::start().await;
+                  let key_path = write_temp_key("enqueue_only");
+                  let state_dir = temp_state_dir("enqueue_only");
+                  let client = test_client(server.uri(), key_path.clone(), &state_dir);
+
+                  assert!(client
+                      .enqueue_if_needed(sample_snapshot("snap-queued"))
+                      .await
+                      .expect("enqueue should succeed"));
+                  assert_eq!(client.spool.list_pending().unwrap().len(), 1);
+
+                  fs::remove_file(key_path).ok();
+                  fs::remove_dir_all(state_dir).ok();
+              }
+
+              #[tokio::test]
+              async fn identical_pending_content_is_not_queued_twice() {
+                  let server = MockServer::start().await;
+                  let key_path = write_temp_key("pending_dedup");
+                  let state_dir = temp_state_dir("pending_dedup");
+                  let client = test_client(server.uri(), key_path.clone(), &state_dir);
+
+                  assert!(client
+                      .enqueue_if_needed(sample_snapshot("snap-1"))
+                      .await
+                      .unwrap());
+                  assert!(!client
+                      .enqueue_if_needed(sample_snapshot("snap-2"))
+                      .await
+                      .unwrap());
+                  assert_eq!(client.spool.list_pending().unwrap().len(), 1);
+
+                  fs::remove_file(key_path).ok();
+                  fs::remove_dir_all(state_dir).ok();
+              }
+
+              #[tokio::test]
+              async fn accepted_digest_survives_a_process_restart() {
+                  let server = MockServer::start().await;
+                  mount_exchange(&server).await;
+                  Mock::given(method("POST"))
+                      .and(path(INVENTORY_PATH))
+                      .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                          "snapshot_id": "snap-1",
+                          "status": "accepted",
+                          "device_id": "dev-1",
+                          "asset_id": "asset-1",
+                          "reconciliation_status": "linked",
+                          "software_count": 1,
+                          "changes": {"installed": 1, "removed": 0, "updated": 0}
+                      })))
+                      .expect(1)
+                      .mount(&server)
+                      .await;
+
+                  let key_path = write_temp_key("persisted_digest");
+                  let state_dir = temp_state_dir("persisted_digest");
+                  {
+                      let client = test_client(server.uri(), key_path.clone(), &state_dir);
+                      client
+                          .submit_if_needed(sample_snapshot("snap-1"))
+                          .await
+                          .unwrap();
+                  }
+
+                  let restarted = test_client(server.uri(), key_path.clone(), &state_dir);
+                  assert!(!restarted
+                      .enqueue_if_needed(sample_snapshot("snap-2"))
+                      .await
+                      .unwrap());
+                  assert!(restarted.spool.list_pending().unwrap().is_empty());
+
+                  fs::remove_file(key_path).ok();
+                  fs::remove_dir_all(state_dir).ok();
+              }
+
+              #[tokio::test]
+              async fn return_to_last_accepted_state_follows_a_pending_change() {
+                  let server = MockServer::start().await;
+                  mount_exchange(&server).await;
+                  Mock::given(method("POST"))
+                      .and(path(INVENTORY_PATH))
+                      .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                          "snapshot_id": "snap-base",
+                          "status": "accepted",
+                          "device_id": "dev-1",
+                          "asset_id": "asset-1",
+                          "reconciliation_status": "linked",
+                          "software_count": 1,
+                          "changes": {"installed": 1, "removed": 0, "updated": 0}
+                      })))
+                      .expect(1)
+                      .mount(&server)
+                      .await;
+
+                  let key_path = write_temp_key("return_transition");
+                  let state_dir = temp_state_dir("return_transition");
+                  let client = test_client(server.uri(), key_path.clone(), &state_dir);
+                  client
+                      .submit_if_needed(sample_snapshot("snap-base"))
+                      .await
+                      .unwrap();
+
+                  let mut changed = sample_snapshot("snap-changed");
+                  changed.software[0].version = Some("6.0".to_string());
+                  assert!(client.enqueue_if_needed(changed).await.unwrap());
+                  assert!(client
+                      .enqueue_if_needed(sample_snapshot("snap-returned"))
+                      .await
+                      .unwrap());
+                  assert_eq!(client.spool.list_pending().unwrap().len(), 2);
+
+                  fs::remove_file(key_path).ok();
+                  fs::remove_dir_all(state_dir).ok();
+              }
+
+              #[tokio::test]
+              async fn delivery_worker_drains_an_enqueued_snapshot() {
+                  let server = MockServer::start().await;
+                  mount_exchange(&server).await;
+                  Mock::given(method("POST"))
+                      .and(path(INVENTORY_PATH))
+                      .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                          "snapshot_id": "snap-worker",
+                          "status": "accepted",
+                          "device_id": "dev-1",
+                          "asset_id": "asset-1",
+                          "reconciliation_status": "linked",
+                          "software_count": 1,
+                          "changes": {"installed": 1, "removed": 0, "updated": 0}
+                      })))
+                      .mount(&server)
+                      .await;
+
+                  let key_path = write_temp_key("worker");
+                  let state_dir = temp_state_dir("worker");
+                  let client = std::sync::Arc::new(test_client(
+                      server.uri(),
+                      key_path.clone(),
+                      &state_dir,
+                  ));
+                  client
+                      .enqueue_if_needed(sample_snapshot("snap-worker"))
+                      .await
+                      .unwrap();
+
+                  let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                  let worker_client = client.clone();
+                  let worker = tokio::spawn(async move {
+                      worker_client.run_loop(shutdown_rx).await;
+                  });
+
+                  tokio::time::timeout(Duration::from_secs(5), async {
+                      loop {
+                          if client.spool.pending_paths().unwrap().is_empty() {
+                              break;
+                          }
+                          tokio::time::sleep(Duration::from_millis(20)).await;
+                      }
+                  })
+                  .await
+                  .expect("delivery worker should drain promptly");
+
+                  let _ = shutdown_tx.send(true);
+                  worker.await.unwrap();
+                  assert!(client.spool.list_pending().unwrap().is_empty());
+
+                  fs::remove_file(key_path).ok();
+                  fs::remove_dir_all(state_dir).ok();
+              }
+
+          '''
+          text = replace_once(text, test_marker, extra_tests + test_marker, "delivery tests")
+          delivery.write_text(text, encoding="utf-8")
+
+          app = Path("src/app.rs")
+          text = app.read_text(encoding="utf-8")
+          start = text.index("    // Resume anything left over from a prior crash/outage")
+          end = text.index("    let (shutdown_tx", start)
+          text = text[:start] + text[end:]
+          text = replace_once(
+              text,
+              "    let inventory_loop = inventory_loop(\n        &delivery_client,\n",
+              "    let delivery_loop = delivery_client.run_loop(shutdown_rx.clone());\n    let inventory_loop = inventory_loop(\n        &delivery_client,\n",
+              "delivery loop wiring",
+          )
+          text = replace_once(
+              text,
+              "        () = inventory_loop => {}\n",
+              "        () = inventory_loop => {}\n        () = delivery_loop => {\n            tracing::warn!(\"delivery worker stopped unexpectedly\");\n        }\n",
+              "delivery select branch",
+          )
+          text = text.replace(
+              '"inventory collection/submission failed"',
+              '"inventory collection/queueing failed"',
+          )
+          text = replace_once(
+              text,
+              "    delivery_client.submit_if_needed(snapshot).await\n",
+              "    delivery_client.enqueue_if_needed(snapshot).await.map(|_| ())\n",
+              "daemon enqueue",
+          )
+          app.write_text(text, encoding="utf-8")
+          PY
+
+          cargo fmt --all
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/_agent_delivery_worker.yml
+          git rm .github/workflows/_agent_delivery_worker_retry.yml
+          git add src/app.rs src/delivery
+          git commit -m "perf: decouple inventory collection from delivery"
+          git push origin HEAD:perf/independent-delivery-worker
