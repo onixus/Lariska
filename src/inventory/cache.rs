@@ -510,6 +510,7 @@ impl FingerprintBuilder {
         Ok(file_type.is_dir())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn add_tree(&mut self, path: &Path, depth: usize) -> Result<(), String> {
         let is_dir = self.add_path(path)?;
         if !is_dir || depth == 0 {
