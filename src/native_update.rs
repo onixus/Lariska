@@ -456,15 +456,20 @@ fn install_package(manifest: &ReleaseManifest, artifact: &Path) -> Result<(), St
                 ],
             )
         }
-        PackageKind::Pkg => run_command(
-            "/usr/sbin/installer",
-            &[
-                "-pkg".as_ref(),
-                artifact.as_os_str(),
-                "-target".as_ref(),
-                "/".as_ref(),
-            ],
-        ),
+        PackageKind::Pkg => {
+            // Installer requires a .pkg suffix even for the verified flat
+            // package bytes. Both forward updates and rollback use this path.
+            let alias = PkgInstallerAlias::new(artifact)?;
+            run_command(
+                "/usr/sbin/installer",
+                &[
+                    "-pkg".as_ref(),
+                    alias.path.as_os_str(),
+                    "-target".as_ref(),
+                    "/".as_ref(),
+                ],
+            )
+        }
         PackageKind::Msi => run_command(
             "C:\\Windows\\System32\\msiexec.exe",
             &[
@@ -475,6 +480,46 @@ fn install_package(manifest: &ReleaseManifest, artifact: &Path) -> Result<(), St
                 "REINSTALLMODE=amus".as_ref(),
             ],
         ),
+    }
+}
+
+struct PkgInstallerAlias {
+    path: PathBuf,
+}
+impl PkgInstallerAlias {
+    fn new(artifact: &Path) -> Result<Self, String> {
+        // Only called for the verified artifact in root-private cache while
+        // holding the supervisor lock. No endpoint can replace these entries.
+        if !fs::symlink_metadata(artifact)
+            .map_err(|e| e.to_string())?
+            .is_file()
+        {
+            return Err("Installer artifact must be a regular private cached file".into());
+        }
+        let parent = artifact.parent().ok_or("Installer artifact has no cache")?;
+        let path = parent.join("installer-artifact.pkg");
+        if path == artifact {
+            return Err("Installer alias must differ from the cached artifact".into());
+        }
+        // A crashed installer may leave our fixed alias. Unlink that directory
+        // entry, including a stale symlink, without opening or following it.
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("stale Installer alias: {e}")),
+        }
+        fs::hard_link(artifact, &path).map_err(|e| format!("Installer package alias: {e}"))?;
+        let alias = Self { path };
+        sync_directory(parent)?;
+        Ok(alias)
+    }
+}
+impl Drop for PkgInstallerAlias {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        if let Some(parent) = self.path.parent() {
+            let _ = sync_directory(parent);
+        }
     }
 }
 
@@ -883,7 +928,18 @@ fn copy_request(
     dest: &Path,
     max_bytes: u64,
 ) -> Result<(), String> {
-    fs::create_dir(dest).map_err(|e| format!("private staging: {e}"))?;
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
+    builder
+        .create(dest)
+        .map_err(|e| format!("private staging: {e}"))?;
     let result = (|| {
         copy_bounded(manifest, &dest.join("manifest.json"), MAX_JOURNAL_BYTES)?;
         copy_bounded(artifact, &dest.join("artifact"), max_bytes)?;
@@ -1347,6 +1403,117 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installer_pkg_alias_preserves_cached_bytes_and_cleans_stale_files() {
+        let root =
+            std::env::temp_dir().join(format!("lariska-pkg-alias-{}", rand::random::<u64>()));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("manifest"), b"{}").unwrap();
+        fs::write(root.join("source"), b"verified signed package bytes").unwrap();
+        let cache = root.join("private");
+        copy_request(&root.join("manifest"), &root.join("source"), &cache, 128).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let artifact = cache.join("artifact");
+        let alias_path = cache.join("installer-artifact.pkg");
+        fs::write(&alias_path, b"stale package from interrupted install").unwrap();
+        {
+            let alias = PkgInstallerAlias::new(&artifact).unwrap();
+            assert_eq!(alias.path, alias_path);
+            assert_eq!(fs::read(&alias.path).unwrap(), fs::read(&artifact).unwrap());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    fs::metadata(&alias.path).unwrap().ino(),
+                    fs::metadata(&artifact).unwrap().ino()
+                );
+            }
+        }
+        assert!(!alias_path.exists());
+        assert_eq!(
+            fs::read(&artifact).unwrap(),
+            b"verified signed package bytes"
+        );
+        fs::create_dir(&alias_path).unwrap();
+        assert!(PkgInstallerAlias::new(&artifact).is_err());
+        assert!(alias_path.is_dir());
+        assert_eq!(
+            fs::read(&artifact).unwrap(),
+            b"verified signed package bytes"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_pkg_alias_unlinks_stale_symlink_and_cleans_after_command_failure() {
+        let root = std::env::temp_dir().join(format!("lariska-pkg-link-{}", rand::random::<u64>()));
+        fs::create_dir(&root).unwrap();
+        let artifact = root.join("artifact");
+        let outside = root.join("unrelated");
+        let alias_path = root.join("installer-artifact.pkg");
+        fs::write(&artifact, b"verified package").unwrap();
+        fs::write(&outside, b"untouched outside target").unwrap();
+        std::os::unix::fs::symlink(&outside, &alias_path).unwrap();
+        let result = (|| {
+            let alias = PkgInstallerAlias::new(&artifact)?;
+            assert!(!fs::symlink_metadata(&alias.path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            run_command("/usr/bin/false", &[alias.path.as_os_str()])
+        })();
+        assert!(result.is_err());
+        assert!(!alias_path.exists());
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched outside target");
+        assert_eq!(fs::read(&artifact).unwrap(), b"verified package");
+        fs::remove_file(&artifact).unwrap();
+        std::os::unix::fs::symlink(&outside, &artifact).unwrap();
+        assert!(PkgInstallerAlias::new(&artifact).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched outside target");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_installer_reads_alias_of_extensionless_signed_package_fixture() {
+        let Some(fixture) = std::env::var_os("LARISKA_NATIVE_TEST_PKG") else {
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("lariska-pkg-info-{}", rand::random::<u64>()));
+        fs::create_dir(&root).unwrap();
+        let _cleanup = CacheCleanup {
+            directory: root.clone(),
+            retained: false,
+        };
+        let artifact = root.join("artifact");
+        fs::copy(PathBuf::from(fixture), &artifact).unwrap();
+        let (status, _) = execute_bounded(
+            "/usr/sbin/installer",
+            &["-pkginfo".as_ref(), "-pkg".as_ref(), artifact.as_os_str()],
+        )
+        .unwrap();
+        assert!(
+            !status.success(),
+            "counterfactual extensionless package must reproduce the native failure"
+        );
+        let alias = PkgInstallerAlias::new(&artifact).unwrap();
+        let (status, bytes) = execute_bounded(
+            "/usr/sbin/installer",
+            &["-pkginfo".as_ref(), "-pkg".as_ref(), alias.path.as_os_str()],
+        )
+        .unwrap();
+        assert!(status.success(), "{}", String::from_utf8_lossy(&bytes));
+        assert!(String::from_utf8_lossy(&bytes).contains("installer-artifact"));
+    }
 
     #[test]
     fn installed_cli_version_accepts_current_output_and_rejects_non_versions() {

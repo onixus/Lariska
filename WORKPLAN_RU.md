@@ -108,7 +108,7 @@ Lariska должна быть production-ready endpoint-агентом Shapoclya
 
 - Linux package installs обновлять через deb/RPM path, а не записью в `/usr/bin` из непривилегированного service;
 - Windows использовать signed MSI/service updater;
-- macOS использовать signed/notarized package;
+- macOS использовать signed package; по выбору владельца текущий P0 использует самоподписанный installer-сертификат и явное локальное доверие, без Apple notarization;
 - после restart требовать health acknowledgement;
 - автоматически восстанавливать previous build при отсутствии healthy heartbeat;
 - сохранять bounded update history и причину rollback.
@@ -199,7 +199,7 @@ Lariska должна быть production-ready endpoint-агентом Shapoclya
 - реально собирать и устанавливать `.deb`/RPM в CI;
 - добавить package smoke tests в контейнерах/VM;
 - подготовить signed MSI;
-- подготовить signed/notarized macOS pkg;
+- подготовить публично доверенный signed/notarized macOS pkg; текущий P0 покрывает выбранный владельцем self-signed режим;
 - определить ownership конфигурации, identity и cache при upgrade/uninstall;
 - проверить upgrade N-1 → N и rollback N → N-1;
 - выпускать SBOM, provenance/attestation и checksums;
