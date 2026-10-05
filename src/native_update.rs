@@ -36,6 +36,15 @@ struct Pending {
 struct Journal {
     active: Option<CachedRelease>,
     pending: Option<Pending>,
+    #[serde(default)]
+    consumed: Vec<ConsumedRequest>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ConsumedRequest {
+    nonce: String,
+    version: String,
+    sequence: u64,
 }
 
 trait NativeOperations {
@@ -74,6 +83,17 @@ pub fn seed(config_path: &Path, manifest: &Path, artifact: &Path) -> Result<(), 
     let mut journal = read_journal(&root)?;
     if journal.pending.is_some() {
         return Err("cannot replace rollback cache during a pending update".into());
+    }
+    if let Some(active) = journal.active.clone() {
+        if valid_nonce(&active.directory) {
+            remember_consumed_request(
+                &config,
+                &root,
+                &mut journal,
+                &active.directory,
+                &active.manifest,
+            )?;
+        }
     }
     let directory = format!("seed-{}", rand::random::<u64>());
     let dest = root.join(&directory);
@@ -182,8 +202,15 @@ fn accept_request_with(
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or("invalid request directory")?;
-    if nonce.len() != 32 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !valid_nonce(nonce) {
         return Err("invalid request nonce".into());
+    }
+    if journal
+        .consumed
+        .iter()
+        .any(|request| request.nonce == nonce)
+    {
+        return Err("native request nonce was already consumed".into());
     }
     let previous = journal
         .active
@@ -217,6 +244,10 @@ fn accept_request_with(
         return Err("the requested version is already installed".into());
     }
     operations.verify_signature(config, &manifest, &dest.join("artifact"))?;
+    // Reserve the transaction identity durably before the ledger or installer.
+    // A stale endpoint-owned ready directory must never re-install a completed
+    // or interrupted request when this supervisor loses its in-memory set.
+    remember_consumed_request(config, root, journal, nonce, &manifest)?;
     update::commit_pending(config, &manifest, nonce, root)?;
     journal.pending = Some(Pending {
         release: CachedRelease {
@@ -267,6 +298,14 @@ fn recover_or_ack_with(
         // commit_pending precedes the installation journal. If it alone was
         // persisted, no package-manager execution has begun.
         if let Some(interrupted) = ledger.pending {
+            remember_consumed_nonce(
+                config,
+                root,
+                journal,
+                &interrupted.nonce,
+                &interrupted.version,
+                interrupted.sequence,
+            )?;
             update::finish_update(
                 config,
                 root,
@@ -282,6 +321,16 @@ fn recover_or_ack_with(
             if last.version == pending.release.manifest.version
                 && last.sequence == pending.release.manifest.sequence
             {
+                if last.nonce != pending.nonce {
+                    return Err("protected completed transaction nonce is missing or disagrees with the native journal; administrator repair is required".into());
+                }
+                remember_consumed_request(
+                    config,
+                    root,
+                    journal,
+                    &pending.nonce,
+                    &pending.release.manifest,
+                )?;
                 if last.outcome == "healthy" {
                     journal.active = Some(pending.release);
                 }
@@ -299,9 +348,17 @@ fn recover_or_ack_with(
         .ok_or("missing protected pending update")?;
     if authoritative.nonce != pending.nonce
         || authoritative.version != pending.release.manifest.version
+        || authoritative.sequence != pending.release.manifest.sequence
     {
         return Err("protected transaction identities disagree".into());
     }
+    remember_consumed_request(
+        config,
+        root,
+        journal,
+        &pending.nonce,
+        &pending.release.manifest,
+    )?;
     if update::health_status_for_pending(config, authoritative).unwrap_or(false) {
         update::finish_update(config, root, &pending.nonce, true, "healthy_heartbeat")?;
         journal.active = Some(pending.release);
@@ -894,10 +951,6 @@ fn private_root(config: &Config) -> Result<PathBuf, String> {
     }
     #[cfg(windows)]
     {
-        windows_trusted_path(
-            root.parent().ok_or("native updater state has no parent")?,
-            false,
-        )?;
         // Bootstrap belongs to the signed installer. It sets a protected ACL;
         // creating this directory with an inherited user-writable ACL is unsafe.
         if !root.is_dir() {
@@ -985,13 +1038,14 @@ fn validate_windows_trust(report: &WindowsTrustReport, strict_leaf: bool) -> Res
     if report.objects.is_empty() || report.objects.len() > 128 || report.trusted_sids.len() > 256 {
         return Err("invalid bounded Windows ownership report".into());
     }
-    // Leaf: every content/metadata/replacement permission. Ancestors: replacing
-    // the existing protected child, changing ACL/owner or turning the directory
-    // into a reparse point. Creating unrelated ProgramData children is allowed.
+    // Leaf: every content/metadata/replacement permission. Ancestors: deleting
+    // an existing protected child, replacing the directory or changing ACL/owner.
+    // ProgramData permits add-child and metadata writes. They cannot modify the
+    // protected child's ACL, and that child keeps the ancestor nonempty: Windows
+    // rejects FSCTL_SET_REPARSE_POINT on a nonempty directory ([MS-FSA] 2.1.5.10.37).
     const LEAF_WRITE: u32 =
         0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000;
-    const PARENT_REPLACE: u32 =
-        0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000;
+    const PARENT_REPLACE: u32 = 0x40 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000;
     for (index, object) in report.objects.iter().enumerate() {
         let location = format!("{:?}", object.path.chars().take(512).collect::<String>());
         if object.reparse || !report.trusted_sids.contains(&object.owner) {
@@ -1140,6 +1194,20 @@ fn read_journal(root: &Path) -> Result<Journal, String> {
     }
     let journal: Journal =
         serde_json::from_slice(&bytes).map_err(|e| format!("native journal corrupted: {e}"))?;
+    if journal.consumed.len() > MAX_REQUESTS {
+        return Err("native consumed request history exceeds its hard bound".into());
+    }
+    let mut nonces = BTreeSet::new();
+    for request in &journal.consumed {
+        if !valid_nonce(&request.nonce)
+            || !nonces.insert(&request.nonce)
+            || request.version.len() > 128
+        {
+            return Err("invalid native consumed request identity".into());
+        }
+        semver::Version::parse(&request.version)
+            .map_err(|e| format!("consumed request version: {e}"))?;
+    }
     for cached in journal
         .active
         .iter()
@@ -1158,7 +1226,87 @@ fn read_journal(root: &Path) -> Result<Journal, String> {
 }
 
 fn write_journal(root: &Path, journal: &Journal) -> Result<(), String> {
+    if serde_json::to_vec(journal)
+        .map_err(|e| e.to_string())?
+        .len() as u64
+        > MAX_JOURNAL_BYTES
+    {
+        return Err("native journal exceeds size limit".into());
+    }
     update::atomic_json(&root.join("native-journal.json"), journal)
+}
+
+fn valid_nonce(nonce: &str) -> bool {
+    nonce.len() == 32
+        && nonce
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn remember_consumed_request(
+    config: &Config,
+    root: &Path,
+    journal: &mut Journal,
+    nonce: &str,
+    manifest: &ReleaseManifest,
+) -> Result<(), String> {
+    remember_consumed_nonce(
+        config,
+        root,
+        journal,
+        nonce,
+        &manifest.version,
+        manifest.sequence,
+    )
+}
+
+fn remember_consumed_nonce(
+    config: &Config,
+    root: &Path,
+    journal: &mut Journal,
+    nonce: &str,
+    version: &str,
+    sequence: u64,
+) -> Result<(), String> {
+    if !valid_nonce(nonce) || version.len() > 128 {
+        return Err("invalid native consumed request identity".into());
+    }
+    semver::Version::parse(version).map_err(|e| format!("consumed request version: {e}"))?;
+    if let Some(previous) = journal
+        .consumed
+        .iter()
+        .find(|request| request.nonce == nonce)
+    {
+        return if previous.version == version && previous.sequence == sequence {
+            Ok(())
+        } else {
+            Err("consumed native request nonce changed its release identity".into())
+        };
+    }
+    // Prune only transactions that the authoritative anti-rollback floor must
+    // reject. Emergency policy can admit those old releases, so retain every
+    // receipt while an override is configured. Never evict replayable nonces.
+    if config.updates.emergency_version.is_none() {
+        let ledger = update::read_ledger(root)?;
+        let floor = semver::Version::parse(&ledger.floor_version).map_err(|e| e.to_string())?;
+        let mut retained = Vec::new();
+        for request in &journal.consumed {
+            let candidate = semver::Version::parse(&request.version).map_err(|e| e.to_string())?;
+            if candidate >= floor && request.sequence >= ledger.floor_sequence {
+                retained.push(request.clone());
+            }
+        }
+        journal.consumed = retained;
+    }
+    if journal.consumed.len() >= MAX_REQUESTS {
+        return Err("native consumed request history is full; administrator repair is required before accepting another update".into());
+    }
+    journal.consumed.push(ConsumedRequest {
+        nonce: nonce.into(),
+        version: version.into(),
+        sequence,
+    });
+    write_journal(root, journal)
 }
 
 fn prune_cache(root: &Path, journal: &Journal) -> Result<(), String> {
@@ -1287,6 +1435,7 @@ mod tests {
                 directory: "seed-test".into(),
             }),
             pending: None,
+            consumed: Vec::new(),
         };
         write_journal(&root, &journal).unwrap();
         fs::write(root.join("installed-agent"), b"old executable").unwrap();
@@ -1419,6 +1568,162 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn rolled_back_request_cannot_replay_after_supervisor_restart() {
+        let (root, config, mut journal) = fixture();
+        let request = request(&root, &config);
+        let ops = operations(&root, false);
+        accept_request_with(&config, &root, &request, &mut journal, &ops).unwrap();
+        let mut ledger = update::read_ledger(&root).unwrap();
+        ledger.pending.as_mut().unwrap().deadline = now().saturating_sub(1);
+        update::atomic_json(&root.join("update-state.json"), &ledger).unwrap();
+        let mut restarted = read_journal(&root).unwrap();
+        recover_or_ack_with(&config, &root, &mut restarted, &ops).unwrap();
+        // The failed endpoint cannot reap its accepted ready request. A second
+        // helper restart must not install those same signed bytes a second time.
+        assert!(request.is_dir());
+        let mut restarted = read_journal(&root).unwrap();
+        let error =
+            accept_request_with(&config, &root, &request, &mut restarted, &ops).unwrap_err();
+        assert!(error.contains("already consumed"), "{error}");
+        assert_eq!(ops.installs.get(), 2);
+        assert_eq!(fs::read(&ops.installed).unwrap(), b"old executable");
+        assert!(update::read_ledger(&root).unwrap().pending.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn invalid_uppercase_nonce_cannot_reserve_a_transaction() {
+        let (root, config, mut journal) = fixture();
+        let request = request(&root, &config);
+        let request = request.with_file_name(
+            request
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_uppercase(),
+        );
+        let ops = operations(&root, false);
+        let error = accept_request_with(&config, &root, &request, &mut journal, &ops).unwrap_err();
+        assert!(error.contains("invalid request nonce"));
+        assert!(read_journal(&root).unwrap().consumed.is_empty());
+        assert_eq!(ops.installs.get(), 0);
+        assert!(update::read_ledger(&root).unwrap().pending.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn authoritative_pending_sequence_must_match_the_native_journal() {
+        let (root, config, mut journal) = fixture();
+        let request = request(&root, &config);
+        let ops = operations(&root, false);
+        accept_request_with(&config, &root, &request, &mut journal, &ops).unwrap();
+        let mut ledger = update::read_ledger(&root).unwrap();
+        ledger.pending.as_mut().unwrap().sequence += 1;
+        update::atomic_json(&root.join("update-state.json"), &ledger).unwrap();
+        let mut restarted = read_journal(&root).unwrap();
+        let error = recover_or_ack_with(&config, &root, &mut restarted, &ops).unwrap_err();
+        assert!(error.contains("transaction identities disagree"));
+        assert!(restarted.pending.is_some());
+        assert_eq!(ops.installs.get(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn durable_consumed_history_prunes_only_strictly_blocked_release_identities() {
+        let (root, config, mut journal) = fixture();
+        journal.consumed = vec![
+            ConsumedRequest {
+                nonce: "00".repeat(16),
+                version: "0.3.0".into(),
+                sequence: 5,
+            },
+            ConsumedRequest {
+                nonce: "11".repeat(16),
+                version: "1.2.3".into(),
+                sequence: 4,
+            },
+            ConsumedRequest {
+                nonce: "22".repeat(16),
+                version: env!("CARGO_PKG_VERSION").into(),
+                sequence: 5,
+            },
+            ConsumedRequest {
+                nonce: "33".repeat(16),
+                version: "1.2.3".into(),
+                sequence: 6,
+            },
+        ];
+        let mut ledger = update::read_ledger(&root).unwrap();
+        ledger.floor_sequence = 5;
+        update::atomic_json(&root.join("update-state.json"), &ledger).unwrap();
+        remember_consumed_nonce(&config, &root, &mut journal, &"44".repeat(16), "2.0.0", 7)
+            .unwrap();
+        assert_eq!(journal.consumed.len(), 3);
+        assert_eq!(journal.consumed[0].nonce, "22".repeat(16));
+        assert_eq!(journal.consumed[1].nonce, "33".repeat(16));
+        assert_eq!(read_journal(&root).unwrap().consumed.len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn replayable_nonce_capacity_and_emergency_policy_fail_closed_without_eviction() {
+        let (root, mut config, mut journal) = fixture();
+        journal.consumed = (0..MAX_REQUESTS)
+            .map(|index| ConsumedRequest {
+                nonce: format!("{index:032x}"),
+                version: "1.2.3".into(),
+                sequence: 2,
+            })
+            .collect();
+        write_journal(&root, &journal).unwrap();
+        let candidate = "ff".repeat(16);
+        let error = remember_consumed_nonce(&config, &root, &mut journal, &candidate, "2.0.0", 3)
+            .unwrap_err();
+        assert!(error.contains("history is full"));
+        assert_eq!(read_journal(&root).unwrap().consumed.len(), MAX_REQUESTS);
+        let mut ledger = update::read_ledger(&root).unwrap();
+        ledger.floor_sequence = 3;
+        update::atomic_json(&root.join("update-state.json"), &ledger).unwrap();
+        config.updates.emergency_version = Some("1.2.3".into());
+        assert!(
+            remember_consumed_nonce(&config, &root, &mut journal, &candidate, "2.0.0", 3).is_err()
+        );
+        assert_eq!(journal.consumed.len(), MAX_REQUESTS);
+        config.updates.emergency_version = None;
+        remember_consumed_nonce(&config, &root, &mut journal, &candidate, "2.0.0", 3).unwrap();
+        assert_eq!(journal.consumed.len(), 1);
+        assert_eq!(journal.consumed[0].nonce, candidate);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn legacy_journal_reads_but_completed_history_requires_exact_nonce() {
+        let (root, config, mut journal) = fixture();
+        let mut legacy = serde_json::to_value(&journal).unwrap();
+        legacy.as_object_mut().unwrap().remove("consumed");
+        update::atomic_json(&root.join("native-journal.json"), &legacy).unwrap();
+        assert!(read_journal(&root).unwrap().consumed.is_empty());
+        let request = request(&root, &config);
+        let ops = operations(&root, false);
+        accept_request_with(&config, &root, &request, &mut journal, &ops).unwrap();
+        let nonce = journal.pending.as_ref().unwrap().nonce.clone();
+        update::finish_update(&config, &root, &nonce, true, "healthy_heartbeat").unwrap();
+        let mut legacy = serde_json::to_value(update::read_ledger(&root).unwrap()).unwrap();
+        legacy["history"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("nonce");
+        update::atomic_json(&root.join("update-state.json"), &legacy).unwrap();
+        let mut restarted = read_journal(&root).unwrap();
+        assert!(update::read_ledger(&root).unwrap().history[0]
+            .nonce
+            .is_empty());
+        let error = recover_or_ack_with(&config, &root, &mut restarted, &ops).unwrap_err();
+        assert!(error.contains("transaction nonce"));
+        let mut ledger = update::read_ledger(&root).unwrap();
+        ledger.history[0].nonce = "ff".repeat(16);
+        update::atomic_json(&root.join("update-state.json"), &ledger).unwrap();
+        assert!(recover_or_ack_with(&config, &root, &mut restarted, &ops).is_err());
+        assert_eq!(ops.installs.get(), 1);
+        assert!(restarted.pending.is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn crash_between_ledger_and_journal_does_not_run_an_installer() {
         let (root, config, mut journal) = fixture();
         let manifest = signed(&config, "1.2.3", 2, b"new executable").manifest;
@@ -1438,6 +1743,12 @@ mod tests {
                 .reason,
             "interrupted_before_install"
         );
+        let request = request(&root, &config);
+        let mut restarted = read_journal(&root).unwrap();
+        let error =
+            accept_request_with(&config, &root, &request, &mut restarted, &ops).unwrap_err();
+        assert!(error.contains("already consumed"));
+        assert_eq!(ops.installs.get(), 0);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1455,6 +1766,12 @@ mod tests {
         assert_eq!(update::read_ledger(&root).unwrap().floor_version, "1.2.3");
         assert_eq!(ops.installs.get(), 1);
         assert_eq!(ops.restarts.get(), 1);
+        assert_eq!(update::read_ledger(&root).unwrap().history[0].nonce, nonce);
+        let mut restarted = read_journal(&root).unwrap();
+        let error =
+            accept_request_with(&config, &root, &request, &mut restarted, &ops).unwrap_err();
+        assert!(error.contains("already consumed"));
+        assert_eq!(ops.installs.get(), 1);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1477,6 +1794,21 @@ mod tests {
         let source = r#"{"trusted_sids":["S-1-5-18","S-1-5-32-544"],"objects":[{"path":"C:\\ProgramData\\LariskaUpdater","owner":"S-1-5-18","reparse":false,"aces":[{"sid":"S-1-1-0","rights":1179785,"allow":true,"inherit_only":false}]},{"path":"C:\\ProgramData","owner":"S-1-5-32-544","reparse":false,"aces":[{"sid":"S-1-5-11","rights":4,"allow":true,"inherit_only":false}]}]}"#;
         let mut report: WindowsTrustReport = serde_json::from_str(source).unwrap();
         validate_windows_trust(&report, true).unwrap();
+        // The native MSI runner's real ProgramData Users ACE: add-file,
+        // add-subdirectory, write-EA and write-attributes on an ancestor.
+        report.objects[1].aces[0].sid = "S-1-5-32-545".into();
+        report.objects[1].aces[0].rights = 0x116;
+        validate_windows_trust(&report, true).unwrap();
+        for destructive in [0x40, 0x10000, 0x40000, 0x80000, 0x10000000, 0x40000000] {
+            report.objects[1].aces[0].rights = 0x116 | destructive;
+            assert!(validate_windows_trust(&report, true).is_err());
+        }
+        report.objects[1].aces[0].rights = 0x116;
+        for leaf_metadata in [0x10, 0x100, 0x116] {
+            report.objects[0].aces[0].rights = leaf_metadata;
+            assert!(validate_windows_trust(&report, true).is_err());
+        }
+        report.objects[0].aces[0].rights = 1179785;
         // Windows stores generic read/execute as a negative signed enum. The
         // PowerShell bridge preserves those bits in unsigned JSON; they never
         // grant write access, whereas GENERIC_WRITE must remain forbidden.
@@ -1493,7 +1825,7 @@ mod tests {
         report.objects[0].aces[0].rights = 1179785;
         report.objects[1].aces[0].rights = 0x40;
         let detail = validate_windows_trust(&report, true).unwrap_err();
-        assert!(detail.contains("S-1-5-11"));
+        assert!(detail.contains("S-1-5-32-545"));
         assert!(detail.contains("rights=0x00000040"));
         assert!(detail.contains("strict_leaf=false"));
         report.objects[1].aces[0].rights = 4;
@@ -1551,6 +1883,56 @@ mod tests {
         .unwrap();
         assert!(windows_trusted_path(&path, true).is_err());
         fs::remove_dir_all(path).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_metadata_writable_ancestor_preserves_protected_child() {
+        if std::env::var_os("CI").is_none() {
+            eprintln!("Windows ACL integration requires the elevated CI runner");
+            return;
+        }
+        let parent =
+            std::env::temp_dir().join(format!("lariska-parent-acl-{}", rand::random::<u64>()));
+        let child = parent.join("protected");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&child).unwrap();
+        let icacls = "C:\\Windows\\System32\\icacls.exe";
+        for path in [&parent, &child] {
+            run_command(
+                icacls,
+                &[
+                    path.as_os_str(),
+                    "/inheritance:r".as_ref(),
+                    "/grant:r".as_ref(),
+                    "*S-1-5-18:(OI)(CI)F".as_ref(),
+                    "*S-1-5-32-544:(OI)(CI)F".as_ref(),
+                ],
+            )
+            .unwrap();
+        }
+        run_command(
+            icacls,
+            &[
+                parent.as_os_str(),
+                "/grant:r".as_ref(),
+                "*S-1-5-32-545:(WD,AD,WEA,WA)".as_ref(),
+            ],
+        )
+        .unwrap();
+        windows_trusted_path(&child, true)
+            .expect("ancestor metadata rights must not reject an existing protected child");
+        assert!(windows_trusted_path(&parent, true).is_err());
+        run_command(
+            icacls,
+            &[
+                parent.as_os_str(),
+                "/grant:r".as_ref(),
+                "*S-1-5-32-545:(DC)".as_ref(),
+            ],
+        )
+        .unwrap();
+        assert!(windows_trusted_path(&child, true).is_err());
+        fs::remove_dir_all(parent).unwrap();
     }
     #[cfg(unix)]
     #[test]

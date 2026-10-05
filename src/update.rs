@@ -518,6 +518,8 @@ pub struct PendingUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryEntry {
+    #[serde(default)]
+    pub nonce: String,
     pub version: String,
     pub sequence: u64,
     pub at: u64,
@@ -553,6 +555,11 @@ pub fn read_ledger(ledger_dir: &Path) -> Result<UpdateLedger, String> {
             parse_version(&ledger.floor_version)?;
             if ledger.history.len() > 100 {
                 return Err("update history exceeds its hard bound".into());
+            }
+            for record in &ledger.history {
+                if !record.nonce.is_empty() {
+                    validate_nonce(&record.nonce)?;
+                }
             }
             Ok(ledger)
         }
@@ -699,6 +706,7 @@ pub fn finish_update(
         return Err("update transaction nonce mismatch".into());
     }
     let record = HistoryEntry {
+        nonce: pending.nonce.clone(),
         version: pending.version.clone(),
         sequence: pending.sequence,
         at: unix_now()?,

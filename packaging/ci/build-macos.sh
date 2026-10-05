@@ -31,4 +31,36 @@ install -m644 packaging/trust/public-trust.json packaging/trust/macos.cer "$stag
 chmod 755 packaging/macos/scripts/postinstall
 pkgbuild --root "$staging/root" --scripts packaging/macos/scripts --identifier com.shapoclyack.lariska --version "$version" --install-location / "$staging/unsigned.pkg"
 productsign --timestamp=none --keychain "$LARISKA_SIGNING_KEYCHAIN" --sign 'Lariska Local Installer' "$staging/unsigned.pkg" "dist/$version/lariska-$version-$(uname -m)-apple-darwin.pkg"
-pkgutil --check-signature "dist/$version/lariska-$version-$(uname -m)-apple-darwin.pkg"
+pkgutil --check-signature "dist/$version/lariska-$version-$(uname -m)-apple-darwin.pkg" | tee "$staging/signature.txt"
+# The imported P12 can contain a same-name identity with a different key. Bind
+# the resulting package's leaf signer, not merely its CN, to the client pin.
+python - "$staging/signature.txt" <<'PY_SIGNER'
+import json, re, sys
+from pathlib import Path
+in_leaf = False
+digest = ''
+reading_digest = False
+for line in Path(sys.argv[1]).read_text().splitlines():
+    text = line.strip()
+    entry = re.fullmatch(r'([0-9]+)\.\s*(.*)', text)
+    if entry:
+        if in_leaf:
+            break
+        in_leaf = entry[1] == '1'
+        continue
+    if not in_leaf:
+        continue
+    fingerprint = re.fullmatch(r'SHA-?256 Fingerprint:\s*(.*)', text, re.IGNORECASE)
+    if fingerprint:
+        reading_digest = True
+        digest += ''.join(c for c in fingerprint[1] if c in '0123456789abcdefABCDEF')
+    elif reading_digest:
+        if re.fullmatch(r'[0-9a-fA-F:\s]*', text):
+            digest += ''.join(c for c in text if c in '0123456789abcdefABCDEF')
+        else:
+            reading_digest = False
+trust = json.loads(Path('packaging/trust/public-trust.json').read_text())
+if len(digest) != 64 or digest.lower() != trust['certificates']['macos']['sha256'].lower():
+    raise SystemExit('Signed macOS package leaf certificate differs from the provisioned public SHA-256 pin')
+print('Signed macOS package leaf certificate matches the provisioned public pin')
+PY_SIGNER
