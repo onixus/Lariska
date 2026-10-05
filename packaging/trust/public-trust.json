@@ -8,8 +8,8 @@
       "subject": "Lariska Local Code Signing"
     },
     "macos": {
-      "sha256": "0616adff5e02a67e57e07bf2e85b456d51c5d5bd9e061dd428818928c4bd06d7",
-      "thumbprint": "76d655ba03f120e28de51b185696914db84312cf",
+      "sha256": "bf4364446f41052ca0a822e7fd6e364d587c0be622bbeb79ca2c738284821360",
+      "thumbprint": "6e35ec7ac9bdcc717a74e2c4b609a553ad43e8d6",
       "subject": "Lariska Local Installer"
     }
   }
