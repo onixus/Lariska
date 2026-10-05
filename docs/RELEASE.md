@@ -33,12 +33,13 @@ binaries.
 
 ## Code signing
 
-Not implemented. Release artifacts are unsigned. Windows SmartScreen and
-macOS Gatekeeper will both warn on first run. Signing requires
-organizational certificate/notarization credentials that this project does
-not own — resolve ownership before distributing to any fleet where
-unsigned-binary warnings are unacceptable (Plan.md §19 "code-signing
-ownership and release-key custody").
+Native deb/RPM/MSI/pkg delivery uses Ed25519-signed manifests. MSI and pkg
+builds also require platform signing certificates in GitHub Secrets. The
+configured certificates are self-signed: administrators must provision
+their trust explicitly, and macOS packages are not Apple notarized.
+Archive binaries remain unsigned and can trigger SmartScreen or Gatekeeper.
+Private keys remain local until their export is authorized; validate the
+current commit's native lifecycle before distributing signed packages.
 
 ## Upgrade procedure
 

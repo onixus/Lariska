@@ -8,7 +8,7 @@ use crate::update::{self, PackageKind, ReleaseManifest};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -702,7 +702,7 @@ fn execute_bounded_env(
             let _ = fs::remove_file(&self.0);
         }
     }
-    let _cleanup = Cleanup(path.clone());
+    let stderr_path = path.with_extension("stderr");
     let mut options = OpenOptions::new();
     options.create_new(true).write(true).read(true);
     #[cfg(unix)]
@@ -711,6 +711,9 @@ fn execute_bounded_env(
         options.mode(0o600);
     }
     let file = options.open(&path).map_err(|e| e.to_string())?;
+    let _cleanup = Cleanup(path.clone());
+    let stderr_file = options.open(&stderr_path).map_err(|e| e.to_string())?;
+    let _stderr_cleanup = Cleanup(stderr_path.clone());
     let mut command = Command::new(program);
     for (name, value) in environment {
         command.env(name, value);
@@ -719,7 +722,8 @@ fn execute_bounded_env(
         .args(args)
         .stdin(Stdio::null())
         .stdout(file.try_clone().map_err(|e| e.to_string())?)
-        .stderr(Stdio::null());
+        // Keep diagnostics bounded, separate from successful metadata stdout.
+        .stderr(stderr_file.try_clone().map_err(|e| e.to_string())?);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -728,7 +732,12 @@ fn execute_bounded_env(
     let mut child = command.spawn().map_err(|e| format!("{program}: {e}"))?;
     let started = std::time::Instant::now();
     let status = loop {
-        if file.metadata().map_err(|e| e.to_string())?.len() > MAX_JOURNAL_BYTES
+        if file
+            .metadata()
+            .map_err(|e| e.to_string())?
+            .len()
+            .saturating_add(stderr_file.metadata().map_err(|e| e.to_string())?.len())
+            > MAX_JOURNAL_BYTES
             || started.elapsed() > Duration::from_secs(300)
         {
             #[cfg(unix)]
@@ -745,12 +754,34 @@ fn execute_bounded_env(
         std::thread::sleep(Duration::from_millis(50));
     };
     let mut bytes = Vec::new();
-    File::open(&path)
-        .map_err(|e| e.to_string())?
+    // Read the created objects through held descriptors, never resolve mutable
+    // temporary paths again after executing a privileged command.
+    let mut stdout_reader = file.try_clone().map_err(|e| e.to_string())?;
+    stdout_reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| e.to_string())?;
+    stdout_reader
         .take(MAX_JOURNAL_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
+    if !status.success() {
+        let mut stderr_reader = stderr_file.try_clone().map_err(|e| e.to_string())?;
+        stderr_reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| e.to_string())?;
+        stderr_reader
+            .take(MAX_JOURNAL_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+    }
+    if bytes.len() as u64 > MAX_JOURNAL_BYTES
+        || file
+            .metadata()
+            .map_err(|e| e.to_string())?
+            .len()
+            .saturating_add(stderr_file.metadata().map_err(|e| e.to_string())?.len())
+            > MAX_JOURNAL_BYTES
+    {
         return Err("native command output exceeded limit".into());
     }
     Ok((status, bytes))
@@ -978,7 +1009,7 @@ $trusted+=@(Get-LocalGroupMember -SID 'S-1-5-32-544'|ForEach-Object {$_.SID.Valu
 $objects=@();$item=Microsoft.PowerShell.Management\Get-Item -LiteralPath $env:LARISKA_UPDATE_TRUST_PATH -Force;
 while($null -ne $item){
 $acl=Microsoft.PowerShell.Security\Get-Acl -LiteralPath $item.FullName;
-$aces=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])|ForEach-Object {@{sid=$_.IdentityReference.Value;rights=[uint32]$_.FileSystemRights;allow=($_.AccessControlType -eq 'Allow');inherit_only=(($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)-ne 0)}});
+$aces=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])|ForEach-Object {@{sid=$_.IdentityReference.Value;rights=[uint32]([int64]$_.FileSystemRights -band [int64]([uint32]::MaxValue));allow=($_.AccessControlType -eq 'Allow');inherit_only=(($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)-ne 0)}});
 $objects+=@{owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value;reparse=(($item.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0);aces=$aces};
 if($item.PSIsContainer){$parent=$item.Parent}else{$parent=$item.Directory};
 if($null -eq $parent){break};$item=Microsoft.PowerShell.Management\Get-Item -LiteralPath $parent.FullName -Force;
@@ -994,7 +1025,13 @@ if($null -eq $parent){break};$item=Microsoft.PowerShell.Management\Get-Item -Lit
         &[("LARISKA_UPDATE_TRUST_PATH", path.as_os_str())],
     )?;
     if !status.success() {
-        return Err("Windows updater ownership/ACL check failed".into());
+        let detail = String::from_utf8_lossy(&bytes)
+            .chars()
+            .take(2048)
+            .collect::<String>();
+        return Err(format!(
+            "Windows updater ownership/ACL check failed ({status}): {detail}"
+        ));
     }
     let report: WindowsTrustReport =
         serde_json::from_slice(&bytes).map_err(|e| format!("Windows ACL report: {e}"))?;
@@ -1382,6 +1419,13 @@ mod tests {
         let source = r#"{"trusted_sids":["S-1-5-18","S-1-5-32-544"],"objects":[{"owner":"S-1-5-18","reparse":false,"aces":[{"sid":"S-1-1-0","rights":1179785,"allow":true,"inherit_only":false}]},{"owner":"S-1-5-32-544","reparse":false,"aces":[{"sid":"S-1-5-11","rights":4,"allow":true,"inherit_only":false}]}]}"#;
         let mut report: WindowsTrustReport = serde_json::from_str(source).unwrap();
         validate_windows_trust(&report, true).unwrap();
+        // Windows stores generic read/execute as a negative signed enum. The
+        // PowerShell bridge preserves those bits in unsigned JSON; they never
+        // grant write access, whereas GENERIC_WRITE must remain forbidden.
+        report.objects[0].aces[0].rights = 0xA0000000;
+        validate_windows_trust(&report, true).unwrap();
+        report.objects[0].aces[0].rights = 0xC0000000;
+        assert!(validate_windows_trust(&report, true).is_err());
         report.objects[0].aces[0].rights = 2;
         assert!(validate_windows_trust(&report, true).is_err());
         report.objects[0].aces[0].rights = 1179785;
@@ -1437,5 +1481,32 @@ mod tests {
         .unwrap();
         assert!(windows_trusted_path(&path, true).is_err());
         fs::remove_dir_all(path).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_keeps_success_metadata_clean_and_preserves_failure_diagnostics() {
+        let (status, bytes) = execute_bounded(
+            "/bin/sh",
+            &[
+                "-c".as_ref(),
+                "printf metadata; printf warning >&2".as_ref(),
+            ],
+        )
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(bytes, b"metadata");
+        let (status, bytes) = execute_bounded(
+            "/bin/sh",
+            &["-c".as_ref(), "printf provider_failed >&2; exit 1".as_ref()],
+        )
+        .unwrap();
+        assert!(!status.success());
+        assert_eq!(bytes, b"provider_failed");
+        let script = format!("/usr/bin/head -c {} /dev/zero >&2", MAX_JOURNAL_BYTES + 1);
+        assert!(
+            execute_bounded("/bin/sh", &["-c".as_ref(), script.as_ref()])
+                .unwrap_err()
+                .contains("limit")
+        );
     }
 }

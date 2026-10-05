@@ -34,8 +34,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  signing-preflight:
+    name: Required native signing secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      LARISKA_RELEASE_ED25519_KEY: ${{ secrets.LARISKA_RELEASE_ED25519_KEY }}
+      LARISKA_WINDOWS_P12_B64: ${{ secrets.LARISKA_WINDOWS_P12_B64 }}
+      LARISKA_WINDOWS_P12_PASSWORD: ${{ secrets.LARISKA_WINDOWS_P12_PASSWORD }}
+      LARISKA_MACOS_P12_B64: ${{ secrets.LARISKA_MACOS_P12_B64 }}
+      LARISKA_MACOS_P12_PASSWORD: ${{ secrets.LARISKA_MACOS_P12_PASSWORD }}
+    steps:
+      - name: Fail before builds or signing trust changes when credentials are absent
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in LARISKA_RELEASE_ED25519_KEY LARISKA_WINDOWS_P12_B64 LARISKA_WINDOWS_P12_PASSWORD LARISKA_MACOS_P12_B64 LARISKA_MACOS_P12_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error title=Missing signing secret::Required signing secret $name is unavailable to this workflow. Provision it before rerunning native lifecycle validation."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then exit 1; fi
   lifecycle:
     name: Native ${{ matrix.kind }} on ${{ matrix.os }} install / upgrade / rollback
+    needs: signing-preflight
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     strategy:
