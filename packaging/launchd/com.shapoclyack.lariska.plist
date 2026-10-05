@@ -29,9 +29,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Library/Logs/Lariska/lariska.log</string>
+    <string>/Library/Application Support/Lariska/state/lariska.log</string>
     <key>StandardErrorPath</key>
-    <string>/Library/Logs/Lariska/lariska.log</string>
+    <string>/Library/Application Support/Lariska/state/lariska.log</string>
 
     <key>UserName</key><string>_lariska</string>
     <key>GroupName</key><string>_lariska</string>

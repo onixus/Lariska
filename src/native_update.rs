@@ -589,17 +589,24 @@ fn installed_agent_version() -> Result<String, String> {
                 .ok_or("installed endpoint path is not Unicode")?,
             &["--version".as_ref()],
         )?;
-        let version = output
-            .trim()
-            .strip_prefix("lariska ")
-            .ok_or("installed endpoint returned invalid version output")?;
-        semver::Version::parse(version).map_err(|e| format!("installed endpoint version: {e}"))?;
-        Ok(version.into())
+        parse_installed_cli_version(&output)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err("unsupported installed endpoint platform".into())
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn parse_installed_cli_version(output: &str) -> Result<String, String> {
+    let output = output.trim();
+    // The current CLI prints a bare version; older packages may include its name.
+    let version = output.strip_prefix("lariska ").unwrap_or(output);
+    if version.len() > 128 {
+        return Err("installed endpoint version exceeds its length limit".into());
+    }
+    semver::Version::parse(version).map_err(|e| format!("installed endpoint version: {e}"))?;
+    Ok(version.into())
 }
 
 fn restart_agent() -> Result<(), String> {
@@ -961,6 +968,7 @@ struct WindowsAce {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WindowsPathSecurity {
+    path: String,
     owner: String,
     reparse: bool,
     aces: Vec<WindowsAce>,
@@ -985,28 +993,34 @@ fn validate_windows_trust(report: &WindowsTrustReport, strict_leaf: bool) -> Res
     const PARENT_REPLACE: u32 =
         0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000;
     for (index, object) in report.objects.iter().enumerate() {
+        let location = format!("{:?}", object.path.chars().take(512).collect::<String>());
         if object.reparse || !report.trusted_sids.contains(&object.owner) {
-            return Err(
-                "Windows updater paths must have privileged owners and no reparse points".into(),
-            );
+            return Err(format!(
+                "Windows updater paths must have privileged owners and no reparse points: path={location}, owner={:?}, reparse={}",
+                object.owner.chars().take(96).collect::<String>(), object.reparse
+            ));
         }
         if object.aces.len() > 2048 {
-            return Err("Windows updater ACL exceeds bound".into());
+            return Err(format!(
+                "Windows updater ACL exceeds bound: path={location}"
+            ));
         }
         let forbidden = if index == 0 && strict_leaf {
             LEAF_WRITE
         } else {
             PARENT_REPLACE
         };
-        if object.aces.iter().any(|ace| {
+        if let Some(ace) = object.aces.iter().find(|ace| {
             ace.allow
                 && !ace.inherit_only
                 && !report.trusted_sids.contains(&ace.sid)
                 && ace.rights & forbidden != 0
         }) {
-            return Err(
-                "Windows updater path is writable or replaceable by an unprivileged account".into(),
-            );
+            return Err(format!(
+                "Windows updater path is writable or replaceable by an unprivileged account: path={location}, sid={:?}, rights={:#010x}, forbidden={:#010x}, strict_leaf={}",
+                ace.sid.chars().take(96).collect::<String>(), ace.rights, forbidden,
+                index == 0 && strict_leaf
+            ));
         }
     }
     Ok(())
@@ -1036,7 +1050,7 @@ $objects=@();$item=Microsoft.PowerShell.Management\Get-Item -LiteralPath $env:LA
 while($null -ne $item){
 $acl=Microsoft.PowerShell.Security\Get-Acl -LiteralPath $item.FullName;
 $aces=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])|ForEach-Object {@{sid=$_.IdentityReference.Value;rights=[uint32]([int64]$_.FileSystemRights -band [int64]([uint32]::MaxValue));allow=($_.AccessControlType -eq 'Allow');inherit_only=(($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)-ne 0)}});
-$objects+=@{owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value;reparse=(($item.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0);aces=$aces};
+$objects+=@{path=$item.FullName;owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value;reparse=(($item.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0);aces=$aces};
 if($item.PSIsContainer){$parent=$item.Parent}else{$parent=$item.Directory};
 if($null -eq $parent){break};$item=Microsoft.PowerShell.Management\Get-Item -LiteralPath $parent.FullName -Force;
 };@{trusted_sids=$trusted;objects=$objects}|Microsoft.PowerShell.Utility\ConvertTo-Json -Depth 8 -Compress"#;
@@ -1185,6 +1199,24 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_cli_version_accepts_current_output_and_rejects_non_versions() {
+        let current = env!("CARGO_PKG_VERSION");
+        assert_eq!(parse_installed_cli_version(current).unwrap(), current);
+        assert_eq!(
+            parse_installed_cli_version(&format!("{current}\r\n")).unwrap(),
+            current
+        );
+        assert_eq!(
+            parse_installed_cli_version(&format!("lariska {current}\n")).unwrap(),
+            current
+        );
+        for invalid in ["", "0.4", "other-agent 0.4.0", "0.4.0\nwarning"] {
+            assert!(parse_installed_cli_version(invalid).is_err(), "{invalid}");
+        }
+        assert!(parse_installed_cli_version(&format!("0.4.0+{}", "a".repeat(128))).is_err());
+    }
     #[test]
     fn queue_copy_rejects_oversized_and_cleans_private_staging() {
         let root = std::env::temp_dir().join(format!("lariska-native-{}", rand::random::<u64>()));
@@ -1442,7 +1474,7 @@ mod tests {
     }
     #[test]
     fn hostile_windows_acl_reparse_and_owner_reports_are_rejected() {
-        let source = r#"{"trusted_sids":["S-1-5-18","S-1-5-32-544"],"objects":[{"owner":"S-1-5-18","reparse":false,"aces":[{"sid":"S-1-1-0","rights":1179785,"allow":true,"inherit_only":false}]},{"owner":"S-1-5-32-544","reparse":false,"aces":[{"sid":"S-1-5-11","rights":4,"allow":true,"inherit_only":false}]}]}"#;
+        let source = r#"{"trusted_sids":["S-1-5-18","S-1-5-32-544"],"objects":[{"path":"C:\\ProgramData\\LariskaUpdater","owner":"S-1-5-18","reparse":false,"aces":[{"sid":"S-1-1-0","rights":1179785,"allow":true,"inherit_only":false}]},{"path":"C:\\ProgramData","owner":"S-1-5-32-544","reparse":false,"aces":[{"sid":"S-1-5-11","rights":4,"allow":true,"inherit_only":false}]}]}"#;
         let mut report: WindowsTrustReport = serde_json::from_str(source).unwrap();
         validate_windows_trust(&report, true).unwrap();
         // Windows stores generic read/execute as a negative signed enum. The
@@ -1453,16 +1485,28 @@ mod tests {
         report.objects[0].aces[0].rights = 0xC0000000;
         assert!(validate_windows_trust(&report, true).is_err());
         report.objects[0].aces[0].rights = 2;
-        assert!(validate_windows_trust(&report, true).is_err());
+        let detail = validate_windows_trust(&report, true).unwrap_err();
+        assert!(detail.contains("LariskaUpdater"));
+        assert!(detail.contains("S-1-1-0"));
+        assert!(detail.contains("rights=0x00000002"));
+        assert!(detail.contains("strict_leaf=true"));
         report.objects[0].aces[0].rights = 1179785;
         report.objects[1].aces[0].rights = 0x40;
-        assert!(validate_windows_trust(&report, true).is_err());
+        let detail = validate_windows_trust(&report, true).unwrap_err();
+        assert!(detail.contains("S-1-5-11"));
+        assert!(detail.contains("rights=0x00000040"));
+        assert!(detail.contains("strict_leaf=false"));
         report.objects[1].aces[0].rights = 4;
         report.objects[1].reparse = true;
         assert!(validate_windows_trust(&report, true).is_err());
         report.objects[1].reparse = false;
         report.objects[0].owner = "S-1-5-21-unprivileged".into();
         assert!(validate_windows_trust(&report, true).is_err());
+        report.objects[0].path = format!("{}\nforged log", "x".repeat(10_000));
+        report.objects[0].owner = "y".repeat(10_000);
+        let detail = validate_windows_trust(&report, true).unwrap_err();
+        assert!(detail.len() < 1024);
+        assert!(!detail.contains('\n'));
     }
     #[cfg(windows)]
     #[test]

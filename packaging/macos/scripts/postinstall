@@ -2,6 +2,17 @@
 set -eu
 root='/Library/Application Support/LariskaUpdater'
 config_root='/Library/Application Support/Lariska'
+state="$config_root/state"
+# Only an empty legacy root-owned directory can change ownership automatically.
+# Never traverse endpoint-controlled state to modify child inode ownership.
+legacy_state_needs_migration() {
+  [ "$1" -eq 0 ] || return 1
+  first_entry=$(/usr/bin/find "$2" -mindepth 1 -maxdepth 1 -print -quit) || {
+    echo 'Cannot inspect legacy Lariska state; offline administrator migration is required' >&2
+    exit 1
+  }
+  [ -n "$first_entry" ]
+}
 if [ -L "$root" ] || [ -L "$root/supervisor" ] || [ -L "$config_root" ] || [ -L "$config_root/state" ] || [ -L /Library/Logs/Lariska ]; then
   echo 'Lariska directories must not be symlinks' >&2
   exit 1
@@ -44,10 +55,21 @@ if [ "$uid" -lt 200 ] || [ "$uid" -ge 500 ]; then
   echo 'Existing _lariska account is not a dedicated service account' >&2; exit 1
 fi
 /usr/bin/install -d -o root -g _lariska -m0750 "$config_root"
-/usr/bin/install -d -o _lariska -g _lariska -m0700 "$config_root/state"
+if [ -e "$state" ]; then
+  if [ ! -d "$state" ]; then echo 'Lariska state must be a directory' >&2; exit 1; fi
+  state_owner=$(/usr/bin/stat -f '%u' "$state")
+  if legacy_state_needs_migration "$state_owner" "$state"; then
+    echo 'Root-owned Lariska state is not empty. Stop both launchd jobs and complete the offline state migration in docs/SIGNED_UPDATES.md before reinstalling. State ownership has not been changed.' >&2
+    exit 1
+  fi
+  if [ "$state_owner" -ne 0 ] && [ "$state_owner" -ne "$uid" ]; then
+    echo 'Lariska state belongs to an unexpected account; offline administrator migration is required' >&2
+    exit 1
+  fi
+fi
+/usr/bin/install -d -o _lariska -g _lariska -m0700 "$state"
 /usr/bin/install -d -o root -g wheel -m0750 /Library/Logs/Lariska
-# Preserve enrollment files and migrate previous root-run identity/spool.
-if [ -d "$config_root/state" ]; then /usr/sbin/chown -RP _lariska:_lariska "$config_root/state"; fi
+# Preserve enrollment and existing native state without recursive ownership changes.
 for file in "$config_root/lariska.toml" "$config_root/provisioning.key"; do
   if [ -L "$file" ]; then echo 'Lariska configuration must not be a symlink' >&2; exit 1; fi
   if [ -f "$file" ] && [ ! -L "$file" ]; then

@@ -45,14 +45,20 @@ else:
     stable = private / 'supervisor'
 clean_env = {key: value for key, value in os.environ.items() if not key.startswith('LARISKA_')}
 
-def run(*command, check=True):
-    result = subprocess.run(list(map(str, command)), check=False, env=clean_env, text=True, capture_output=True)
+def run(*command, check=True, environment=None):
+    result = subprocess.run(list(map(str, command)), check=False, env=clean_env if environment is None else environment, text=True, capture_output=True)
     if check and result.returncode:
         raise RuntimeError(f'Native command {command[0]} failed ({result.returncode}): {result.stdout[-8192:]} {result.stderr[-8192:]}')
     return result
 
 def ps(script):
-    return run('powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script)
+    # pwsh 7 launches this harness in CI; its module paths are incompatible with
+    # the Windows PowerShell 5.1 process used for service/task control.
+    modules = r'C:\Windows\System32\WindowsPowerShell\v1.0\Modules'
+    environment = dict(clean_env, PSModulePath=modules, WinPSModulePath=modules)
+    environment.pop('PSModuleAnalysisCachePath', None)
+    prelude = "$env:PSModulePath='" + modules + "';$env:WinPSModulePath=$env:PSModulePath;$ErrorActionPreference='Stop';"
+    return run(r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe', '-NoProfile', '-NonInteractive', '-Command', prelude + script, environment=environment)
 
 def install(artifact):
     if windows:
@@ -138,9 +144,9 @@ def ledger():
 def control(component, restart=False):
     if windows:
         if component == 'agent':
-            ps("Restart-Service Lariska" if restart else "Start-Service Lariska")
+            ps("Microsoft.PowerShell.Management\\Restart-Service Lariska" if restart else "Microsoft.PowerShell.Management\\Start-Service Lariska")
         else:
-            ps(("Stop-ScheduledTask -TaskName LariskaUpdater; Start-Sleep -Seconds 2; " if restart else '') + "Start-ScheduledTask -TaskName LariskaUpdater")
+            ps(("ScheduledTasks\\Stop-ScheduledTask -TaskName LariskaUpdater; Microsoft.PowerShell.Utility\\Start-Sleep -Seconds 2; " if restart else '') + "ScheduledTasks\\Start-ScheduledTask -TaskName LariskaUpdater")
     elif macos:
         label = 'com.shapoclyack.lariska' + ('-updater' if component == 'updater' else '')
         if restart:

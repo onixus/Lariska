@@ -30,7 +30,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-packages-${{ github.ref }}
+  # Every job uses a disposable host. A stalled old commit must not prevent
+  # verification of its repair; duplicate runs of the same commit stay serial.
+  group: native-packages-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -206,8 +208,21 @@ jobs:
         if: always() && runner.os == 'macOS'
         shell: bash
         run: |
-          sudo security remove-trusted-cert -d packaging/trust/macos.cer || true
-          security delete-keychain "$RUNNER_TEMP/lariska-native.keychain-db" || true
+          # Trust-settings authorization can wait for an unavailable GUI. Run
+          # cleanup with a bound as root so its children can be terminated.
+          sudo "$(command -v python)" - "$RUNNER_TEMP/lariska-native.keychain-db" <<'PY'
+          import subprocess, sys
+          for command in (
+              ['/usr/bin/security', 'remove-trusted-cert', '-d', 'packaging/trust/macos.cer'],
+              ['/usr/bin/security', 'delete-keychain', sys.argv[1]],
+          ):
+              try:
+                  result = subprocess.run(command, timeout=30, capture_output=True)
+                  if result.returncode:
+                      print('::warning::Temporary macOS signing cleanup command failed')
+              except subprocess.TimeoutExpired:
+                  print('::warning::Temporary macOS signing cleanup exceeded 30 seconds')
+          PY
           rm -f "$RUNNER_TEMP/lariska-macos.p12"
       - name: Remove temporary Windows signing material
         if: always() && runner.os == 'Windows'

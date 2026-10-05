@@ -14,6 +14,10 @@ The first native install creates a private stable watchdog copy. Endpoint packag
 | Windows | `C:\Program Files\Lariska\lariska.exe`, LocalService | `C:\ProgramData\LariskaUpdater\supervisor.exe`, SYSTEM scheduled task | Signed MSI |
 | macOS | `/usr/local/bin/lariska`, launchd `_lariska` | `/Library/Application Support/LariskaUpdater/supervisor`, independent root LaunchDaemon | Signed `.pkg` |
 
+The macOS endpoint writes its launchd output to `/Library/Application Support/Lariska/state/lariska.log`, owned by `_lariska`. The root updater writes to `/Library/Logs/Lariska/updater.log`.
+
+The macOS installer refuses a nonempty state directory owned by root before changing its ownership. For a legacy root-run installation, stop both launchd jobs, back up state and enrollment, and migrate offline into a new administrator-controlled directory. Copy regular state files into new inodes, preserve their contents and reject symlinks and files with multiple hard links; assign the new state to `_lariska` and verify the saved agent identity before starting either job. The installer preserves existing state owned by `_lariska` and never recursively changes its files' ownership.
+
 Configuration and trust policy must be administrator-owned and not writable by the endpoint. The endpoint owns only its state/cache/spool and update mailbox. The native installer provisions these boundaries. Enroll the endpoint using the normal protected configuration and provisioning-key file, then seed its initial rollback package before starting the updater:
 
 ```sh
