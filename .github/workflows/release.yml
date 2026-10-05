@@ -120,9 +120,16 @@ jobs:
           name: lariska-sbom
           path: "*.cdx.json"
 
+  native-packages:
+    name: Signed native packages
+    uses: ./.github/workflows/native-packages.yml
+    with:
+      release: true
+    secrets: inherit
+
   release:
     name: Publish release
-    needs: [build, sbom]
+    needs: [build, sbom, native-packages]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

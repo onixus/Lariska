@@ -155,6 +155,7 @@ async fn run_async(
     let delivery_loop = delivery_client.run_loop(shutdown_rx.clone());
     let inventory_loop = inventory_loop(
         &delivery_client,
+        &heartbeat_client,
         &identity.agent_id,
         &hostname,
         &config.state_dir,
@@ -213,8 +214,10 @@ async fn run_async(
 /// The first scan is staggered by at most five minutes to avoid a fleet-wide
 /// boot/update storm. Later scans use a deterministic per-agent jitter and are
 /// stretched on battery power, while remaining capped at one day.
+#[allow(clippy::too_many_arguments)]
 async fn inventory_loop(
     delivery_client: &DeliveryClient,
+    heartbeat_client: &HeartbeatClient,
     agent_id: &str,
     hostname: &str,
     state_dir: &Path,
@@ -232,7 +235,7 @@ async fn inventory_loop(
     loop {
         tokio::select! {
             _ = &mut timer => {
-                if let Err(error) = collect_and_submit(delivery_client, agent_id, hostname, state_dir, cache_max_age).await {
+                if let Err(error) = collect_and_submit(delivery_client, heartbeat_client.inventory_schema_version(), agent_id, hostname, state_dir, cache_max_age).await {
                     tracing::warn!(%error, "inventory collection/queueing failed");
                 }
 
@@ -311,6 +314,7 @@ fn stable_jitter_secs(agent_id: &str, max_secs: u64) -> u64 {
 
 async fn collect_and_submit(
     delivery_client: &DeliveryClient,
+    schema_version: u16,
     agent_id: &str,
     hostname: &str,
     state_dir: &Path,
@@ -320,10 +324,18 @@ async fn collect_and_submit(
     for warning in &collected.warnings {
         tracing::warn!(%warning, "inventory collector warning");
     }
-    ensure_authoritative_collection(&collected)?;
+    if schema_version == 1 {
+        ensure_authoritative_collection(&collected)?;
+    }
 
     let identifiers = identity::platform_identifiers();
     let snapshot = build_snapshot(agent_id, hostname, identifiers, collected)?;
+    let snapshot = if schema_version == 2 {
+        snapshot
+    } else {
+        snapshot.into_v1()
+    };
+    snapshot.validate().map_err(|error| error.to_string())?;
 
     delivery_client
         .enqueue_if_needed(snapshot)
@@ -367,7 +379,7 @@ fn build_snapshot(
 
     let os_release = inventory::environment::detect_os_release();
 
-    Ok(InventorySnapshot::new(
+    Ok(InventorySnapshot::new_v2(
         snapshot_id,
         agent_id.to_string(),
         collected_at,
@@ -384,8 +396,21 @@ fn build_snapshot(
         labels,
         identifiers,
         collected.entries,
-        collected.warnings,
+        safe_collector_warnings(&collected.sources),
+        collected.sources,
     ))
+}
+
+fn safe_collector_warnings(sources: &[crate::model::CollectionSource]) -> Vec<String> {
+    sources
+        .iter()
+        .filter_map(|source| {
+            source
+                .diagnostic_code
+                .as_deref()
+                .map(|code| format!("{}: {code}", source.source.as_str()))
+        })
+        .collect()
 }
 
 async fn register_with_retry(
@@ -467,7 +492,7 @@ fn diagnostic_snapshot(
 
     let os_release = inventory::environment::detect_os_release();
 
-    InventorySnapshot::new(
+    InventorySnapshot::new_v2(
         "diagnostic-snapshot".to_string(),
         "agent_00000000000000000000000000000000".to_string(),
         "1970-01-01T00:00:00Z".to_string(),
@@ -484,7 +509,8 @@ fn diagnostic_snapshot(
         labels,
         identifiers,
         collected.entries,
-        collected.warnings,
+        safe_collector_warnings(&collected.sources),
+        collected.sources,
     )
 }
 
@@ -504,6 +530,7 @@ mod tests {
                     architecture: None,
                     source: SoftwareSource::Other,
                     install_location: None,
+                    ..SoftwareEntry::default()
                 },
                 SoftwareEntry {
                     name: "".to_string(),
@@ -512,10 +539,12 @@ mod tests {
                     architecture: None,
                     source: SoftwareSource::Other,
                     install_location: None,
+                    ..SoftwareEntry::default()
                 },
             ],
             warnings: Vec::new(),
             complete: true,
+            sources: Vec::new(),
         };
 
         let snapshot = diagnostic_snapshot(collected, Vec::new());
@@ -530,6 +559,7 @@ mod tests {
             entries: Vec::new(),
             warnings: vec!["dpkg-query collector failed: timed out".to_string()],
             complete: false,
+            sources: Vec::new(),
         };
 
         let error = ensure_authoritative_collection(&collected)

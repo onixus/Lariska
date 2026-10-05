@@ -1,14 +1,23 @@
 use super::{non_empty, run_command, CollectorResult, CommandRunError, MAX_METADATA_FILE_BYTES};
-use crate::model::{compare_versions, SoftwareEntry, SoftwareSource};
+use crate::model::{InstallationScope, SoftwareEntry, SoftwareSource};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const APPLICATION_DIRS: [&str; 2] = ["/Applications", "~/Applications"];
 
 pub async fn collect(timeout: Duration) -> CollectorResult {
-    let mut result = collect_bundles().await;
+    let mut result = collect_bundles()
+        .await
+        .with_source(SoftwareSource::MacBundle);
     if let Some(brew) = collect_homebrew(timeout).await {
-        result.merge(brew);
+        result.merge(brew.with_source(SoftwareSource::Brew));
+    }
+    if !result
+        .sources
+        .iter()
+        .any(|state| state.source == SoftwareSource::Brew)
+    {
+        result.merge(CollectorResult::not_applicable(SoftwareSource::Brew));
     }
     result
 }
@@ -29,6 +38,7 @@ async fn collect_bundles() -> CollectorResult {
             entries: Vec::new(),
             warnings: vec![format!("macOS bundle collector panicked: {error}")],
             complete: false,
+            sources: Vec::new(),
         })
 }
 
@@ -67,6 +77,7 @@ fn collect_bundles_sync(dirs: &[PathBuf]) -> CollectorResult {
         entries,
         warnings,
         complete,
+        sources: Vec::new(),
     }
 }
 
@@ -112,14 +123,31 @@ fn read_bundle_info(app_path: &Path) -> Result<Option<SoftwareEntry>, String> {
         .and_then(|value| value.as_string())
         .and_then(non_empty);
 
-    Ok(Some(SoftwareEntry {
-        name,
-        version,
-        publisher: None,
-        architecture: None,
-        source: SoftwareSource::Other,
-        install_location: non_empty(&app_path.display().to_string()),
-    }))
+    Ok(Some(
+        SoftwareEntry {
+            name,
+            version,
+            publisher: None,
+            architecture: None,
+            source: SoftwareSource::MacBundle,
+            install_location: non_empty(&app_path.display().to_string()),
+            ..SoftwareEntry::default()
+        }
+        .with_path_instance(
+            dictionary
+                .get("CFBundleIdentifier")
+                .and_then(|value| value.as_string())
+                .and_then(non_empty),
+            if std::env::var_os("HOME")
+                .is_some_and(|home| app_path.starts_with(PathBuf::from(home)))
+            {
+                InstallationScope::User
+            } else {
+                InstallationScope::System
+            },
+            app_path,
+        ),
+    ))
 }
 
 async fn collect_homebrew(timeout: Duration) -> Option<CollectorResult> {
@@ -132,6 +160,7 @@ async fn collect_homebrew(timeout: Duration) -> Option<CollectorResult> {
                     entries: Vec::new(),
                     warnings: vec![format!("brew formula collector failed: {message}")],
                     complete: false,
+                    sources: Vec::new(),
                 })
             }
         };
@@ -154,31 +183,28 @@ async fn collect_homebrew(timeout: Duration) -> Option<CollectorResult> {
         entries,
         warnings,
         complete,
+        sources: Vec::new(),
     })
 }
 
 fn parse_brew_versions(output: &str) -> Vec<SoftwareEntry> {
     output
         .lines()
-        .filter_map(|line| {
+        .flat_map(|line| {
             let mut fields = line.split_whitespace();
-            let name = fields.next()?;
-            if name.trim().is_empty() {
-                return None;
-            }
-            // Homebrew can report multiple installed versions on one line.
-            // The server key cannot represent them all, so report the newest
-            // one deterministically instead of whichever token appeared first.
-            let version = fields
-                .map(ToOwned::to_owned)
-                .max_by(|left, right| compare_versions(Some(left.as_str()), Some(right.as_str())));
-            Some(SoftwareEntry {
-                name: name.to_string(),
-                version,
-                publisher: None,
-                architecture: None,
-                source: SoftwareSource::Brew,
-                install_location: None,
+            let name = fields.next().unwrap_or("");
+            fields.filter(|_| !name.is_empty()).map(move |version| {
+                SoftwareEntry {
+                    name: name.to_string(),
+                    version: Some(version.to_string()),
+                    source: SoftwareSource::Brew,
+                    ..SoftwareEntry::default()
+                }
+                .with_instance(
+                    Some(name.to_string()),
+                    InstallationScope::System,
+                    &format!("brew:{name}:{version}"),
+                )
             })
         })
         .collect()
@@ -200,11 +226,11 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_newest_of_multiple_homebrew_versions() {
+    fn preserves_multiple_homebrew_versions() {
         let entries = parse_brew_versions("openssl@3 3.1.7 3.10.1 3.9.0\n");
 
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].version.as_deref(), Some("3.10.1"));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].version.as_deref(), Some("3.1.7"));
     }
 
     #[test]

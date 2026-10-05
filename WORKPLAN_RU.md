@@ -1,6 +1,6 @@
 # Актуальный план работ Lariska
 
-Статус на 23 сентября 2026 года. Документ описывает оставшуюся работу после стабилизации ветки 0.3.x и заменяет исторический список задач, большая часть которого уже выполнена.
+Статус исходного кода на 6 октября 2026 года. Опубликованный baseline — 0.4.0; P0 реализован в рабочей ветке и требует review, companion PR Shapoclyack и завершённых native CI прогонов перед поставкой.
 
 ## 1. Цель продукта
 
@@ -14,7 +14,7 @@ Lariska должна быть production-ready endpoint-агентом Shapoclya
 - обновляется проверяемым и восстанавливаемым способом;
 - предоставляет оператору измеримые показатели свежести, полноты и влияния на хост.
 
-## 2. Текущий baseline 0.3.x
+## 2. Опубликованный baseline 0.4.0
 
 | Направление | Статус | Что уже есть |
 | --- | --- | --- |
@@ -28,10 +28,12 @@ Lariska должна быть production-ready endpoint-агентом Shapoclya
 | Полнота | Выполнена консервативная модель | Неполный цикл не публикуется целиком |
 | Delivery | Выполнено | zstd spool, independent worker, retry, quarantine, persisted accepted digest |
 | Packaging | Частично | systemd/launchd/Windows SCM и заготовки deb/RPM; production signing не завершён |
-| Self-update | Частично | TLS policy, target triple и SHA-256; нет signed manifest и health rollback |
+| Self-update в опубликованной 0.4.0 | Частично | TLS policy, target triple и SHA-256; P0 native updater реализован в рабочей ветке |
 | Документация | Актуализируется | README EN/RU, versioned wiki, Plan и этот roadmap |
 
 ## 3. Приоритет P0: точность данных
+
+Реализовано в текущем изменении: [контракт v2, source-aware completeness и fallback](docs/INVENTORY_V2.md). Golden fixture синхронизирован с companion PR Shapoclyack. Условие поставки — совместное review и успешные проверки обоих репозиториев.
 
 ### 3.1 Inventory schema v2: installation identity
 
@@ -82,6 +84,8 @@ Lariska должна быть production-ready endpoint-агентом Shapoclya
 Зависимость: server-side effective inventory и обратная совместимость контракта.
 
 ## 4. Приоритет P0: безопасное обновление агента
+
+Реализовано в текущем изменении: [signed manifest, streaming, независимый native supervisor и health rollback](docs/SIGNED_UPDATES.md). Добавлен workflow реального install/upgrade/rollback для deb/RPM/MSI/pkg; его наличие не заменяет завершённый успешный CI.
 
 ### 4.1 Streaming download и строгие лимиты
 

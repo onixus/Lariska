@@ -53,7 +53,11 @@ impl fmt::Debug for ApiClient {
 
 impl ApiClient {
     pub fn new(config: &Config) -> Result<Self, ApiError> {
-        let mut builder = Client::builder().timeout(config.request_timeout);
+        // Inventory and authenticated update requests never follow a redirect
+        // to an alternate origin or a weaker transport.
+        let mut builder = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(config.request_timeout);
 
         if let Some(ca_path) = &config.tls_ca_file {
             let pem = std::fs::read(ca_path)

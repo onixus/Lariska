@@ -1,6 +1,12 @@
 # Lariska Technical Plan
 
-Status: active architecture and delivery plan for the 0.3.x line. Last reviewed: 2026-09-23.
+Status: published baseline 0.4.0; P0 implementation under review. Last reviewed: 2026-10-06.
+
+The implementation in this branch adds [inventory v2 and source completeness](docs/INVENTORY_V2.md)
+and [signed native updates with independent recovery](docs/SIGNED_UPDATES.md).
+Delivery requires the companion Shapoclyack change and completed native lifecycle CI.
+The requested self-signed macOS mode is not Apple notarized. Roadmap items below
+remain acceptance criteria until those delivery checks finish.
 
 ## 1. Purpose and boundary
 

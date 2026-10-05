@@ -9,6 +9,8 @@ pub mod identity;
 pub mod inventory;
 pub mod managed;
 pub mod model;
+pub mod native_update;
 pub mod qos;
 pub mod service;
 pub mod telemetry;
+pub mod update;

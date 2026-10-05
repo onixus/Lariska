@@ -1,0 +1,20 @@
+[Unit]
+Description=Lariska signed native package updater and recovery supervisor
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/var/lib/lariska-updater/supervisor update-supervisor --config /etc/lariska/lariska.toml
+User=root
+StateDirectory=lariska-updater
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=10
+# Package managers need their normal system access. The inventory service
+# keeps its unprivileged ProtectSystem=strict policy; only this separately
+# installed helper may act on a locally trusted signed update.
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

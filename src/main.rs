@@ -38,6 +38,19 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
             }
         }
         Some("check-config") => app::check_config(&config_path(&args[1..])),
+        Some("update-supervisor") => lariska::native_update::supervise(
+            &config_path(&args[1..]),
+            args[1..].iter().any(|a| a == "--once"),
+        ),
+        Some("update-seed") => lariska::native_update::seed(
+            &config_path(&args[1..]),
+            &required_path(&args[1..], "--manifest")?,
+            &required_path(&args[1..], "--artifact")?,
+        ),
+        Some("--version" | "version") => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("inventory") => {
             ensure_inventory_args(&args[1..])?;
             app::print_inventory();
@@ -49,6 +62,13 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
         }
         Some(command) => Err(format!("unknown command: {command}")),
     }
+}
+
+fn required_path(args: &[String], flag: &str) -> Result<PathBuf, String> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| PathBuf::from(&pair[1]))
+        .ok_or_else(|| format!("required argument: {flag} path"))
 }
 
 fn config_path(args: &[String]) -> PathBuf {
@@ -69,7 +89,7 @@ fn ensure_inventory_args(args: &[String]) -> Result<(), String> {
 
 fn print_usage() {
     println!(
-        "Usage:\n  lariska run [--config path] [--service]\n  lariska check-config [--config path]\n  lariska inventory [--output json]"
+        "Usage:\n  lariska run [--config path] [--service]\n  lariska check-config [--config path]\n  lariska inventory [--output json]\n  lariska update-supervisor --config path [--once]\n  lariska update-seed --config path --manifest path --artifact path\n  lariska --version"
     );
 }
 

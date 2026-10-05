@@ -364,6 +364,7 @@ mod tests {
                 architecture: None,
                 source: SoftwareSource::Dpkg,
                 install_location: None,
+                ..crate::model::SoftwareEntry::default()
             }],
             Vec::new(),
         )

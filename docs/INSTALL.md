@@ -111,7 +111,7 @@ sudo systemctl status lariska
 sudo journalctl -u lariska -n 100 --no-pager
 ```
 
-The hardened unit writes state under `/var/lib/lariska`. Self-replacement of a package-owned `/usr/bin/lariska` by the unprivileged service may be unavailable; use controlled package deployment in production until the signed native updater milestone is complete.
+The hardened unit writes state under `/var/lib/lariska`. Native packages install an independent privileged recovery supervisor. Provision protected trust and seed the currently installed rollback package before enabling remote upgrades; see [Signed native updates](SIGNED_UPDATES.md).
 
 ## 4. macOS
 
@@ -250,16 +250,9 @@ Shapoclyack cannot remotely change:
 
 ## 8. Update behavior
 
-The current update path:
+The endpoint checks the locally trusted Ed25519 manifest, streams a bounded native package into staging and leaves installation to an independently supervised privileged helper. The helper verifies again, records a protected transaction, installs the native package and requires a successful matching-version heartbeat. A failed health window restores the cached previous signed package. Configuration, identity and spool survive this transaction.
 
-- joins a relative API path to the configured same-origin server;
-- refuses a foreign target triple;
-- requires HTTPS unless the local insecure-update override is enabled;
-- verifies SHA-256 before replacement;
-- stages the file and retains the previous binary;
-- exits so the service supervisor starts the installed build.
-
-Production limitations remain: no embedded-key signed manifest, final streaming/size design, native package ownership, anti-rollback policy, or automatic post-restart health rollback. See [WORKPLAN_RU.md](../WORKPLAN_RU.md).
+See [Signed native updates](SIGNED_UPDATES.md) for native package enrollment, rollback seeding, administrator-owned keyrings, anti-rollback and the explicitly pinned self-signed MSI/pkg mode. Older tar/zip installations require migration to a native package before this remote update path can be enabled.
 
 ## 9. Troubleshooting
 

@@ -1,5 +1,5 @@
 use super::{runtimes, CollectorResult};
-use crate::model::SoftwareEntry;
+use crate::model::{CollectionSource, CollectionStatus, SoftwareSource};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -7,8 +7,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const CACHE_SUBDIR: &str = "inventory-cache-v1";
-const CACHE_FORMAT_VERSION: u16 = 1;
+const CACHE_SUBDIR: &str = "inventory-cache-v2";
+const CACHE_FORMAT_VERSION: u16 = 2;
 const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FINGERPRINT_ITEMS: usize = 100_000;
 
@@ -207,12 +207,18 @@ pub async fn collect_all_cached(
     {
         Ok(runtime_result) => result.merge(runtime_result),
         Err(error) => {
-            result.complete = false;
-            result
-                .warnings
-                .push(format!("runtime collectors panicked: {error}"));
+            tracing::warn!(%error, "runtime collectors panicked");
+            for source in [
+                SoftwareSource::Pip,
+                SoftwareSource::Npm,
+                SoftwareSource::Java,
+            ] {
+                result.merge(CollectorResult::failed(source, "collector_panicked"));
+            }
         }
     }
+
+    reconcile_last_complete(state_dir, &mut result.sources);
 
     tracing::debug!(
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -223,6 +229,48 @@ pub async fn collect_all_cached(
         "cached inventory collection completed"
     );
     result
+}
+
+fn reconcile_last_complete(state_dir: &Path, sources: &mut [CollectionSource]) {
+    use std::collections::BTreeMap;
+    let path = state_dir.join("inventory-source-history-v2.json");
+    let history: Option<BTreeMap<SoftwareSource, String>> =
+        File::open(&path).ok().and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(64 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+            if bytes.len() > 64 * 1024 {
+                return None;
+            }
+            serde_json::from_slice(&bytes).ok()
+        });
+    let mut history = history.unwrap_or_default();
+    for source in sources {
+        if source.status == CollectionStatus::Complete {
+            if let Some(at) = &source.last_complete_at {
+                history.insert(source.source, at.clone());
+            }
+        } else {
+            source.last_complete_at = history.get(&source.source).cloned();
+        }
+    }
+    if let Ok(bytes) = serde_json::to_vec(&history) {
+        let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+        let stored = (|| -> std::io::Result<()> {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            replace_file(&temp, &path)?;
+            sync_parent_dir(&path)
+        })();
+        if let Err(error) = stored {
+            tracing::warn!(%error, "could not persist collector source history");
+            let _ = fs::remove_file(temp);
+        }
+    }
 }
 
 async fn collect_platform_cached(
@@ -287,6 +335,7 @@ async fn collect_platform(timeout: Duration) -> CollectorResult {
                 "software collection is not supported on this operating system".to_string(),
             ],
             complete: false,
+            sources: Vec::new(),
         }
     }
 }
@@ -322,7 +371,7 @@ fn collect_runtime_cached<Fingerprint, Collect>(
 ) -> CollectorResult
 where
     Fingerprint: FnOnce() -> Result<String, String>,
-    Collect: FnOnce() -> Vec<SoftwareEntry>,
+    Collect: FnOnce() -> CollectorResult,
 {
     let fingerprint = match fingerprint_fn() {
         Ok(fingerprint) => Some(fingerprint),
@@ -339,11 +388,20 @@ where
         }
     }
 
-    let result = CollectorResult {
-        entries: collect_fn(),
-        warnings: Vec::new(),
-        complete: true,
-    };
+    let mut result = collect_fn();
+    if fingerprint.is_none() {
+        result.complete = false;
+        result.warnings.push("fingerprint_failed".to_string());
+        for source in &mut result.sources {
+            source.status = if result.entries.is_empty() {
+                CollectionStatus::Failed
+            } else {
+                CollectionStatus::Partial
+            };
+            source.last_complete_at = None;
+            source.diagnostic_code = Some("fingerprint_failed".to_string());
+        }
+    }
     if let (Some(cache), Some(fingerprint)) = (cache, fingerprint.as_deref()) {
         if let Err(error) = cache.store(kind, fingerprint, &result) {
             tracing::warn!(collector = kind.label(), %error, "could not update runtime inventory cache");
@@ -634,10 +692,53 @@ mod tests {
                 architecture: Some("x86_64".to_string()),
                 source: SoftwareSource::Dpkg,
                 install_location: None,
+                ..SoftwareEntry::default()
             }],
             warnings: Vec::new(),
             complete: true,
+            sources: Vec::new(),
         }
+    }
+
+    #[test]
+    fn failed_source_keeps_last_complete_time_across_restart() {
+        let state_dir = temp_state_dir("source-history");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut healthy = vec![CollectionSource::new(
+            SoftwareSource::Pip,
+            CollectionStatus::Complete,
+            None,
+        )];
+        healthy[0].last_complete_at = Some("2026-10-05T10:00:00Z".into());
+        reconcile_last_complete(&state_dir, &mut healthy);
+        let mut failed = vec![CollectionSource::new(
+            SoftwareSource::Pip,
+            CollectionStatus::Failed,
+            Some("metadata_unreadable"),
+        )];
+        reconcile_last_complete(&state_dir, &mut failed);
+        assert_eq!(
+            failed[0].last_complete_at.as_deref(),
+            Some("2026-10-05T10:00:00Z")
+        );
+        assert_eq!(failed[0].status, CollectionStatus::Failed);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn failed_fingerprint_cannot_bless_an_empty_runtime_result_or_cache_it() {
+        let state_dir = temp_state_dir("fingerprint-failed");
+        let cache = InventoryCache::open(&state_dir, Duration::from_secs(3600)).unwrap();
+        let result = collect_runtime_cached(
+            Some(&cache),
+            CacheKind::Python,
+            || Err("permission denied".into()),
+            || CollectorResult::not_applicable(SoftwareSource::Pip),
+        );
+        assert!(!result.complete);
+        assert_eq!(result.sources[0].status, CollectionStatus::Failed);
+        assert!(!cache.path(CacheKind::Python).exists());
+        fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]

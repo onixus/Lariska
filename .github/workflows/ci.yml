@@ -78,6 +78,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: onixus/Shapoclyack
+          # The companion branch is required while this paired change is a PR;
+          # main uses the deployed contract after server-first integration.
+          ref: ${{ github.head_ref == 'codex/p0-completion' && 'codex/lariska-p0-server' || 'main' }}
           path: shapoclyack
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -85,4 +88,20 @@ jobs:
         working-directory: lariska
         env:
           SHAPOCLYACK_FIXTURE_PATH: ${{ github.workspace }}/shapoclyack/tests/fixtures/endpoint_inventory_v1_valid.json
-        run: cargo test shapoclyack_fixture_is_schema_compatible -- --nocapture
+        run: cargo test --locked shapoclyack_fixture_is_schema_compatible -- --nocapture
+      - name: Validate the inventory v2 and signed-release companion fixtures
+        working-directory: lariska
+        env:
+          SHAPOCLYACK_FIXTURE_PATH: ${{ github.workspace }}/shapoclyack/tests/fixtures/endpoint_inventory_v2_valid.json
+        run: |
+          cargo test --locked shapoclyack_fixture_is_schema_compatible -- --nocapture
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          pairs = [
+              ('tests/fixtures/inventory_v2.json', '../shapoclyack/tests/fixtures/endpoint_inventory_v2_valid.json'),
+              ('tests/fixtures/signed_manifest_v1.json', '../shapoclyack/tests/fixtures/endpoint_signed_manifest_v1.json'),
+          ]
+          for agent, server in pairs:
+              assert json.loads(Path(agent).read_text()) == json.loads(Path(server).read_text()), agent
+          PY

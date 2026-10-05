@@ -1,8 +1,7 @@
-use crate::inventory::read_text_file_limited;
-use crate::model::{SoftwareEntry, SoftwareSource};
+use crate::inventory::{read_text_file_limited, CollectorResult};
+use crate::model::{InstallationScope, SoftwareEntry, SoftwareSource};
 use serde::Deserialize;
 use serde_json::Value;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
@@ -14,54 +13,42 @@ struct PackageJson {
 }
 
 /// Collects globally installed Node.js packages.
-pub fn collect_nodejs_packages() -> Vec<SoftwareEntry> {
-    let mut entries = Vec::new();
+pub fn collect_nodejs_packages() -> CollectorResult {
+    collect_nodejs_dirs(&candidate_node_modules_dirs())
+}
 
-    for dir in candidate_node_modules_dirs() {
-        if !dir.is_dir() {
-            continue;
+pub(crate) fn collect_nodejs_dirs(dirs: &[PathBuf]) -> CollectorResult {
+    let mut result = CollectorResult::default();
+    let mut found = false;
+    for dir in dirs {
+        if dir.exists() {
+            found = true;
         }
-
-        let Ok(read_dir) = fs::read_dir(&dir) else {
-            continue;
-        };
-
-        for item in read_dir.flatten() {
-            let path = item.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let file_name = path
+        for path in super::child_dirs(dir, &mut result) {
+            let packages = if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or_default();
-
-            // Handle scoped packages like @angular/cli.
-            if file_name.starts_with('@') {
-                if let Ok(scoped_dir) = fs::read_dir(&path) {
-                    for scoped_item in scoped_dir.flatten() {
-                        let sub_path = scoped_item.path();
-                        if sub_path.is_dir() {
-                            if let Some(entry) = check_package_json(&sub_path) {
-                                entries.push(entry);
-                            }
-                        }
-                    }
+                .is_some_and(|name| name.starts_with('@'))
+            {
+                super::child_dirs(&path, &mut result)
+            } else {
+                vec![path]
+            };
+            for package in packages {
+                match read_text_file_limited(&package.join("package.json"))
+                    .and_then(|content| parse_package_json(&content, &package))
+                {
+                    Some(entry) => result.entries.push(entry),
+                    None => result.mark_failed("metadata_unreadable"),
                 }
-            } else if let Some(entry) = check_package_json(&path) {
-                entries.push(entry);
             }
         }
     }
-
-    entries
-}
-
-fn check_package_json(module_dir: &Path) -> Option<SoftwareEntry> {
-    let pkg_file = module_dir.join("package.json");
-    let content = read_text_file_limited(&pkg_file)?;
-    parse_package_json(&content, module_dir)
+    if !found && result.complete {
+        CollectorResult::not_applicable(SoftwareSource::Npm)
+    } else {
+        result.with_source(SoftwareSource::Npm)
+    }
 }
 
 pub fn parse_package_json(content: &str, install_dir: &Path) -> Option<SoftwareEntry> {
@@ -77,14 +64,18 @@ pub fn parse_package_json(content: &str, install_dir: &Path) -> Option<SoftwareE
         .filter(|v| !v.is_empty());
     let publisher = parsed.author.and_then(package_author_name);
 
-    Some(SoftwareEntry {
-        name,
-        version,
-        publisher,
-        architecture: None,
-        source: SoftwareSource::Npm,
-        install_location: Some(install_dir.display().to_string()),
-    })
+    Some(
+        SoftwareEntry {
+            name: name.clone(),
+            version,
+            publisher,
+            architecture: None,
+            source: SoftwareSource::Npm,
+            install_location: Some(install_dir.display().to_string()),
+            ..SoftwareEntry::default()
+        }
+        .with_path_instance(Some(name), InstallationScope::Runtime, install_dir),
+    )
 }
 
 /// npm accepts several shapes for `author`. Unknown-but-valid shapes must not
@@ -136,6 +127,38 @@ pub(crate) fn candidate_node_modules_dirs() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_metadata_is_degraded_instead_of_authoritative_removal() {
+        let root = std::env::temp_dir().join(format!(
+            "lariska-nodejs-completeness-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let good = root.join("good/package.json");
+        std::fs::create_dir_all(good.parent().unwrap()).unwrap();
+        std::fs::write(good, "{\"name\":\"good\",\"version\":\"1.2\"}").unwrap();
+        let good_result = collect_nodejs_dirs(std::slice::from_ref(&root));
+        assert!(good_result.complete);
+        assert_eq!(good_result.entries.len(), 1);
+        let bad = root.join("broken/package.json");
+        std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+        std::fs::write(&bad, "{bad json").unwrap();
+        let result = collect_nodejs_dirs(std::slice::from_ref(&root));
+        assert!(!result.complete);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.sources[0].source, SoftwareSource::Npm);
+        assert_eq!(
+            result.sources[0].status,
+            crate::model::CollectionStatus::Partial
+        );
+        assert_eq!(
+            result.sources[0].diagnostic_code.as_deref(),
+            Some("metadata_unreadable")
+        );
+        assert!(result.sources[0].last_complete_at.is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn parses_valid_package_json() {

@@ -1,7 +1,9 @@
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const INVENTORY_SCHEMA_VERSION: u16 = 1;
+pub const INVENTORY_SCHEMA_VERSION: u16 = 2;
+pub const LEGACY_INVENTORY_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InventorySnapshot {
@@ -19,6 +21,8 @@ pub struct InventorySnapshot {
     pub identifiers: Vec<EndpointIdentifier>,
     pub software: Vec<SoftwareEntry>,
     pub collector_warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<CollectionSource>,
 }
 
 /// Orders two version strings the way a human reads them: digit runs compare as
@@ -130,6 +134,44 @@ impl InventorySnapshot {
         collector_warnings: Vec<String>,
     ) -> Self {
         let mut snapshot = Self {
+            schema_version: LEGACY_INVENTORY_SCHEMA_VERSION,
+            snapshot_id,
+            agent_id,
+            collected_at,
+            hostname,
+            os_family,
+            os_name,
+            os_version,
+            os_arch,
+            agent_version,
+            labels,
+            identifiers,
+            software,
+            collector_warnings,
+            sources: Vec::new(),
+        };
+        snapshot.normalize();
+        snapshot
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_v2(
+        snapshot_id: String,
+        agent_id: String,
+        collected_at: String,
+        hostname: String,
+        os_family: Option<String>,
+        os_name: Option<String>,
+        os_version: Option<String>,
+        os_arch: Option<String>,
+        agent_version: String,
+        labels: BTreeMap<String, String>,
+        identifiers: Vec<EndpointIdentifier>,
+        software: Vec<SoftwareEntry>,
+        collector_warnings: Vec<String>,
+        sources: Vec<CollectionSource>,
+    ) -> Self {
+        let mut snapshot = Self {
             schema_version: INVENTORY_SCHEMA_VERSION,
             snapshot_id,
             agent_id,
@@ -144,27 +186,35 @@ impl InventorySnapshot {
             identifiers,
             software,
             collector_warnings,
+            sources,
         };
         snapshot.normalize();
         snapshot
     }
 
-    /// Sorts and deduplicates identifiers/software deterministically. Software
-    /// entries are deduplicated on the server's comparison key (name +
-    /// publisher + architecture + source, excluding version) because the
-    /// server holds `UNIQUE(snapshot_id, comparison_key)` and rejects a
-    /// payload carrying two entries with the same key — it does not
-    /// deduplicate for us. A host with two versions of one product installed
-    /// side by side (three Visual C++ redistributables of the same year is
-    /// ordinary on Windows) therefore cannot be represented in full, and the
-    /// greater version is what survives.
-    ///
-    /// "Greater" is decided by [`compare_versions`], not by string order.
-    /// Lexicographically `"1.9.0"` beats `"1.10.0"`, which would have kept the
-    /// *older* build and reported the machine as running software it had
-    /// already replaced — or, in the other direction, hidden the old copy that
-    /// is the one an advisory is about. Every dropped version is named in
-    /// `collector_warnings`, so what could not be sent is at least visible.
+    /// Builds the legacy wire shape only after a complete collection.
+    pub fn into_v1(mut self) -> Self {
+        self.schema_version = LEGACY_INVENTORY_SCHEMA_VERSION;
+        self.sources.clear();
+        for entry in &mut self.software {
+            if matches!(
+                entry.source,
+                SoftwareSource::Pacman | SoftwareSource::MacBundle
+            ) {
+                entry.source = SoftwareSource::Other;
+            }
+            entry.product_identity = None;
+            entry.installation_identity = None;
+            entry.package_id = None;
+            entry.scope = None;
+            entry.install_instance_id = None;
+        }
+        self.normalize();
+        self
+    }
+
+    /// Keeps one row per installation in v2. Legacy v1 retains the newest
+    /// product row because old servers enforce a product comparison key.
     pub fn normalize(&mut self) {
         self.identifiers
             .retain(|identifier| !identifier.value_hash.trim().is_empty());
@@ -176,10 +226,24 @@ impl InventorySnapshot {
         self.identifiers.dedup();
 
         self.software.iter_mut().for_each(SoftwareEntry::normalize);
+        if self.schema_version == INVENTORY_SCHEMA_VERSION {
+            for entry in &mut self.software {
+                if entry.installation_identity.is_none() {
+                    entry.ensure_installation_identity();
+                    entry.install_instance_id = Some(hash_identity(&[
+                        "lariska-endpoint-instance-v2",
+                        &self.agent_id,
+                        entry.install_instance_id.as_deref().unwrap_or(""),
+                    ]));
+                }
+                entry.ensure_installation_identity();
+            }
+            self.sources.sort_by_key(|source| source.source);
+        }
         self.software.retain(|entry| !entry.name.is_empty());
         self.software.sort_by(|left, right| {
-            left.comparison_key()
-                .cmp(&right.comparison_key())
+            left.identity_key(self.schema_version)
+                .cmp(&right.identity_key(self.schema_version))
                 .then_with(|| {
                     // Descending: the survivor of each group is the one
                     // `deduplicate_software` keeps, which is the first it sees.
@@ -195,10 +259,22 @@ impl InventorySnapshot {
 
         for entry in self.software.drain(..) {
             match deduped.last() {
-                Some(last) if last.comparison_key() == entry.comparison_key() => {
+                Some(last)
+                    if last.identity_key(self.schema_version)
+                        == entry.identity_key(self.schema_version) =>
+                {
                     // Named plainly rather than with Rust's `{:?}`, which
                     // rendered these as `Some("8.0.61001")` in an operator's
                     // console.
+                    if self.schema_version == INVENTORY_SCHEMA_VERSION {
+                        if last.version != entry.version {
+                            warnings.push(format!(
+                                "conflicting versions for installation {}",
+                                entry.installation_identity.as_deref().unwrap_or("unknown")
+                            ));
+                        }
+                        continue;
+                    }
                     warnings.push(format!(
                         "{} is installed more than once ({}); the server's inventory \
                          key does not carry a version, so only {} was sent and {} was dropped",
@@ -217,7 +293,9 @@ impl InventorySnapshot {
     }
 
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.schema_version != INVENTORY_SCHEMA_VERSION {
+        if ![LEGACY_INVENTORY_SCHEMA_VERSION, INVENTORY_SCHEMA_VERSION]
+            .contains(&self.schema_version)
+        {
             return Err(ModelError::Invalid(format!(
                 "unsupported inventory schema version {}",
                 self.schema_version
@@ -237,6 +315,57 @@ impl InventorySnapshot {
             return Err(ModelError::Invalid(
                 "software entries must not have empty names".to_string(),
             ));
+        }
+
+        if self.schema_version == INVENTORY_SCHEMA_VERSION {
+            let mut sources = std::collections::BTreeSet::new();
+            for source in &self.sources {
+                if !sources.insert(source.source) {
+                    return Err(ModelError::Invalid(
+                        "duplicate collection source".to_string(),
+                    ));
+                }
+                validate_required("collector_version", &source.collector_version)?;
+                validate_required("source collected_at", &source.collected_at)?;
+                if source.diagnostic_code.as_ref().is_some_and(|code| {
+                    code.len() > 64
+                        || !code
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                }) {
+                    return Err(ModelError::Invalid("invalid diagnostic code".to_string()));
+                }
+                if source.status == CollectionStatus::Complete && source.last_complete_at.is_none()
+                {
+                    return Err(ModelError::Invalid(
+                        "complete sources require last_complete_at".to_string(),
+                    ));
+                }
+            }
+            for entry in &self.software {
+                if !sources.contains(&entry.source) {
+                    return Err(ModelError::Invalid(
+                        "software source has no completeness state".to_string(),
+                    ));
+                }
+                for id in [&entry.installation_identity, &entry.install_instance_id] {
+                    if !id.as_ref().is_some_and(|value| {
+                        value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+                    }) {
+                        return Err(ModelError::Invalid(
+                            "invalid installation identity".to_string(),
+                        ));
+                    }
+                }
+                if entry.product_identity.as_deref() != Some(entry.comparison_key().as_str())
+                    || entry.scope.is_none()
+                    || entry.install_location.is_some()
+                {
+                    return Err(ModelError::Invalid(
+                        "invalid v2 product identity or raw install location".to_string(),
+                    ));
+                }
+            }
         }
 
         for identifier in &self.identifiers {
@@ -264,19 +393,27 @@ impl InventorySnapshot {
         let prev_map: BTreeMap<String, &SoftwareEntry> = previous
             .software
             .iter()
-            .map(|entry| (entry.comparison_key(), entry))
+            .map(|entry| (entry.identity_key(self.schema_version), entry))
             .collect();
 
         let curr_map: BTreeMap<String, &SoftwareEntry> = self
             .software
             .iter()
-            .map(|entry| (entry.comparison_key(), entry))
+            .map(|entry| (entry.identity_key(self.schema_version), entry))
             .collect();
 
         let mut changes = Vec::new();
 
         // Check for added or modified entries in current snapshot
         for (key, curr_entry) in &curr_map {
+            if self.schema_version == INVENTORY_SCHEMA_VERSION
+                && !self.sources.iter().any(|source| {
+                    source.source == curr_entry.source
+                        && source.status == CollectionStatus::Complete
+                })
+            {
+                continue;
+            }
             match prev_map.get(key) {
                 Some(prev_entry) => {
                     if curr_entry.version != prev_entry.version {
@@ -299,7 +436,13 @@ impl InventorySnapshot {
 
         // Check for removed entries that were in previous snapshot
         for (key, prev_entry) in &prev_map {
-            if !curr_map.contains_key(key) {
+            if !curr_map.contains_key(key)
+                && (self.schema_version == LEGACY_INVENTORY_SCHEMA_VERSION
+                    || self.sources.iter().any(|source| {
+                        source.source == prev_entry.source
+                            && source.status == CollectionStatus::Complete
+                    }))
+            {
                 changes.push(SoftwareDeltaItem {
                     action: DeltaAction::Removed,
                     entry: (*prev_entry).clone(),
@@ -400,6 +543,8 @@ pub enum SoftwareSource {
     /// what a Microsoft advisory is actually matched against: an OS build plus
     /// the updates applied on top of it.
     Kb,
+    Pacman,
+    MacBundle,
     #[default]
     Other,
 }
@@ -417,6 +562,8 @@ impl SoftwareSource {
             Self::Npm => "npm",
             Self::Java => "java",
             Self::Kb => "kb",
+            Self::Pacman => "pacman",
+            Self::MacBundle => "mac_bundle",
             Self::Other => "other",
         }
     }
@@ -434,12 +581,14 @@ impl SoftwareSource {
             "npm" | "node" | "nodejs" => Self::Npm,
             "java" | "jar" | "jdk" | "jre" => Self::Java,
             "kb" | "msu" | "hotfix" => Self::Kb,
+            "pacman" => Self::Pacman,
+            "mac_bundle" => Self::MacBundle,
             _ => Self::Other,
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SoftwareEntry {
     pub name: String,
     pub version: Option<String>,
@@ -447,9 +596,144 @@ pub struct SoftwareEntry {
     pub architecture: Option<String>,
     pub source: SoftwareSource,
     pub install_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<InstallationScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_instance_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallationScope {
+    System,
+    User,
+    Runtime,
+    Container,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionStatus {
+    Complete,
+    Partial,
+    Failed,
+    NotApplicable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CollectionSource {
+    pub source: SoftwareSource,
+    pub status: CollectionStatus,
+    pub collected_at: String,
+    pub last_complete_at: Option<String>,
+    pub collector_version: String,
+    pub diagnostic_code: Option<String>,
+}
+
+impl CollectionSource {
+    pub fn new(
+        source: SoftwareSource,
+        status: CollectionStatus,
+        diagnostic_code: Option<&str>,
+    ) -> Self {
+        let collected_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("valid UTC timestamp");
+        Self {
+            source,
+            status,
+            last_complete_at: (status == CollectionStatus::Complete).then(|| collected_at.clone()),
+            collected_at,
+            collector_version: env!("CARGO_PKG_VERSION").to_string(),
+            diagnostic_code: diagnostic_code.map(ToOwned::to_owned),
+        }
+    }
 }
 
 impl SoftwareEntry {
+    pub fn with_instance(
+        mut self,
+        package_id: Option<String>,
+        scope: InstallationScope,
+        private_instance: &str,
+    ) -> Self {
+        self.package_id = package_id;
+        self.scope = Some(scope);
+        self.install_instance_id = Some(hash_identity(&[
+            "lariska-install-instance-v2",
+            private_instance,
+        ]));
+        self
+    }
+
+    pub fn with_path_instance(
+        self,
+        package_id: Option<String>,
+        scope: InstallationScope,
+        path: &std::path::Path,
+    ) -> Self {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.with_instance(package_id, scope, &canonical.to_string_lossy())
+    }
+
+    pub fn ensure_installation_identity(&mut self) {
+        self.normalize();
+        self.package_id = normalize_optional_string(self.package_id.as_deref());
+        let scope = *self.scope.get_or_insert({
+            if matches!(
+                self.source,
+                SoftwareSource::Pip | SoftwareSource::Npm | SoftwareSource::Java
+            ) {
+                InstallationScope::Runtime
+            } else {
+                InstallationScope::System
+            }
+        });
+        let product = self.comparison_key();
+        if self.install_instance_id.is_none() {
+            // With no native key/path, version is necessary to retain parallel
+            // installations instead of hiding a vulnerable older build.
+            let instance = self
+                .install_location
+                .as_deref()
+                .or(self.package_id.as_deref())
+                .unwrap_or(self.version.as_deref().unwrap_or("unknown"));
+            self.install_instance_id =
+                Some(hash_identity(&["lariska-install-instance-v2", instance]));
+        }
+        let scope_name = match scope {
+            InstallationScope::System => "system",
+            InstallationScope::User => "user",
+            InstallationScope::Runtime => "runtime",
+            InstallationScope::Container => "container",
+        };
+        self.installation_identity = Some(hash_identity(&[
+            "lariska-installation-v2",
+            &product,
+            self.package_id.as_deref().unwrap_or(""),
+            scope_name,
+            self.install_instance_id.as_deref().unwrap_or(""),
+        ]));
+        self.product_identity = Some(product);
+        self.install_location = None;
+    }
+
+    pub fn identity_key(&self, schema_version: u16) -> String {
+        if schema_version == INVENTORY_SCHEMA_VERSION {
+            self.installation_identity
+                .clone()
+                .unwrap_or_else(|| self.comparison_key())
+        } else {
+            self.comparison_key()
+        }
+    }
+
     pub fn normalize(&mut self) {
         self.name = normalize_required_string(&self.name);
         self.version = normalize_optional_string(self.version.as_deref());
@@ -470,6 +754,15 @@ impl SoftwareEntry {
             self.source.as_str()
         )
     }
+}
+
+fn hash_identity(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -735,8 +1028,207 @@ mod tests {
 
     #[test]
     fn unknown_source_maps_to_other() {
-        assert_eq!(SoftwareSource::from_raw("pacman"), SoftwareSource::Other);
+        assert_eq!(SoftwareSource::from_raw("pacman"), SoftwareSource::Pacman);
         assert_eq!(SoftwareSource::from_raw("DPKG"), SoftwareSource::Dpkg);
+    }
+
+    fn source_fixture(source: SoftwareSource, status: CollectionStatus) -> CollectionSource {
+        CollectionSource {
+            source,
+            status,
+            collected_at: "2026-10-06T10:00:00Z".into(),
+            last_complete_at: (status == CollectionStatus::Complete)
+                .then(|| "2026-10-06T10:00:00Z".into()),
+            collector_version: "0.4.0".into(),
+            diagnostic_code: (status == CollectionStatus::Failed)
+                .then(|| "metadata_unreadable".into()),
+        }
+    }
+
+    fn fixture_v2(
+        software: Vec<SoftwareEntry>,
+        sources: Vec<CollectionSource>,
+    ) -> InventorySnapshot {
+        let base = fixture_snapshot(Vec::new());
+        InventorySnapshot::new_v2(
+            base.snapshot_id,
+            base.agent_id,
+            "2026-10-06T10:00:00Z".into(),
+            base.hostname,
+            base.os_family,
+            base.os_name,
+            base.os_version,
+            base.os_arch,
+            "0.4.0".into(),
+            base.labels,
+            base.identifiers,
+            software,
+            Vec::new(),
+            sources,
+        )
+    }
+
+    fn java_install(version: &str, instance: &str) -> SoftwareEntry {
+        SoftwareEntry {
+            name: "OpenJDK".into(),
+            version: Some(version.into()),
+            publisher: Some("Eclipse Adoptium".into()),
+            architecture: Some("x86_64".into()),
+            source: SoftwareSource::Java,
+            install_location: Some(instance.into()),
+            ..SoftwareEntry::default()
+        }
+        .with_instance(
+            Some("java-runtime".into()),
+            InstallationScope::Runtime,
+            instance,
+        )
+    }
+
+    #[test]
+    fn v2_preserves_old_vulnerable_installation_and_is_idempotent() {
+        let entries = vec![
+            java_install("17.0.1", "/private/users/alice/java17"),
+            java_install("21.0.3", "/private/users/alice/java21"),
+        ];
+        let mut snapshot = fixture_v2(
+            entries,
+            vec![source_fixture(
+                SoftwareSource::Java,
+                CollectionStatus::Complete,
+            )],
+        );
+        assert_eq!(snapshot.software.len(), 2);
+        assert!(snapshot
+            .software
+            .iter()
+            .any(|entry| entry.version.as_deref() == Some("17.0.1")));
+        assert_eq!(
+            snapshot.software[0].product_identity,
+            snapshot.software[1].product_identity
+        );
+        assert_ne!(
+            snapshot.software[0].installation_identity,
+            snapshot.software[1].installation_identity
+        );
+        snapshot.validate().unwrap();
+        let json = snapshot.to_canonical_json();
+        assert!(!json.contains("alice"));
+        assert!(!json.contains("/private/users"));
+        snapshot.normalize();
+        assert_eq!(snapshot.to_canonical_json(), json);
+        snapshot.software.push(snapshot.software[0].clone());
+        snapshot.normalize();
+        assert_eq!(snapshot.to_canonical_json(), json);
+    }
+
+    #[test]
+    fn v2_version_change_modifies_same_installation_and_scope_keeps_copies_distinct() {
+        let previous = fixture_v2(
+            vec![java_install("17.0.1", "/java")],
+            vec![source_fixture(
+                SoftwareSource::Java,
+                CollectionStatus::Complete,
+            )],
+        );
+        let current = fixture_v2(
+            vec![java_install("17.0.2", "/java")],
+            previous.sources.clone(),
+        );
+        assert_eq!(
+            current.software[0].installation_identity,
+            previous.software[0].installation_identity
+        );
+        let delta = current.diff(&previous);
+        assert_eq!(delta.software_changes.len(), 1);
+        assert_eq!(delta.software_changes[0].action, DeltaAction::Modified);
+        let mut user = java_install("17.0.2", "/java");
+        user.scope = Some(InstallationScope::User);
+        let two = fixture_v2(vec![current.software[0].clone(), user], current.sources);
+        assert_eq!(two.software.len(), 2);
+    }
+
+    #[test]
+    fn v2_partial_source_never_manufactures_changes_while_healthy_source_updates() {
+        let previous = fixture_v2(
+            vec![
+                software("bash", None, Some("5.1"), "dpkg"),
+                software("requests", None, Some("2.30"), "pip"),
+            ],
+            vec![
+                source_fixture(SoftwareSource::Dpkg, CollectionStatus::Complete),
+                source_fixture(SoftwareSource::Pip, CollectionStatus::Complete),
+            ],
+        );
+        let current = fixture_v2(
+            vec![
+                software("bash", None, Some("5.2"), "dpkg"),
+                software("untrusted-observation", None, Some("1"), "pip"),
+            ],
+            vec![
+                source_fixture(SoftwareSource::Dpkg, CollectionStatus::Complete),
+                source_fixture(SoftwareSource::Pip, CollectionStatus::Partial),
+            ],
+        );
+        let changes = current.diff(&previous).software_changes;
+        assert!(changes
+            .iter()
+            .all(|change| change.entry.source == SoftwareSource::Dpkg));
+        assert!(!changes.is_empty());
+        let recovered = fixture_v2(
+            vec![software("bash", None, Some("5.2"), "dpkg")],
+            vec![
+                source_fixture(SoftwareSource::Dpkg, CollectionStatus::Complete),
+                source_fixture(SoftwareSource::Pip, CollectionStatus::Complete),
+            ],
+        );
+        assert!(recovered
+            .diff(&previous)
+            .software_changes
+            .iter()
+            .any(|change| change.entry.source == SoftwareSource::Pip
+                && change.action == DeltaAction::Removed));
+    }
+
+    #[test]
+    fn v2_falls_back_to_legacy_shape_for_complete_older_server_collection() {
+        let snapshot = fixture_v2(
+            vec![
+                java_install("17.0.1", "/java17"),
+                java_install("21.0.3", "/java21"),
+            ],
+            vec![source_fixture(
+                SoftwareSource::Java,
+                CollectionStatus::Complete,
+            )],
+        )
+        .into_v1();
+        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(snapshot.software.len(), 1);
+        assert_eq!(snapshot.software[0].version.as_deref(), Some("21.0.3"));
+        assert!(snapshot.sources.is_empty());
+        let json = snapshot.to_canonical_json();
+        assert!(!json.contains("installation_identity"));
+        snapshot.validate().unwrap();
+    }
+
+    #[test]
+    fn v2_contract_fixture_roundtrips_and_validates() {
+        let text = include_str!("../tests/fixtures/inventory_v2.json").trim();
+        let mut snapshot: InventorySnapshot = serde_json::from_str(text).unwrap();
+        snapshot.validate().unwrap();
+        snapshot.normalize();
+        assert_eq!(snapshot.to_canonical_json(), text);
+        assert_eq!(snapshot.software.len(), 2);
+        assert_eq!(
+            snapshot
+                .sources
+                .iter()
+                .find(|source| source.source == SoftwareSource::Pip)
+                .unwrap()
+                .status,
+            CollectionStatus::Failed
+        );
     }
 
     fn fixture_snapshot(software: Vec<SoftwareEntry>) -> InventorySnapshot {
@@ -776,6 +1268,7 @@ mod tests {
             architecture: architecture.map(ToOwned::to_owned),
             source: SoftwareSource::from_raw(source),
             install_location: None,
+            ..SoftwareEntry::default()
         }
     }
 }

@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+# An update must leave the stable watchdog alive while replacing the endpoint.
+# Final removal stops both components and preserves configuration/state.
+if [ "$1" = remove ] || [ "$1" = deconfigure ]; then
+    systemctl stop lariska.service lariska-updater.service || true
+    systemctl disable lariska.service lariska-updater.service || true
+fi
+exit 0

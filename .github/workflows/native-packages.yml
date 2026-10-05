@@ -1,0 +1,192 @@
+name: Native package lifecycle
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release:
+        type: boolean
+        default: false
+    secrets:
+      LARISKA_RELEASE_ED25519_KEY:
+        required: true
+      LARISKA_WINDOWS_P12_B64:
+        required: true
+      LARISKA_WINDOWS_P12_PASSWORD:
+        required: true
+      LARISKA_MACOS_P12_B64:
+        required: true
+      LARISKA_MACOS_P12_PASSWORD:
+        required: true
+  push:
+    branches: [codex/p0-completion]
+    paths:
+      - 'src/**'
+      - 'Cargo.*'
+      - 'packaging/**'
+      - '.github/workflows/native-packages.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-packages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lifecycle:
+    name: Native ${{ matrix.kind }} on ${{ matrix.os }} install / upgrade / rollback
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            kind: deb
+          - os: ubuntu-24.04
+            kind: rpm
+          - os: ubuntu-24.04-arm
+            kind: deb
+          - os: ubuntu-24.04-arm
+            kind: rpm
+          - os: windows-latest
+            kind: msi
+          - os: macos-15
+            kind: pkg
+          - os: macos-15-intel
+            kind: pkg
+    env:
+      LARISKA_RELEASE_KEY_ID: lariska-local-2026-10
+      LARISKA_RELEASE_ED25519_KEY: ${{ secrets.LARISKA_RELEASE_ED25519_KEY }}
+      LARISKA_WINDOWS_P12_PASSWORD: ${{ secrets.LARISKA_WINDOWS_P12_PASSWORD }}
+      LARISKA_MACOS_P12_PASSWORD: ${{ secrets.LARISKA_MACOS_P12_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Manifest signing dependency
+        run: python -m pip install cryptography
+      - name: Native Linux tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y rpm
+      - name: WiX and isolated Windows signing trust
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NATIVE_P12_B64: ${{ secrets.LARISKA_WINDOWS_P12_B64 }}
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'WiX installation failed' }
+          $p12 = Join-Path $env:RUNNER_TEMP 'lariska-windows.p12'
+          [IO.File]::WriteAllBytes($p12, [Convert]::FromBase64String($env:NATIVE_P12_B64))
+          $password = ConvertTo-SecureString $env:LARISKA_WINDOWS_P12_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath $p12 -CertStoreLocation Cert:\CurrentUser\My -Password $password | Out-Null
+          Import-Certificate -FilePath packaging/trust/windows.cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          Import-Certificate -FilePath packaging/trust/windows.cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+          "LARISKA_SIGNING_P12=$p12" >> $env:GITHUB_ENV
+      - name: Isolated macOS signing keychain and self-signed trust
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          NATIVE_P12_B64: ${{ secrets.LARISKA_MACOS_P12_B64 }}
+        run: |
+          set -euo pipefail
+          p12="$RUNNER_TEMP/lariska-macos.p12"
+          keychain="$RUNNER_TEMP/lariska-native.keychain-db"
+          printf '%s' "$NATIVE_P12_B64" | base64 --decode > "$p12"
+          chmod 600 "$p12"
+          security create-keychain -p "$LARISKA_MACOS_P12_PASSWORD" "$keychain"
+          security unlock-keychain -p "$LARISKA_MACOS_P12_PASSWORD" "$keychain"
+          security import "$p12" -k "$keychain" -P "$LARISKA_MACOS_P12_PASSWORD" -T /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$LARISKA_MACOS_P12_PASSWORD" "$keychain"
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          sudo security add-trusted-cert -d -r trustRoot -p basic -k "$keychain" packaging/trust/macos.cer
+          echo "LARISKA_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+      - name: Build three actual package versions and signed manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          versions="0.4.0 0.4.1 0.4.2"
+          if [ '${{ inputs.release }}' = true ]; then
+            versions=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          fi
+          for version in $versions; do
+            python - "$version" <<'PY'
+          from pathlib import Path
+          import re,sys
+          version=sys.argv[1]
+          path=Path('Cargo.toml')
+          path.write_text(re.sub(r'(?m)^version = "[^"]+"', 'version = "'+version+'"', path.read_text(), count=1))
+          lock=Path('Cargo.lock')
+          lock.write_text(re.sub(r'(name = "lariska"\nversion = ")[^"]+', lambda match:match[1]+version, lock.read_text(), count=1))
+          PY
+            cargo build --release --locked
+            target=$(rustc -vV | sed -n 's/^host: //p')
+            if [ '${{ matrix.kind }}' = msi ]; then
+              powershell.exe -NoProfile -NonInteractive -File packaging/ci/build-windows.ps1 -Version "$version"
+            elif [ '${{ matrix.kind }}' = pkg ]; then
+              bash packaging/ci/build-macos.sh "$version"
+            else
+              bash packaging/ci/build-linux.sh "$version" '${{ matrix.kind }}'
+            fi
+            sequence=$(python - "$version" <<'PY'
+          import sys
+          major,minor,patch=map(int,sys.argv[1].split("."))
+          print(major*1000000+minor*1000+patch)
+          PY
+          )
+            artifact=$(find "dist/$version" -maxdepth 1 -type f -name '*.${{ matrix.kind }}')
+            python packaging/ci/sign-manifest.py "$artifact" --platform "$target" --kind '${{ matrix.kind }}' --version "$version" --sequence "$sequence"
+          done
+      - name: Real native lifecycle (Unix)
+        if: runner.os != 'Windows' && matrix.kind != 'rpm' && inputs.release != true
+        shell: bash
+        run: sudo -E "$(command -v python)" packaging/ci/native-smoke.py --kind '${{ matrix.kind }}'
+      - name: Real RPM lifecycle on Fedora with independent systemd services
+        if: matrix.kind == 'rpm' && inputs.release != true
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t lariska-native-fedora packaging/ci/fedora
+          docker run -d --name lariska-native-rpm --privileged --cgroupns=host --tmpfs /run --tmpfs /run/lock --tmpfs /tmp -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v "$GITHUB_WORKSPACE:/workspace:ro" -v "$GITHUB_WORKSPACE/dist:/workspace/dist" -w /workspace lariska-native-fedora
+          docker exec lariska-native-rpm python3 packaging/ci/native-smoke.py --kind rpm
+      - name: Real native lifecycle (Windows)
+        if: runner.os == 'Windows' && inputs.release != true
+        shell: pwsh
+        run: python packaging/ci/native-smoke.py --kind msi
+      - name: Collect service diagnostics on failure
+        if: failure() && runner.os == 'Linux'
+        run: |
+          sudo journalctl -u lariska -u lariska-updater --no-pager > dist/systemd.log || true
+      - name: Collect Fedora diagnostics on failure
+        if: failure() && matrix.kind == 'rpm'
+        shell: bash
+        run: |
+          docker logs lariska-native-rpm > dist/fedora-container.log 2>&1 || true
+          docker exec lariska-native-rpm journalctl -u lariska -u lariska-updater --no-pager > dist/fedora-systemd.log 2>&1 || true
+      - name: Stop disposable Fedora system
+        if: always() && matrix.kind == 'rpm'
+        shell: bash
+        run: docker rm -f lariska-native-rpm || true
+      - name: Native package and lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lariska-native-${{ matrix.kind }}-${{ matrix.os }}-${{ github.sha }}
+          path: dist/**
+          if-no-files-found: error
+      - name: Remove temporary macOS signing material
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo security remove-trusted-cert -d packaging/trust/macos.cer || true
+          security delete-keychain "$RUNNER_TEMP/lariska-native.keychain-db" || true
+          rm -f "$RUNNER_TEMP/lariska-macos.p12"
+      - name: Remove temporary Windows signing material
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item "$env:RUNNER_TEMP\lariska-windows.p12" -ErrorAction SilentlyContinue

@@ -42,19 +42,9 @@ ownership and release-key custody").
 
 ## Upgrade procedure
 
-From 0.3.0 an agent can be upgraded from the Shapoclyack console: the build
-is named in the heartbeat response, downloaded from the API, verified against
-the SHA-256 digest the server published, installed over the running binary
-(the previous one is kept beside it as `lariska.old`), and the process exits
-so the service manager starts the new build. Publishing a release is therefore
-only half of a fleet upgrade — the artifact and its digest have to be
-registered in the console for the version and target triple in question, and
-the triples the agent asks for are exactly the five built below.
+Managed updates now require a signed native package manifest, a locally provisioned trust key and an initial signed rollback seed. The independent privileged updater installs through the native package manager and verifies a heartbeat from the new version; timeout or failed health restores its protected cached previous package. See [Signed native updates](SIGNED_UPDATES.md).
 
-An agent refuses an offer over plain HTTP (the build and its digest would
-share one unprotected connection) unless `allow_insecure_updates = true`, and
-refuses a build for a different target triple. See
-[INSTALL.md §7](INSTALL.md#7-remote-management).
+The release workflow keeps GitHub releases draft and now waits for signed deb/RPM/MSI/pkg builds. Validate the native lifecycle workflow for the current commit before publishing a release. Self-signed native artifacts need explicitly provisioned local certificate trust/pins and are not notarized. Archive downloads remain useful for manual installation, but their checksum alone does not authorize remote native updates.
 
 The manual path remains supported, and is the one to use when the console is
 not involved — replace the binary and restart the service:
@@ -90,18 +80,9 @@ sc.exe start Lariska
 
 ## Rollback procedure
 
-After a console-driven upgrade the build that was replaced is still on the
-host, beside the installed one and suffixed `.old`; restoring it is a stop,
-a rename and a start. Otherwise the procedure is the upgrade in reverse: stop
-the service, restore the previous binary
-(keep the last N release archives on hand — they are exactly what was
-downloaded from the GitHub release, no rebuild needed), restart. State
-compatibility: the wire schema is versioned (`schema_version`, currently
-`1`) and the local spool/identity file formats have not changed since Phase
-L1 — a rollback within schema v1 is expected to work without touching
-`state_dir`. If a future release ever bumps `schema_version` or changes the
-spool file format, this document must be updated with the specific
-incompatibility before that release ships.
+The native supervisor restores the cached previous signed package automatically when new-version health is not acknowledged. Its stable executable and protected journal are independent of the newly installed endpoint, and a supervisor restart resumes recovery. The anti-rollback floor survives normal recovery; an administrative emergency override names one exact signed version and does not lower that floor.
+
+For a manual archive installation, stop the service, restore the retained previous binary and restart it. Preserve `state_dir`: endpoint identity remains compatible. New agents can read v1 and v2 inventory spool payloads; an older v1-only binary cannot submit queued v2 snapshots and may quarantine them. Keep this evidence for recovery instead of deleting state. Deploy Shapoclyack dual-read/source-aware support before rolling out v2 agents.
 
 ## Incident response: server rejects a large fraction of submissions
 

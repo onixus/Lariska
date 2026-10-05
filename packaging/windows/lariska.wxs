@@ -1,0 +1,27 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Lariska" Manufacturer="Shapoclyack" Version="$(var.Version)" UpgradeCode="E2E5595C-1B4F-4FCB-BF41-A14F766DB537" Scope="perMachine">
+    <MajorUpgrade AllowDowngrades="yes" Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Lariska">
+        <Component Id="Endpoint" Guid="99ADB191-D319-4665-8F39-2F8560BA7D66" Bitness="always64">
+          <File Id="EndpointExe" Source="$(var.Binary)" Name="lariska.exe" KeyPath="yes" />
+          <ServiceInstall Id="EndpointService" Name="Lariska" DisplayName="Lariska Endpoint Agent" Description="Shapoclyack endpoint software inventory" Type="ownProcess" Start="auto" ErrorControl="normal" Account="NT AUTHORITY\LocalService" Arguments="--winservice" />
+          <ServiceControl Id="EndpointControl" Name="Lariska" Stop="both" Remove="uninstall" Wait="yes" />
+        </Component>
+        <Component Id="Helper" Guid="7868A771-7BD1-409A-A551-0F7F4827E8E5" Bitness="always64"><File Id="HelperExe" Source="$(var.Binary)" Name="lariska-updater.exe" KeyPath="yes" /></Component>
+        <Component Id="BootstrapScript" Guid="746A9DA0-E8A1-4B78-8912-68C1D8C4195B" Bitness="always64"><File Id="SetupScript" Source="packaging/windows/native-setup.ps1" KeyPath="yes" /></Component>
+        <Component Id="PublicCertificate" Guid="412D4E29-1CF3-44A9-BF84-D4C3316735AA" Bitness="always64"><File Id="WindowsCertificate" Source="packaging/trust/windows.cer" KeyPath="yes" /></Component>
+        <Component Id="PublicTrust" Guid="B68F8CEC-E89A-43CD-95FC-374F72923F94" Bitness="always64"><File Id="TrustFile" Source="packaging/trust/public-trust.json" KeyPath="yes" /></Component>
+        <Component Id="ExampleConfig" Guid="2A1D8A1F-888C-40C1-B7BC-2303DD20DC35" Bitness="always64"><File Id="ExampleFile" Source="packaging/windows/lariska.example.toml" KeyPath="yes" /></Component>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="Agent" Title="Lariska" Level="1"><ComponentRef Id="Endpoint" /><ComponentRef Id="Helper" /><ComponentRef Id="BootstrapScript" /><ComponentRef Id="PublicTrust" /><ComponentRef Id="PublicCertificate" /><ComponentRef Id="ExampleConfig" /></Feature>
+    <CustomAction Id="Bootstrap" Directory="System64Folder" ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#SetupScript]&quot; -InstallDir &quot;[INSTALLFOLDER].&quot;" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="RemoveUpdater" Directory="System64Folder" ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#SetupScript]&quot; -InstallDir &quot;[INSTALLFOLDER].&quot; -Remove" Execute="deferred" Impersonate="no" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="Bootstrap" After="InstallServices" Condition="NOT REMOVE" />
+      <Custom Action="RemoveUpdater" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

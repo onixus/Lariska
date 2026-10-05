@@ -39,7 +39,7 @@ The important separation is deliberate:
 
 1. The inventory scheduler performs one bounded collection at a time.
 2. Unchanged collectors can reuse a versioned persistent cache until the configured full-refresh deadline.
-3. A collector failure marks the cycle non-authoritative. The daemon keeps diagnostics, but does not publish a partial snapshot that Shapoclyack could mistake for mass software removal.
+3. Schema v2 reports completeness independently for each source; the server keeps prior effective data for failed/partial sources while healthy sources update. Older servers retain the authoritative-only v1 fallback.
 4. An authoritative snapshot is atomically added to the local spool.
 5. A dedicated worker owns authentication, HTTP retry, and spool draining. Network failure does not stretch the collection cycle.
 
@@ -96,11 +96,11 @@ For systemd, launchd, Windows SCM installation, file locations, and verification
 
 These are current engineering boundaries, not marketing punctuation marks:
 
-- Inventory schema v1 cannot faithfully represent every side-by-side installation that shares the same normalized product key. Schema v2 with installation identity is planned.
+- [Inventory v2](docs/INVENTORY_V2.md) preserves installation instances and per-source completeness. A companion Shapoclyack deployment is required; older servers use v1.
 - HTTP inventory transport sends full JSON snapshots. Local spool data is zstd-compressed, but wire compression and delta submission are not yet enabled.
 - Windows per-user inventory covers loaded user hives. Lariska deliberately does not mount every signed-out user profile.
 - Snap, Flatpak, macOS package receipts, MSIX/AppX, and several language ecosystems are not collected yet.
-- Upgrade artifacts are checked by target triple and SHA-256, but release-manifest signatures, native package-manager upgrades, and automatic health rollback remain roadmap work.
+- [Signed native updates](docs/SIGNED_UPDATES.md) verify local Ed25519 trust and use an independent privileged watchdog for installation and health rollback. Self-signed MSI/pkg trust is explicit local policy.
 - Low-impact behavior is enforced structurally, but fleet SLOs for CPU time, peak RSS, disk reads, and collection latency still require published benchmark baselines.
 
 ## Documentation
