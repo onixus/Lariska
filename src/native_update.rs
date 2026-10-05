@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const POWERSHELL: &str = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+const WINDOWS_POWERSHELL_MODULES: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules";
 
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
 const MAX_REQUESTS: usize = 200;
@@ -473,7 +474,7 @@ fn verify_native_signature(
                 .windows_signer_thumbprint
                 .as_deref()
                 .ok_or("MSI package requires a local signer thumbprint")?;
-            let script = "$s=Get-AuthenticodeSignature -LiteralPath $env:LARISKA_UPDATE_ARTIFACT; if($s.Status -ne 'Valid'){exit 1}; $s.SignerCertificate.Thumbprint";
+            let script = r"$s=Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $env:LARISKA_UPDATE_ARTIFACT; if($s.Status -ne 'Valid'){exit 1}; $s.SignerCertificate.Thumbprint";
             let (status, output) = execute_bounded_env(
                 POWERSHELL,
                 &[
@@ -718,8 +719,33 @@ fn execute_bounded_env(
     for (name, value) in environment {
         command.env(name, value);
     }
+    if program.eq_ignore_ascii_case(POWERSHELL) {
+        // A pwsh 7 parent can otherwise make WindowsPowerShell 5.1 autoload
+        // incompatible Core modules. Privileged scripts use only OS-controlled
+        // builtins; user directories and module-analysis caches establish no trust.
+        command
+            .env("PSModulePath", WINDOWS_POWERSHELL_MODULES)
+            .env("WinPSModulePath", WINDOWS_POWERSHELL_MODULES)
+            .env_remove("PSModuleAnalysisCachePath");
+        if args.len() != 4
+            || args[0] != "-NoProfile"
+            || args[1] != "-NonInteractive"
+            || args[2] != "-Command"
+        {
+            return Err("native PowerShell requires a fixed, noninteractive script".into());
+        }
+        // WindowsPowerShell startup can prepend CurrentUser/AllUsers locations,
+        // even when the inherited path contains only PSHOME. Reset before any
+        // cmdlet discovery or module autoload in the actual privileged script.
+        let mut script = std::ffi::OsString::from(format!(
+            "$env:PSModulePath='{WINDOWS_POWERSHELL_MODULES}';$env:WinPSModulePath=$env:PSModulePath;"
+        ));
+        script.push(args[3]);
+        command.args(&args[..3]).arg(script);
+    } else {
+        command.args(args);
+    }
     command
-        .args(args)
         .stdin(Stdio::null())
         .stdout(file.try_clone().map_err(|e| e.to_string())?)
         // Keep diagnostics bounded, separate from successful metadata stdout.
@@ -1005,7 +1031,7 @@ $identity=[Security.Principal.WindowsIdentity]::GetCurrent();
 $principal=[Security.Principal.WindowsPrincipal]::new($identity);
 if(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){exit 1};
 $trusted=@('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464',$identity.User.Value);
-$trusted+=@(Get-LocalGroupMember -SID 'S-1-5-32-544'|ForEach-Object {$_.SID.Value});
+$trusted+=@(Microsoft.PowerShell.LocalAccounts\Get-LocalGroupMember -SID 'S-1-5-32-544'|ForEach-Object {$_.SID.Value});
 $objects=@();$item=Microsoft.PowerShell.Management\Get-Item -LiteralPath $env:LARISKA_UPDATE_TRUST_PATH -Force;
 while($null -ne $item){
 $acl=Microsoft.PowerShell.Security\Get-Acl -LiteralPath $item.FullName;
@@ -1013,7 +1039,7 @@ $aces=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])
 $objects+=@{owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value;reparse=(($item.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0);aces=$aces};
 if($item.PSIsContainer){$parent=$item.Parent}else{$parent=$item.Directory};
 if($null -eq $parent){break};$item=Microsoft.PowerShell.Management\Get-Item -LiteralPath $parent.FullName -Force;
-};@{trusted_sids=$trusted;objects=$objects}|ConvertTo-Json -Depth 8 -Compress"#;
+};@{trusted_sids=$trusted;objects=$objects}|Microsoft.PowerShell.Utility\ConvertTo-Json -Depth 8 -Compress"#;
     let (status, bytes) = execute_bounded_env(
         POWERSHELL,
         &[
@@ -1507,6 +1533,40 @@ mod tests {
             execute_bounded("/bin/sh", &["-c".as_ref(), script.as_ref()])
                 .unwrap_err()
                 .contains("limit")
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_builtin_modules_ignore_poisoned_parent_search_paths() {
+        let script = r"$ErrorActionPreference='Stop';
+foreach($entry in @(
+@{name='Microsoft.PowerShell.Security\Get-Acl';module='Microsoft.PowerShell.Security'},
+@{name='Microsoft.PowerShell.LocalAccounts\Get-LocalGroupMember';module='Microsoft.PowerShell.LocalAccounts'},
+@{name='Microsoft.PowerShell.Security\Get-AuthenticodeSignature';module='Microsoft.PowerShell.Security'},
+@{name='Microsoft.PowerShell.Management\Get-Item';module='Microsoft.PowerShell.Management'},
+@{name='Microsoft.PowerShell.Utility\ConvertTo-Json';module='Microsoft.PowerShell.Utility'}
+)){
+$command=Get-Command -Name $entry.name -CommandType Cmdlet;
+if($command.CommandType -ne 'Cmdlet' -or $command.ModuleName -ne $entry.module){throw 'unexpected native command provider'};
+};$env:PSModulePath;$env:WinPSModulePath";
+        let poison = std::ffi::OsStr::new(r"Z:\untrusted-modules");
+        let (status, bytes) = execute_bounded_env(
+            POWERSHELL,
+            &[
+                "-NoProfile".as_ref(),
+                "-NonInteractive".as_ref(),
+                "-Command".as_ref(),
+                script.as_ref(),
+            ],
+            &[("PSModulePath", poison), ("WinPSModulePath", poison)],
+        )
+        .unwrap();
+        assert!(status.success(), "{}", String::from_utf8_lossy(&bytes));
+        let output = String::from_utf8(bytes).unwrap();
+        let paths: Vec<_> = output.lines().collect();
+        assert_eq!(
+            paths,
+            vec![WINDOWS_POWERSHELL_MODULES, WINDOWS_POWERSHELL_MODULES]
         );
     }
 }
