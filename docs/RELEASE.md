@@ -20,7 +20,7 @@
    binary with no bundled runtime).
 6. A **draft** GitHub release is created with all artifacts attached —
    review it and publish manually. It is never auto-published, so a bad
-   build never becomes visible to users without an authorized publication step. Confirm both workflows succeeded for the release commit, verify the downloaded checksums/manifests and package versions, then publish with `gh release edit vX.Y.Z --draft=false --latest`. The release should contain 25 assets: five archives, five checksums, seven native packages, seven manifests and one SBOM.
+   build never becomes visible to users without an authorized publication step. Confirm both workflows succeeded for the release commit, verify the downloaded checksums/manifests and package versions, then publish with `gh release edit vX.Y.Z --draft=false --latest`. The release should contain 32 assets: five archives, twelve checksums, seven native packages, seven manifests and one SBOM.
 
 ## Build provenance
 
