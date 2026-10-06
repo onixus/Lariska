@@ -2,7 +2,7 @@
 
 ## Cutting a release
 
-1. Update `Cargo.toml`'s `version` and add a changelog entry.
+1. Update the package version in `Cargo.toml` and `Cargo.lock`, README versions, installation examples and the dated changelog entry. Run the normal CI and the native lifecycle workflow on that exact commit before tagging.
 2. Tag `vX.Y.Z` and push the tag — `.github/workflows/release.yml` triggers
    on any `v*.*.*` tag push.
 3. The workflow builds five targets natively (no cross-compiling to a
@@ -14,13 +14,13 @@
    - `x86_64-pc-windows-msvc`
    - `x86_64-apple-darwin`
    - `aarch64-apple-darwin`
-4. Each archive gets a `.sha256` checksum file alongside it.
+4. Each archive gets a `.sha256` checksum file alongside it. The reusable native workflow also builds seven packages: Linux x86_64/aarch64 DEB and RPM, Windows x86_64 MSI, and macOS x86_64/aarch64 PKG. Each native package has an Ed25519-signed `.manifest.json` binding its bytes, version and target. Release mode builds the source version; it does not execute the lifecycle smoke tests, so run those separately before publication.
 5. A CycloneDX SBOM (`lariska.cdx.json`) is generated from `Cargo.lock` —
    this only reflects Rust dependencies (accurate and complete for a Rust
    binary with no bundled runtime).
 6. A **draft** GitHub release is created with all artifacts attached —
    review it and publish manually. It is never auto-published, so a bad
-   build never becomes visible to users without a human step.
+   build never becomes visible to users without an authorized publication step. Confirm both workflows succeeded for the release commit, verify the downloaded checksums/manifests and package versions, then publish with `gh release edit vX.Y.Z --draft=false --latest`. The release should contain 25 assets: five archives, five checksums, seven native packages, seven manifests and one SBOM.
 
 ## Build provenance
 
@@ -38,8 +38,7 @@ builds also require platform signing certificates in GitHub Secrets. The
 configured certificates are self-signed: administrators must provision
 their trust explicitly, and macOS packages are not Apple notarized.
 Archive binaries remain unsigned and can trigger SmartScreen or Gatekeeper.
-Private keys remain local until their export is authorized; validate the
-current commit's native lifecycle before distributing signed packages.
+Private keys are supplied through the five GitHub Secrets listed in [Signed native updates](SIGNED_UPDATES.md); only public trust material belongs in Git. Validate the current commit's native lifecycle before distributing signed packages.
 
 ## Upgrade procedure
 

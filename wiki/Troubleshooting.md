@@ -82,7 +82,7 @@ Only loaded user hives under `HKEY_USERS` are collected. Software installed only
 
 ### Side-by-side versions collapse
 
-This is a schema-v1 limitation when entries share name, publisher, architecture, and source. The agent retains the naturally newer version and emits a warning. Schema v2 installation identity is the planned fix.
+This is a schema-v1 limitation when entries share name, publisher, architecture, and source. The agent retains the naturally newer version and emits a warning. Confirm the server negotiates schema v2: installation identities then preserve these rows. Deploy compatible Shapoclyack first; absent or unknown negotiation falls back to v1.
 
 ## Inventory is slow or causes noticeable load
 
@@ -135,7 +135,7 @@ Corrupt, oversized, expired, or incompatible cache entries are ignored and remov
 Safe manual reset:
 
 1. stop the service;
-2. remove `state_dir/inventory-cache-v1/` only;
+2. remove `state_dir/inventory-cache-v2/` only;
 3. start the service;
 4. expect one cold scan.
 
@@ -157,16 +157,9 @@ Fix the policy in Shapoclyack. Repeating the same invalid revision will not chan
 
 ## Update fails
 
-Common causes:
+Check the refusal reason and protected watchdog journal. Common causes include an unknown/revoked signing key, expired manifest, wrong platform/package kind, byte-count or digest mismatch, anti-rollback rejection, replayed nonce, missing rollback seed, untrusted native signer or unavailable native installer. HTTP also requires the explicit local insecure-update override.
 
-- update platform does not match the agent target triple;
-- plain HTTP without the local insecure-update override;
-- digest mismatch;
-- service account cannot replace the installed binary;
-- staging/state directory is not writable;
-- supervisor does not restart the service after staging.
-
-Prefer native package deployment in production until signed manifests and health rollback are complete. Keep the previous executable and update logs for recovery.
+For health rollback, inspect registration/heartbeat authentication and both endpoint and watchdog logs. An executable starting is insufficient: health must match the new version and transaction nonce. Preserve signed predecessor packages and journal evidence. See [Signed native updates](../docs/SIGNED_UPDATES.md).
 
 ## Crash report detected after restart
 

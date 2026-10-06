@@ -17,7 +17,7 @@ flowchart TB
     RC --> CACHE
     PC --> NORM[normalization]
     RC --> NORM
-    NORM --> AUTHZ{complete?}
+    NORM --> AUTHZ{v2 negotiated or complete v1?}
     AUTHZ -- no --> LOG[bounded warnings; keep server state]
     AUTHZ -- yes --> SPOOL[atomic zstd spool]
     SPOOL --> DW
@@ -41,7 +41,7 @@ The scheduler uses a one-shot delay rather than a catch-up interval. The next co
 
 ### Delivery
 
-The inventory path only persists a complete snapshot and wakes the worker. The worker owns token acquisition, HTTP retries, queue draining, acknowledgement, and quarantine. Network failure therefore changes queue age, not local scan concurrency.
+The inventory path persists a negotiated v2 snapshot with source status, or a complete v1 snapshot and wakes the worker. The worker owns token acquisition, HTTP retries, queue draining, acknowledgement, and quarantine. Network failure therefore changes queue age, not local scan concurrency.
 
 ## Inventory pipeline
 
@@ -51,11 +51,11 @@ The inventory path only persists a complete snapshot and wakes the worker. The w
 4. Otherwise run the bounded collector and persist only a complete result.
 5. Merge results while propagating completeness.
 6. Normalize names, versions, architecture, source, and ordering.
-7. Reject publication when the combined result is incomplete.
-8. Create one schema-v1 snapshot ID and timestamp.
+7. For v1, reject publication when the combined result is incomplete; for v2, preserve per-source status.
+8. Create a snapshot ID and timestamp, retaining per-source completeness for negotiated schema v2.
 9. Enqueue the snapshot atomically.
 
-The diagnostic `inventory` command may display partial entries and warnings because it is an operator tool. The daemon is stricter and does not publish partial state.
+The diagnostic `inventory` command may display partial entries and warnings because it is an operator tool. The v1 daemon refuses partial cycles; v2 submits per-source status so the server retains degraded sources safely.
 
 ## Delivery pipeline
 
@@ -98,7 +98,7 @@ Under the configured `state_dir`:
 state_dir/
   <identity and lock state>
   delivery-state-v1.json
-  inventory-cache-v1/
+  inventory-cache-v2/
     platform.json
     python.json
     nodejs.json
@@ -125,4 +125,4 @@ Names outside the documented versioned files may evolve. Operators should use su
 
 ## Known architectural debt
 
-Schema v1 identifies a software product more strongly than an installation instance. It can therefore collapse side-by-side versions with the same normalized key. The next contract revision separates product and installation identity and adds per-source completeness, allowing healthy sources to advance while a failed source is carried forward safely.
+Schema v2 separates product and endpoint-scoped installation identity, preserving side-by-side versions. Per-source completeness allows healthy sources to advance while Shapoclyack preserves degraded sources. Registration/heartbeat negotiate v2 explicitly; absent or unknown negotiation selects the conservative v1 conversion. See [Inventory v2](../docs/INVENTORY_V2.md).

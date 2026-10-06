@@ -2,7 +2,7 @@
 
 Lariska is distributed as a standalone binary for Linux, macOS, and Windows. It exchanges a tenant provisioning key for a short-lived agent token, registers the endpoint, sends independent heartbeats, performs bounded inventory collection, and queues authoritative snapshots for an independent delivery worker.
 
-Release archives are currently unsigned and do not yet include production MSI, DEB, RPM, or PKG installers. Verify published SHA-256 files before installation. Windows SmartScreen and macOS Gatekeeper may warn on first run.
+Version 0.5.0 ships native DEB/RPM packages for Linux x86_64/aarch64, a signed MSI for Windows x86_64, and signed PKG installers for macOS Intel/Apple Silicon, alongside the five unsigned binary archives. Native packages have Ed25519-signed manifests; MSI/PKG use self-signed platform certificates requiring explicit administrator trust. macOS packages are not notarized. Verify archive SHA-256 files before manual installation. See [native enrollment and rollback seeding](SIGNED_UPDATES.md) before enabling managed updates.
 
 ## 1. Create a provisioning key
 
@@ -69,10 +69,10 @@ lariska check-config --config /path/to/lariska.toml
 
 ## 3. Linux
 
-Choose `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu` from the [latest release](https://github.com/onixus/Lariska/releases/latest). The source version at the time of this document is `0.4.0`; use the actual release tag being installed.
+Choose `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu` from the [latest release](https://github.com/onixus/Lariska/releases/latest). The source version at the time of this document is `0.5.0`; use the actual release tag being installed.
 
 ```bash
-VERSION=0.4.0
+VERSION=0.5.0
 TARGET=x86_64-unknown-linux-gnu
 curl -fLO "https://github.com/onixus/Lariska/releases/download/v${VERSION}/lariska-v${VERSION}-${TARGET}.tar.gz"
 curl -fLO "https://github.com/onixus/Lariska/releases/download/v${VERSION}/lariska-v${VERSION}-${TARGET}.tar.gz.sha256"
@@ -101,7 +101,7 @@ sudo -u lariska /usr/bin/lariska inventory --output json
 Install the supplied unit:
 
 ```bash
-VERSION=0.4.0
+VERSION=0.5.0
 curl -fsSL \
   "https://raw.githubusercontent.com/onixus/Lariska/v${VERSION}/packaging/systemd/lariska.service" \
   | sudo tee /etc/systemd/system/lariska.service >/dev/null
@@ -118,7 +118,7 @@ The hardened unit writes state under `/var/lib/lariska`. Native packages install
 Choose `aarch64-apple-darwin` for Apple Silicon or `x86_64-apple-darwin` for Intel.
 
 ```bash
-VERSION=0.4.0
+VERSION=0.5.0
 TARGET=aarch64-apple-darwin
 curl -fLO "https://github.com/onixus/Lariska/releases/download/v${VERSION}/lariska-v${VERSION}-${TARGET}.tar.gz"
 curl -fLO "https://github.com/onixus/Lariska/releases/download/v${VERSION}/lariska-v${VERSION}-${TARGET}.tar.gz.sha256"
@@ -141,7 +141,7 @@ sudo install -d -m 0700 "/Library/Application Support/Lariska/state"
 sudo install -d -m 0755 /Library/Logs/Lariska
 sudo install -m 0600 provisioning.key "/Library/Application Support/Lariska/provisioning.key"
 sudo install -m 0600 lariska.toml "/Library/Application Support/Lariska/lariska.toml"
-VERSION=0.4.0
+VERSION=0.5.0
 sudo curl -fsSL \
   "https://raw.githubusercontent.com/onixus/Lariska/v${VERSION}/packaging/launchd/com.shapoclyack.lariska.plist" \
   -o /Library/LaunchDaemons/com.shapoclyack.lariska.plist
@@ -161,7 +161,7 @@ Release archives are not yet signed/notarized, so test Gatekeeper behavior in th
 Download the `x86_64-pc-windows-msvc` ZIP and matching `.sha256` file from the latest release. From an elevated Command Prompt:
 
 ```bat
-certutil -hashfile lariska-v0.4.0-x86_64-pc-windows-msvc.zip SHA256
+certutil -hashfile lariska-v0.5.0-x86_64-pc-windows-msvc.zip SHA256
 install-lariska.cmd https://shapoclyack.example.com octo-pk-...
 ```
 
@@ -203,7 +203,7 @@ Service logs are written to:
 type C:\ProgramData\Lariska\state\lariska.log
 ```
 
-The Windows service integration and installer are cross-compiled and reviewed; validate them on a real Service Control Manager and endpoint-management stack before a production rollout. Current notes are in [`packaging/windows/README.md`](../packaging/windows/README.md).
+The native MSI lifecycle is exercised on real Windows CI runners. The legacy batch/archive installer below has a separate configuration and permission model; validate it on the target endpoint-management stack before rollout. Current notes are in [`packaging/windows/README.md`](../packaging/windows/README.md).
 
 ## 6. Verify the connection
 

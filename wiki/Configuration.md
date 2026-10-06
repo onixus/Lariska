@@ -118,3 +118,7 @@ lariska check-config --config /path/to/lariska.toml
 ```
 
 The command confirms parsed configuration without printing the provisioning key. It does not prove network reachability or that the key is accepted; registration does that when the service starts.
+
+## Native update policy (0.5.0)
+
+The administrator-owned `[updates]` section selects the native package kind, download limit, health timeout, history bound and local revocable Ed25519 keyring. Self-signed MSI/PKG requires explicit local signer pins and native certificate trust. Provision a matching-version signed rollback seed before starting the watchdog. Remote policy cannot modify this trust configuration. See [Signed native updates](../docs/SIGNED_UPDATES.md) for complete settings and commands.

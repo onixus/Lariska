@@ -103,25 +103,11 @@ Intervals and log levels are validated locally and applied atomically. Remote po
 
 ## Update security
 
-Current controls:
+Managed updates require a locally trusted Ed25519 manifest binding version, platform, native package kind, size, digest, expiry and sequence. Downloads stream to bounded staging; authenticated API requests refuse redirects. Server policy cannot add keys or authorize downgrades.
 
-- same-origin update path joined to the configured server URL;
-- target-triple verification;
-- HTTPS requirement by default;
-- SHA-256 verification;
-- staging before replacement;
-- retained previous executable and restore attempt after failed swap.
+An independent privileged watchdog repeats verification, installs through the native package manager and requires authenticated new-version health. Failed health restores the protected previous signed package. The persisted anti-rollback floor and consumed transaction nonces survive restart. The endpoint runs unprivileged; administrator-owned trust and an initial rollback seed are required.
 
-Residual risks:
-
-- the digest is currently supplied by the same control plane as the artifact;
-- there is no embedded-key signature over a release manifest;
-- download size enforcement and streaming need final hardening;
-- package/service permissions may prevent safe replacement;
-- post-restart health rollback is not automated;
-- anti-rollback policy is not complete.
-
-The production target is a signed manifest, streaming hash/size enforcement, native package installation, health acknowledgement, and automatic rollback.
+MSI and PKG signatures currently use explicitly pinned self-signed certificates; macOS packages are not notarized. Archive binaries remain unsigned. See [Signed native updates](../docs/SIGNED_UPDATES.md) for enrollment, certificate trust and recovery.
 
 ## Supply-chain controls
 
@@ -136,7 +122,7 @@ CI includes:
 - APEX Architecture Contract validation;
 - cross-repository inventory fixture validation.
 
-Future production releases should add artifact signing, build provenance/attestation, signed Windows binaries/MSI, and macOS signing/notarization.
+Native manifests and MSI/PKG signing are implemented. Public-CA signing, macOS notarization and build provenance/attestation remain outstanding.
 
 ## Reporting a vulnerability
 

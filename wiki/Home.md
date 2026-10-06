@@ -79,12 +79,14 @@ Supported today:
 - Python, Node.js, and Java runtime metadata;
 - Linux, Windows, and macOS native service modes.
 
+Schema v2 installation identity, source completeness and signed native updates with automatic health rollback are available in 0.5.0. See [Inventory v2](../docs/INVENTORY_V2.md) and [Signed native updates](../docs/SIGNED_UPDATES.md).
+
 Not yet complete:
 
 - side-by-side installation identity in schema v1;
-- source-aware partial snapshot carry-forward;
+- public-CA platform signing and macOS notarization;
 - Snap, Flatpak, MSIX/AppX, macOS receipts, and additional runtime ecosystems;
-- signed release manifests and automatic update health rollback;
+- build provenance/attestation;
 - zstd wire transport and delta submission;
 - published endpoint-impact benchmark baselines.
 

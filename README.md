@@ -4,7 +4,7 @@
 
 Lariska is a lightweight, cross-platform endpoint inventory agent for the [Shapoclyack](https://github.com/onixus/Shapoclyack) platform. It inventories operating-system and runtime packages, classifies the host environment, and delivers authoritative endpoint snapshots without turning a workstation into an unwilling benchmark machine.
 
-The source tree currently identifies itself as version **0.4.0**.
+The source tree currently identifies itself as version **0.5.0**.
 
 ## What it does
 
@@ -17,7 +17,7 @@ The source tree currently identifies itself as version **0.4.0**.
 | Scheduling | Deterministic fleet jitter, no overlapping scans, longer intervals on battery, managed intervals without restart |
 | Local impact | Background/idle priority, trusted command paths, bounded command output, bounded metadata reads, persistent collector cache |
 | Delivery | Compressed durable local spool, one-at-a-time recovery, independent delivery worker, retry/backoff, quarantine, crash recovery |
-| Security | TLS by default, pseudonymized platform identifiers, secret-safe logs, validated remote settings, SHA-256 checked upgrades |
+| Security | TLS by default, pseudonymized platform identifiers, secret-safe logs, validated remote settings, Ed25519-signed native upgrades with health rollback |
 
 ## Runtime architecture
 
@@ -40,7 +40,7 @@ The important separation is deliberate:
 1. The inventory scheduler performs one bounded collection at a time.
 2. Unchanged collectors can reuse a versioned persistent cache until the configured full-refresh deadline.
 3. Schema v2 reports completeness independently for each source; the server keeps prior effective data for failed/partial sources while healthy sources update. Older servers retain the authoritative-only v1 fallback.
-4. An authoritative snapshot is atomically added to the local spool.
+4. A negotiated v2 snapshot, or an authoritative v1 snapshot, is atomically added to the local spool.
 5. A dedicated worker owns authentication, HTTP retry, and spool draining. Network failure does not stretch the collection cycle.
 
 See [Architecture](wiki/Architecture.md) for the module map, invariants, and data flow.
@@ -84,7 +84,7 @@ For systemd, launchd, Windows SCM installation, file locations, and verification
 
 ## Operational properties
 
-- **Authoritative-only daemon submission.** A timeout, panic, unreadable registry branch, or failed package-manager command prevents publication of that cycle.
+- **Source-aware daemon submission.** Schema v2 reports degraded sources without authorizing removals; the v1 fallback refuses the whole incomplete cycle.
 - **Bounded memory and disk use.** Command output, metadata files, cache entries, HTTP bodies, compressed spool input, and decompressed spool output have explicit ceilings.
 - **Crash-safe delivery.** A snapshot is persisted before delivery and removed only after acknowledgement.
 - **Persistent unchanged-state suppression.** The last accepted semantic digest survives restarts, and identical pending state is not repeatedly enqueued.
@@ -115,6 +115,8 @@ These are current engineering boundaries, not marketing punctuation marks:
 - [Development](wiki/Development.md)
 - [Technical plan](Plan.md)
 - [Russian work plan](WORKPLAN_RU.md)
+- [Inventory v2](docs/INVENTORY_V2.md)
+- [Signed native updates](docs/SIGNED_UPDATES.md)
 - [Release procedures](docs/RELEASE.md)
 - [Changelog](CHANGELOG.md)
 

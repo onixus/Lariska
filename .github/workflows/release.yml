@@ -56,7 +56,7 @@ jobs:
           echo "linker = \"${{ matrix.cross_linker }}\"" >> .cargo/config.toml
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package (tar.gz)
         if: matrix.archive_ext == 'tar.gz'
