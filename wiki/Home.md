@@ -61,7 +61,7 @@ Use the complete [installation guide](../docs/INSTALL.md) for systemd, launchd, 
 
 ## Current behavior at a glance
 
-- The daemon publishes only authoritative snapshots. A failed required collector does not erase server-side software state.
+- Schema v2 publishes source completeness; v1 refuses incomplete cycles. A failed collector does not authorize software removals.
 - Repeated scans use a bounded persistent cache when source fingerprints are unchanged.
 - Inventory scheduling is jittered, non-overlapping, and less frequent on battery.
 - Snapshots are written to a compressed local spool before delivery.

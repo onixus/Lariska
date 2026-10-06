@@ -103,22 +103,14 @@ When schema v1 encounters multiple versions with the same product comparison key
 
 ## Completeness examples
 
-| Situation | Diagnostic output | Daemon submission |
+| Situation | Schema v1 | Negotiated schema v2 |
 | --- | --- | --- |
-| Homebrew is not installed | Other sources, no failure | Allowed |
-| `dpkg-query` times out | Partial entries plus warning | Blocked |
-| One Windows uninstall entry cannot be opened | Remaining entries plus warning | Blocked |
-| No user profiles are loaded on a Windows server | System entries plus coverage warning | Allowed |
-| Runtime metadata file exceeds its limit | File skipped | Depends on collector-level error policy; warnings remain bounded |
-| Cache document is corrupt | Cache ignored, fresh collection attempted | Allowed only if fresh result completes |
+| Homebrew is not installed | Other sources can publish | Source is `not_applicable` |
+| `dpkg-query` times out | Incomplete cycle blocked | Degraded source preserved on server |
+| Windows registry entry cannot be read or a profile hive is unloaded | Incomplete cycle blocked | Registry/MSI source degraded; CBS independent |
+| Runtime metadata is unreadable or oversized | Incomplete cycle blocked | Runtime source degraded |
+| Cache document is corrupt | Fresh collection attempted | Fresh collection attempted; status reported |
 
-## Planned v2 behavior
+## Schema v2 behavior
 
-Schema v2 will replace the all-or-nothing snapshot rule with per-source status:
-
-- `complete`;
-- `partial`;
-- `failed`;
-- `not_applicable`.
-
-Shapoclyack will then carry forward the last complete set for degraded sources while accepting healthy source updates. Removal events will be legal only for a source that completed authoritatively.
+Sources report `complete`, `partial`, `failed` or `not_applicable`, with bounded diagnostics and retained last-complete timestamps. Compatible Shapoclyack carries forward effective inventory for degraded sources while accepting healthy source updates. Only a complete source observation authorizes removals. See [Inventory v2](../docs/INVENTORY_V2.md).
