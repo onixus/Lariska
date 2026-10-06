@@ -1,4 +1,4 @@
-use crate::model::SoftwareEntry;
+use crate::model::{CollectionSource, CollectionStatus, SoftwareEntry, SoftwareSource};
 use std::time::{Duration, Instant};
 
 mod cache;
@@ -36,6 +36,8 @@ pub struct CollectorResult {
     pub entries: Vec<SoftwareEntry>,
     pub warnings: Vec<String>,
     pub complete: bool,
+    #[serde(default)]
+    pub sources: Vec<CollectionSource>,
 }
 
 impl Default for CollectorResult {
@@ -44,16 +46,75 @@ impl Default for CollectorResult {
             entries: Vec::new(),
             warnings: Vec::new(),
             complete: true,
+            sources: Vec::new(),
         }
     }
 }
 
 impl CollectorResult {
+    pub(crate) fn with_source(mut self, source: SoftwareSource) -> Self {
+        let status = if self.complete {
+            CollectionStatus::Complete
+        } else if self.entries.is_empty() {
+            CollectionStatus::Failed
+        } else {
+            CollectionStatus::Partial
+        };
+        self.sources.push(CollectionSource::new(
+            source,
+            status,
+            (!self.complete).then_some(
+                self.warnings
+                    .iter()
+                    .rev()
+                    .find(|warning| {
+                        warning.len() <= 64
+                            && warning
+                                .chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    })
+                    .map(String::as_str)
+                    .unwrap_or("collection_failed"),
+            ),
+        ));
+        self
+    }
+
+    pub(crate) fn not_applicable(source: SoftwareSource) -> Self {
+        Self {
+            sources: vec![CollectionSource::new(
+                source,
+                CollectionStatus::NotApplicable,
+                None,
+            )],
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn failed(source: SoftwareSource, code: &str) -> Self {
+        Self {
+            complete: false,
+            warnings: vec![format!("{} collector failed: {code}", source.as_str())],
+            sources: vec![CollectionSource::new(
+                source,
+                CollectionStatus::Failed,
+                Some(code),
+            )],
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn mark_failed(&mut self, code: &str) {
+        self.complete = false;
+        self.warnings.push(code.to_string());
+    }
+
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn merge(&mut self, mut other: CollectorResult) {
         self.entries.append(&mut other.entries);
         self.warnings.append(&mut other.warnings);
         self.complete &= other.complete;
+        self.sources.append(&mut other.sources);
     }
 }
 
@@ -94,6 +155,7 @@ pub async fn collect_all_with_timeout(timeout: Duration) -> CollectorResult {
                     "software collection is not supported on this operating system".to_string(),
                 ],
                 complete: false,
+                sources: Vec::new(),
             }
         }
     };
@@ -103,12 +165,16 @@ pub async fn collect_all_with_timeout(timeout: Duration) -> CollectorResult {
     // short scan with low peak I/O is preferable to three ecosystems racing
     // over the endpoint disk.
     match tokio::task::spawn_blocking(runtimes::collect_all_runtimes).await {
-        Ok(runtime_entries) => result.entries.extend(runtime_entries),
+        Ok(runtime_result) => result.merge(runtime_result),
         Err(error) => {
-            result.complete = false;
-            result
-                .warnings
-                .push(format!("runtime collectors panicked: {error}"));
+            tracing::warn!(%error, "runtime collectors panicked");
+            for source in [
+                SoftwareSource::Pip,
+                SoftwareSource::Npm,
+                SoftwareSource::Java,
+            ] {
+                result.merge(CollectorResult::failed(source, "collector_panicked"));
+            }
         }
     }
 
@@ -317,6 +383,7 @@ mod tests {
             entries: Vec::new(),
             warnings: vec!["collector failed".to_string()],
             complete: false,
+            sources: Vec::new(),
         });
 
         assert!(!aggregate.complete);

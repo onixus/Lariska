@@ -3,21 +3,22 @@
 ## What Lariska collects
 
 Sent to Shapoclyack on every accepted inventory snapshot (`POST
-/api/endpoint/inventory`, schema v1):
+/api/v1/endpoint/inventory`, negotiated schema v1/v2):
 
 - **Endpoint identity**: a random, locally-generated `agent_id`
   (`agent_<32 hex>`, never derived from hardware) plus one hashed platform
   identifier per endpoint (`bios_uuid_hash` — see below).
 - **Hostname**, OS family/name/version/architecture, agent version.
 - **Installed software**: name, version, publisher, architecture, source
-  (`apt`/`dpkg`/`rpm`/`winreg`/`msi`/`brew`/`other`), and install location
-  (a filesystem path, which on macOS/Windows can reveal a local username if
-  software is installed under a home directory).
+  and per-installation identity in v2. Native package IDs, scope and opaque
+  endpoint-scoped installation instance hashes preserve side-by-side installs.
+  Raw filesystem paths and user SIDs are absent from v2. The legacy v1 shape
+  permits install locations, though v2-to-v1 conversion omits raw paths.
 - Optional operator-supplied `labels` (e.g. site/environment) — none are set
   by default.
 - `collector_warnings`: short diagnostic strings about incomplete collection
-  (e.g. "no supported Linux package manager found"), never raw command
-  output or full inventories.
+  expressed as bounded source diagnostic codes in v2, never raw command
+  output or full inventories. Detailed errors can appear in local operational logs.
 
 **Never collected or sent**: raw machine identifiers (MAC address, hardware
 serial, BIOS UUID) — only a one-way SHA-256 hash of one such identifier is

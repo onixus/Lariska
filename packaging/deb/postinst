@@ -14,6 +14,12 @@ chown root:lariska /etc/lariska
 chown lariska:lariska /var/lib/lariska
 chmod 0750 /etc/lariska /var/lib/lariska
 
+install -d -m0700 -o root -g root /var/lib/lariska-updater
+if [ ! -e /var/lib/lariska-updater/supervisor ]; then
+    install -m0700 -o root -g root /usr/libexec/lariska-updater /var/lib/lariska-updater/supervisor
+fi
+# The stable watchdog must survive replacing or failing the endpoint package.
+# Do not restart it during an upgrade.
 systemctl daemon-reload || true
 
 #DEBHELPER#

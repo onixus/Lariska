@@ -4,6 +4,29 @@ All notable changes to the Lariska endpoint inventory agent will be documented i
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Negotiated inventory schema v2 with endpoint-scoped installation identities,
+  per-source completeness and retained last-complete timestamps. Side-by-side
+  installations remain distinct; older servers keep the conservative v1 path.
+- Signed Ed25519 native-package manifests with a local revocable keyring,
+  bounded streaming downloads, persistent anti-rollback floors and explicit
+  local emergency recovery policy.
+- An independent privileged native updater with protected staging, durable
+  transaction history, heartbeat health acknowledgement and previous-package
+  rollback. The endpoint service remains unprivileged.
+- Native deb/RPM, MSI and macOS package build and lifecycle CI. Requested
+  self-signed Windows/macOS trust is locally pinned; macOS notarization is not
+  available with these self-signed certificates. Native lifecycle validation
+  is required before delivery.
+
+### Changed
+- Authenticated API and update requests refuse redirects to prevent an alternate
+  origin or weaker transport from receiving credentials or update traffic.
+- Native update policy requires a signed release envelope; remote responses
+  cannot add trust keys or authorize a downgrade.
+
 ## [0.4.0] - 2026-09-23
 
 ### Changed

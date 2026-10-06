@@ -31,6 +31,14 @@
     {
       "path": "tests/fixtures/inventory_v1.json",
       "kind": "fixture"
+    },
+    {
+      "path": "tests/fixtures/inventory_v2.json",
+      "kind": "fixture"
+    },
+    {
+      "path": "tests/fixtures/signed_manifest_v1.json",
+      "kind": "fixture"
     }
   ],
   "resources": {

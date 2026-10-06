@@ -1,5 +1,7 @@
 use super::{non_empty, CollectorResult};
-use crate::model::{SoftwareEntry, SoftwareSource};
+use crate::model::{
+    CollectionSource, CollectionStatus, InstallationScope, SoftwareEntry, SoftwareSource,
+};
 use std::collections::BTreeSet;
 use std::time::Duration;
 use winreg::enums::{HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ};
@@ -47,10 +49,18 @@ pub async fn collect(_timeout: Duration) -> CollectorResult {
     // loop.
     tokio::task::spawn_blocking(collect_sync)
         .await
-        .unwrap_or_else(|error| CollectorResult {
-            entries: Vec::new(),
-            warnings: vec![format!("windows registry collector panicked: {error}")],
-            complete: false,
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "windows registry collector panicked");
+            let mut result = CollectorResult::failed(SoftwareSource::Winreg, "collector_panicked");
+            result.merge(CollectorResult::failed(
+                SoftwareSource::Msi,
+                "collector_panicked",
+            ));
+            result.merge(CollectorResult::failed(
+                SoftwareSource::Kb,
+                "collector_panicked",
+            ));
+            result
         })
 }
 
@@ -63,8 +73,14 @@ fn collect_sync() -> CollectorResult {
     for (subkey_path, architecture) in UNINSTALL_KEYS {
         match hklm.open_subkey_with_flags(subkey_path, KEY_READ) {
             Ok(uninstall_key) => {
-                complete &=
-                    collect_from_key(&uninstall_key, architecture, &mut entries, &mut warnings)
+                complete &= collect_from_key(
+                    &uninstall_key,
+                    architecture,
+                    InstallationScope::System,
+                    subkey_path,
+                    &mut entries,
+                    &mut warnings,
+                )
             }
             // The Wow6432Node view does not exist on 32-bit-only Windows —
             // that is expected, not a collector failure.
@@ -76,18 +92,45 @@ fn collect_sync() -> CollectorResult {
         }
     }
 
-    complete &= collect_user_scope(&mut entries, &mut warnings);
-    complete &= collect_updates(&hklm, &mut entries, &mut warnings);
+    let (user_complete, inactive_profiles) = collect_user_scope(&mut entries, &mut warnings);
+    complete &= user_complete;
+    let registry_complete = complete;
+    let updates_complete = collect_updates(&hklm, &mut entries, &mut warnings);
+    complete &= updates_complete;
 
     if entries.is_empty() && warnings.is_empty() {
         complete = false;
         warnings.push("no entries found under either uninstall registry view".to_string());
     }
 
+    // Inactive profiles are a coverage gap, not a failed read: the snapshot is
+    // still authoritative for v1, while v2 keeps registry sources Partial so a
+    // logout does not manufacture removals of per-user installs.
+    let source_state = |source, healthy: bool, gap: bool| {
+        let status = if healthy && !gap {
+            CollectionStatus::Complete
+        } else if entries.iter().any(|entry| entry.source == source) {
+            CollectionStatus::Partial
+        } else {
+            CollectionStatus::Failed
+        };
+        let code = if !healthy {
+            Some("collection_failed")
+        } else {
+            gap.then_some("inactive_user_profile")
+        };
+        CollectionSource::new(source, status, code)
+    };
+    let sources = vec![
+        source_state(SoftwareSource::Winreg, registry_complete, inactive_profiles),
+        source_state(SoftwareSource::Msi, registry_complete, inactive_profiles),
+        source_state(SoftwareSource::Kb, updates_complete, false),
+    ];
     CollectorResult {
         entries,
         warnings,
         complete,
+        sources,
     }
 }
 
@@ -103,10 +146,15 @@ fn collect_sync() -> CollectorResult {
 /// passed over in silence, so the gap is in the snapshot and not only in this
 /// comment. Mounting every profile's `NTUSER.DAT` is the alternative, and is not
 /// something a background inventory agent should be doing to a machine.
-fn collect_user_scope(entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<String>) -> bool {
+/// Returns `(complete, inactive_profiles)`.
+fn collect_user_scope(
+    entries: &mut Vec<SoftwareEntry>,
+    warnings: &mut Vec<String>,
+) -> (bool, bool) {
     let users = RegKey::predef(HKEY_USERS);
-    let mut profiles = 0usize;
+    let mut profiles = BTreeSet::new();
     let mut complete = true;
+    let mut inactive_profiles = false;
 
     for name in users.enum_keys() {
         let name = match name {
@@ -128,12 +176,19 @@ fn collect_user_scope(entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<Strin
                 continue;
             }
         };
-        profiles += 1;
+        profiles.insert(name.clone());
 
         for (subkey_path, architecture) in USER_UNINSTALL_KEYS {
             match hive.open_subkey_with_flags(subkey_path, KEY_READ) {
                 Ok(uninstall_key) => {
-                    complete &= collect_from_key(&uninstall_key, architecture, entries, warnings)
+                    complete &= collect_from_key(
+                        &uninstall_key,
+                        architecture,
+                        InstallationScope::User,
+                        &format!("{name}:{subkey_path}"),
+                        entries,
+                        warnings,
+                    )
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -146,16 +201,36 @@ fn collect_user_scope(entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<Strin
         }
     }
 
-    if profiles == 0 {
-        // This is a coverage limitation, not a failed read. Treating it as a
-        // fatal collection failure would prevent unattended Windows servers
-        // from ever reporting their system-wide software inventory.
-        warnings.push(
-            "no user profiles are loaded, so per-user installs were not collected".to_string(),
-        );
+    // Inactive user hives are invisible. Declaring the source complete would
+    // manufacture removals when somebody logs out, so protect its prior set.
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    match hklm.open_subkey_with_flags(
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList",
+        KEY_READ,
+    ) {
+        Ok(profile_list) => {
+            for profile in profile_list.enum_keys() {
+                match profile {
+                    Ok(sid) if is_user_profile_sid(&sid) && !profiles.contains(&sid) => {
+                        inactive_profiles = true;
+                        warnings.push("an inactive user profile was not collected".to_string());
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        complete = false;
+                        warnings.push("user profile list unreadable".to_string());
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            complete = false;
+            warnings.push("user profile list unreadable".to_string());
+        }
     }
 
-    complete
+    (complete, inactive_profiles)
 }
 
 /// Whether a `HKEY_USERS` subkey is a real user's profile.
@@ -192,9 +267,28 @@ fn looks_like_product_guid(name: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
+fn read_optional_string(
+    key: &RegKey,
+    name: &str,
+    complete: &mut bool,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    match key.get_value::<String, _>(name) {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => {
+            *complete = false;
+            warnings.push("registry_value_unreadable".to_string());
+            None
+        }
+    }
+}
+
 fn collect_from_key(
     uninstall_key: &RegKey,
     architecture: &str,
+    scope: InstallationScope,
+    private_context: &str,
     entries: &mut Vec<SoftwareEntry>,
     warnings: &mut Vec<String>,
 ) -> bool {
@@ -221,27 +315,37 @@ fn collect_from_key(
 
         // Patches/system components without a DisplayName are not
         // user-facing software; skip them rather than emit a blank entry.
-        let display_name: Option<String> = subkey.get_value("DisplayName").ok();
+        let display_name = read_optional_string(&subkey, "DisplayName", &mut complete, warnings);
         let Some(display_name) = display_name.as_deref().and_then(non_empty) else {
             continue;
         };
 
-        let version: Option<String> = subkey.get_value("DisplayVersion").ok();
-        let publisher: Option<String> = subkey.get_value("Publisher").ok();
-        let install_location: Option<String> = subkey.get_value("InstallLocation").ok();
+        let version = read_optional_string(&subkey, "DisplayVersion", &mut complete, warnings);
+        let publisher = read_optional_string(&subkey, "Publisher", &mut complete, warnings);
+        let install_location =
+            read_optional_string(&subkey, "InstallLocation", &mut complete, warnings);
 
-        entries.push(SoftwareEntry {
-            name: display_name,
-            version: version.as_deref().and_then(non_empty),
-            publisher: publisher.as_deref().and_then(non_empty),
-            architecture: Some(architecture.to_string()),
-            source: if is_msi_entry(&subkey, &name) {
-                SoftwareSource::Msi
-            } else {
-                SoftwareSource::Winreg
-            },
-            install_location: install_location.as_deref().and_then(non_empty),
-        });
+        let msi = is_msi_entry(&subkey, &name);
+        entries.push(
+            SoftwareEntry {
+                name: display_name,
+                version: version.as_deref().and_then(non_empty),
+                publisher: publisher.as_deref().and_then(non_empty),
+                architecture: Some(architecture.to_string()),
+                source: if msi {
+                    SoftwareSource::Msi
+                } else {
+                    SoftwareSource::Winreg
+                },
+                install_location: install_location.as_deref().and_then(non_empty),
+                ..SoftwareEntry::default()
+            }
+            .with_instance(
+                msi.then(|| name.clone()),
+                scope,
+                &format!("{private_context}:{architecture}:{name}"),
+            ),
+        );
     }
 
     complete
@@ -314,21 +418,31 @@ fn collect_updates(
                 continue;
             }
         };
-        if package.get_value::<u32, _>("CurrentState").ok() != Some(CBS_STATE_INSTALLED) {
-            continue;
+        match package.get_value::<u32, _>("CurrentState") {
+            Ok(CBS_STATE_INSTALLED) => {}
+            Ok(_) => continue,
+            Err(_) => {
+                complete = false;
+                warnings.push("registry_value_unreadable".to_string());
+                continue;
+            }
         }
         seen.insert(kb.clone());
-        entries.push(SoftwareEntry {
-            name: kb,
-            // A KB has no version of its own: the identifier *is* the version.
-            // Repeating it would make every update look like a product whose
-            // version never changes.
-            version: None,
-            publisher: Some("Microsoft Corporation".to_string()),
-            architecture: None,
-            source: SoftwareSource::Kb,
-            install_location: None,
-        });
+        entries.push(
+            SoftwareEntry {
+                name: kb.clone(),
+                // A KB has no version of its own: the identifier *is* the version.
+                // Repeating it would make every update look like a product whose
+                // version never changes.
+                version: None,
+                publisher: Some("Microsoft Corporation".to_string()),
+                architecture: None,
+                source: SoftwareSource::Kb,
+                install_location: None,
+                ..SoftwareEntry::default()
+            }
+            .with_instance(Some(kb.clone()), InstallationScope::System, &kb),
+        );
     }
 
     if seen.is_empty() {

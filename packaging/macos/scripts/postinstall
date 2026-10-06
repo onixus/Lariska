@@ -1,0 +1,82 @@
+#!/bin/sh
+set -eu
+root='/Library/Application Support/LariskaUpdater'
+config_root='/Library/Application Support/Lariska'
+state="$config_root/state"
+# Only an empty legacy root-owned directory can change ownership automatically.
+# Never traverse endpoint-controlled state to modify child inode ownership.
+legacy_state_needs_migration() {
+  [ "$1" -eq 0 ] || return 1
+  first_entry=$(/usr/bin/find "$2" -mindepth 1 -maxdepth 1 -print -quit) || {
+    echo 'Cannot inspect legacy Lariska state; offline administrator migration is required' >&2
+    exit 1
+  }
+  [ -n "$first_entry" ]
+}
+if [ -L "$root" ] || [ -L "$root/supervisor" ] || [ -L "$config_root" ] || [ -L "$config_root/state" ] || [ -L /Library/Logs/Lariska ]; then
+  echo 'Lariska directories must not be symlinks' >&2
+  exit 1
+fi
+/usr/bin/install -d -o root -g wheel -m0700 "$root"
+if [ ! -e "$root/supervisor" ]; then
+  /usr/bin/install -o root -g wheel -m0700 /usr/local/libexec/lariska-updater "$root/supervisor"
+fi
+# Allocate a hidden local service UID/GID, disjoint from existing users/groups.
+if ! /usr/bin/dscl . -read /Groups/_lariska >/dev/null 2>&1; then
+  used=$(/usr/bin/dscl . -list /Users UniqueID; /usr/bin/dscl . -list /Groups PrimaryGroupID)
+  gid=201
+  while printf '%s\n' "$used" | /usr/bin/awk -v id="$gid" '$NF == id {found=1} END {exit !found}'; do
+    gid=$((gid + 1))
+    if [ "$gid" -ge 500 ]; then echo 'No available Lariska service UID/GID' >&2; exit 1; fi
+  done
+  /usr/bin/dscl . -create /Groups/_lariska
+  /usr/bin/dscl . -create /Groups/_lariska PrimaryGroupID "$gid"
+fi
+gid=$(/usr/bin/dscl . -read /Groups/_lariska PrimaryGroupID | /usr/bin/awk '{print $2}')
+if [ "$gid" -lt 200 ] || [ "$gid" -ge 500 ]; then
+  echo 'Existing _lariska group is not a dedicated service group' >&2; exit 1
+fi
+if ! /usr/bin/dscl . -read /Users/_lariska >/dev/null 2>&1; then
+  uid=$gid
+  while /usr/bin/dscl . -list /Users UniqueID | /usr/bin/awk -v id="$uid" '$NF == id {found=1} END {exit !found}'; do
+    uid=$((uid + 1))
+    if [ "$uid" -ge 500 ]; then echo 'No available Lariska service UID' >&2; exit 1; fi
+  done
+  /usr/bin/dscl . -create /Users/_lariska
+  /usr/bin/dscl . -create /Users/_lariska UniqueID "$uid"
+  /usr/bin/dscl . -create /Users/_lariska PrimaryGroupID "$gid"
+  /usr/bin/dscl . -create /Users/_lariska UserShell /usr/bin/false
+  /usr/bin/dscl . -create /Users/_lariska NFSHomeDirectory /var/empty
+  /usr/bin/dscl . -create /Users/_lariska IsHidden 1
+  /usr/bin/dscl . -create /Users/_lariska Password '*'
+fi
+uid=$(/usr/bin/dscl . -read /Users/_lariska UniqueID | /usr/bin/awk '{print $2}')
+if [ "$uid" -lt 200 ] || [ "$uid" -ge 500 ]; then
+  echo 'Existing _lariska account is not a dedicated service account' >&2; exit 1
+fi
+/usr/bin/install -d -o root -g _lariska -m0750 "$config_root"
+if [ -e "$state" ]; then
+  if [ ! -d "$state" ]; then echo 'Lariska state must be a directory' >&2; exit 1; fi
+  state_owner=$(/usr/bin/stat -f '%u' "$state")
+  if legacy_state_needs_migration "$state_owner" "$state"; then
+    echo 'Root-owned Lariska state is not empty. Stop both launchd jobs and complete the offline state migration in docs/SIGNED_UPDATES.md before reinstalling. State ownership has not been changed.' >&2
+    exit 1
+  fi
+  if [ "$state_owner" -ne 0 ] && [ "$state_owner" -ne "$uid" ]; then
+    echo 'Lariska state belongs to an unexpected account; offline administrator migration is required' >&2
+    exit 1
+  fi
+fi
+/usr/bin/install -d -o _lariska -g _lariska -m0700 "$state"
+/usr/bin/install -d -o root -g wheel -m0750 /Library/Logs/Lariska
+# Preserve enrollment and existing native state without recursive ownership changes.
+for file in "$config_root/lariska.toml" "$config_root/provisioning.key"; do
+  if [ -L "$file" ]; then echo 'Lariska configuration must not be a symlink' >&2; exit 1; fi
+  if [ -f "$file" ] && [ ! -L "$file" ]; then
+    /usr/sbin/chown root:_lariska "$file"
+    /bin/chmod 0640 "$file"
+  fi
+done
+# Enrollment, rollback seeding and initial startup are administrator actions.
+# Never replace/restart the stable watchdog during endpoint package upgrades.
+exit 0

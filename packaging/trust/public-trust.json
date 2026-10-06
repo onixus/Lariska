@@ -1,0 +1,16 @@
+{
+  "key_id": "lariska-local-2026-10",
+  "public_key": "1860465df51eb4733c8baa24612ff1fbe2185eb9c68b45fd439bfe86398ade8f",
+  "certificates": {
+    "windows": {
+      "sha256": "0282f37800de085020f737b610f6cb4c992c71a2e192dd79e4007ecc003fc486",
+      "thumbprint": "4199732eca670b954199b4e77e3f472654b2e556",
+      "subject": "Lariska Local Code Signing"
+    },
+    "macos": {
+      "sha256": "bf4364446f41052ca0a822e7fd6e364d587c0be622bbeb79ca2c738284821360",
+      "thumbprint": "6e35ec7ac9bdcc717a74e2c4b609a553ad43e8d6",
+      "subject": "Lariska Local Installer"
+    }
+  }
+}

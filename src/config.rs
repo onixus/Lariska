@@ -31,6 +31,7 @@ pub struct Config {
     pub allow_insecure_updates: bool,
     pub inventory_full_refresh_interval: Duration,
     pub max_spool_entries: usize,
+    pub updates: crate::update::UpdateConfig,
 }
 
 impl fmt::Debug for Config {
@@ -52,6 +53,7 @@ impl fmt::Debug for Config {
             )
             .field("allow_insecure_updates", &self.allow_insecure_updates)
             .field("max_spool_entries", &self.max_spool_entries)
+            .field("updates", &self.updates)
             .finish()
     }
 }
@@ -71,6 +73,8 @@ struct FileConfig {
     allow_insecure_updates: Option<bool>,
     inventory_full_refresh_interval_secs: Option<u64>,
     max_spool_entries: Option<u64>,
+    #[serde(default)]
+    updates: crate::update::UpdateConfig,
 }
 
 impl Config {
@@ -136,12 +140,14 @@ impl Config {
             allow_insecure_updates,
             inventory_full_refresh_interval,
             max_spool_entries,
+            updates: values.updates,
         };
         config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.updates.validate().map_err(ConfigError::Invalid)?;
         if self.server_url.trim().is_empty() {
             return Err(ConfigError::Invalid("server_url is required".to_string()));
         }

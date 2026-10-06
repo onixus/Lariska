@@ -1,5 +1,5 @@
 use super::{non_empty, run_command, CollectorResult, CommandRunError};
-use crate::model::{SoftwareEntry, SoftwareSource};
+use crate::model::{InstallationScope, SoftwareEntry, SoftwareSource};
 use std::path::Path;
 use std::time::Duration;
 
@@ -28,19 +28,39 @@ pub async fn collect(timeout: Duration) -> CollectorResult {
     if should_probe_manager(dpkg_database, any_database) {
         if let Some(dpkg) = collect_dpkg(timeout).await {
             any_manager_present = true;
-            result.merge(dpkg);
+            result.merge(dpkg.with_source(SoftwareSource::Dpkg));
         }
     }
     if should_probe_manager(rpm_database, any_database) {
         if let Some(rpm) = collect_rpm(timeout).await {
             any_manager_present = true;
-            result.merge(rpm);
+            result.merge(rpm.with_source(SoftwareSource::Rpm));
         }
     }
     if should_probe_manager(pacman_database, any_database) {
         if let Some(pacman) = collect_pacman(timeout).await {
             any_manager_present = true;
-            result.merge(pacman);
+            result.merge(pacman.with_source(SoftwareSource::Pacman));
+        }
+    }
+
+    for source in [
+        SoftwareSource::Dpkg,
+        SoftwareSource::Rpm,
+        SoftwareSource::Pacman,
+    ] {
+        if !result.sources.iter().any(|state| state.source == source) {
+            let database_expected = match source {
+                SoftwareSource::Dpkg => dpkg_database,
+                SoftwareSource::Rpm => rpm_database,
+                SoftwareSource::Pacman => pacman_database,
+                _ => false,
+            };
+            result.merge(if database_expected {
+                CollectorResult::failed(source, "collector_missing")
+            } else {
+                CollectorResult::not_applicable(source)
+            });
         }
     }
 
@@ -85,6 +105,7 @@ async fn collect_dpkg(timeout: Duration) -> Option<CollectorResult> {
         entries: parse_tab_separated(&output, SoftwareSource::Dpkg),
         warnings: Vec::new(),
         complete: true,
+        sources: Vec::new(),
     })
 }
 
@@ -109,6 +130,7 @@ async fn collect_rpm(timeout: Duration) -> Option<CollectorResult> {
         entries: parse_tab_separated(&output, SoftwareSource::Rpm),
         warnings: Vec::new(),
         complete: true,
+        sources: Vec::new(),
     })
 }
 
@@ -130,16 +152,22 @@ async fn collect_pacman(timeout: Duration) -> Option<CollectorResult> {
             if name.trim().is_empty() {
                 return None;
             }
-            Some(SoftwareEntry {
-                name: name.to_string(),
-                version: version.and_then(non_empty),
-                publisher: None,
-                architecture: None,
-                // pacman is not in the server's closed source enum; bucket
-                // it as "other" rather than inventing a new literal.
-                source: SoftwareSource::from_raw("pacman"),
-                install_location: None,
-            })
+            Some(
+                SoftwareEntry {
+                    name: name.to_string(),
+                    version: version.and_then(non_empty),
+                    publisher: None,
+                    architecture: None,
+                    source: SoftwareSource::Pacman,
+                    install_location: None,
+                    ..SoftwareEntry::default()
+                }
+                .with_instance(
+                    Some(name.to_string()),
+                    InstallationScope::System,
+                    &format!("pacman:{name}"),
+                ),
+            )
         })
         .collect();
 
@@ -147,6 +175,7 @@ async fn collect_pacman(timeout: Duration) -> Option<CollectorResult> {
         entries,
         warnings: Vec::new(),
         complete: true,
+        sources: Vec::new(),
     })
 }
 
@@ -162,14 +191,32 @@ fn parse_tab_separated(output: &str, source: SoftwareSource) -> Vec<SoftwareEntr
             if name.trim().is_empty() {
                 return None;
             }
-            Some(SoftwareEntry {
-                name: name.to_string(),
-                version: version.and_then(non_empty),
-                publisher: publisher.and_then(non_empty),
-                architecture: architecture.and_then(non_empty),
-                source,
-                install_location: None,
-            })
+            Some(
+                SoftwareEntry {
+                    name: name.to_string(),
+                    version: version.and_then(non_empty),
+                    publisher: publisher.and_then(non_empty),
+                    architecture: architecture.and_then(non_empty),
+                    source,
+                    install_location: None,
+                    ..SoftwareEntry::default()
+                }
+                .with_instance(
+                    Some(name.to_string()),
+                    InstallationScope::System,
+                    &format!(
+                        "{}:{}:{}:{}",
+                        source.as_str(),
+                        name,
+                        architecture.unwrap_or(""),
+                        if source == SoftwareSource::Rpm {
+                            version.unwrap_or("")
+                        } else {
+                            ""
+                        }
+                    ),
+                ),
+            )
         })
         .collect()
 }
@@ -179,6 +226,7 @@ fn collector_failure(collector: &str, message: &str) -> CollectorResult {
         entries: Vec::new(),
         warnings: vec![format!("{collector} collector failed: {message}")],
         complete: false,
+        sources: Vec::new(),
     }
 }
 

@@ -2,6 +2,10 @@ use crate::api::{ApiClient, ApiError};
 use crate::auth::AuthClient;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::{
+    atomic::{AtomicU16, Ordering},
+    Arc,
+};
 
 const REGISTER_PATH: &str = "/api/v1/agent/register";
 const HEARTBEAT_PATH: &str = "/api/v1/agent/heartbeat";
@@ -29,6 +33,8 @@ struct AgentRegisterRequest<'a> {
     /// *scanning* agent's release line and reported every endpoint as
     /// permanently outdated, offering an upgrade to a different program.
     agent_kind: &'static str,
+    inventory_schema_versions: [u16; 2],
+    signed_updates: bool,
 }
 
 #[derive(Serialize)]
@@ -44,6 +50,8 @@ struct AgentHeartbeatRequest<'a> {
     /// binary, and handing an agent the wrong one is the failure mode worth
     /// designing out.
     platform: String,
+    inventory_schema_versions: [u16; 2],
+    signed_updates: bool,
     /// The management revision this process has already acted on, so the
     /// server's repeated decision is applied once rather than every minute.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +79,13 @@ pub struct AgentInfo {
     pub last_seen_at: Option<String>,
     #[serde(default)]
     pub online: bool,
+    /// Explicit capability; absence on older servers keeps schema v1.
+    #[serde(default = "legacy_schema_version")]
+    pub inventory_schema_version: u16,
+}
+
+fn legacy_schema_version() -> u16 {
+    1
 }
 
 /// Why the heartbeat loop ended.
@@ -105,11 +120,31 @@ struct HeartbeatResponse {
 pub struct HeartbeatClient {
     api: ApiClient,
     auth: AuthClient,
+    inventory_schema_version: Arc<AtomicU16>,
 }
 
 impl HeartbeatClient {
     pub fn new(api: ApiClient, auth: AuthClient) -> Self {
-        Self { api, auth }
+        Self {
+            api,
+            auth,
+            inventory_schema_version: Arc::new(AtomicU16::new(1)),
+        }
+    }
+
+    pub fn inventory_schema_version(&self) -> u16 {
+        self.inventory_schema_version.load(Ordering::Acquire)
+    }
+
+    fn record_capability(&self, info: &AgentInfo) {
+        self.inventory_schema_version.store(
+            if info.inventory_schema_version == 2 {
+                2
+            } else {
+                1
+            },
+            Ordering::Release,
+        );
     }
 
     pub async fn register(
@@ -125,10 +160,12 @@ impl HeartbeatClient {
             version,
             labels,
             agent_kind: "endpoint",
+            inventory_schema_versions: [1, 2],
+            signed_updates: true,
         };
 
         let token = self.auth.token().await?;
-        match self
+        let info: AgentInfo = match self
             .api
             .post_json(REGISTER_PATH, Some(&token), &body, None)
             .await
@@ -137,10 +174,12 @@ impl HeartbeatClient {
                 let token = self.auth.force_refresh().await?;
                 self.api
                     .post_json(REGISTER_PATH, Some(&token), &body, None)
-                    .await
+                    .await?
             }
-            other => other,
-        }
+            other => other?,
+        };
+        self.record_capability(&info);
+        Ok(info)
     }
 
     pub async fn heartbeat(
@@ -172,6 +211,8 @@ impl HeartbeatClient {
             current_job_id,
             detail,
             platform: crate::managed::target_triple(),
+            inventory_schema_versions: [1, 2],
+            signed_updates: true,
             applied_config_revision,
         };
 
@@ -189,6 +230,7 @@ impl HeartbeatClient {
             }
             other => other?,
         };
+        self.record_capability(&response.info);
         Ok((response.info, response.directive))
     }
 
@@ -223,6 +265,9 @@ impl HeartbeatClient {
                         .await
                     {
                         Ok((_, directive)) => {
+                            if let Err(error) = crate::update::ack_health(config) {
+                                tracing::warn!(%error, "could not acknowledge update health");
+                            }
                             applied = crate::managed::apply_settings(&directive, applied, runtime_tx);
 
                             // Logged on change only. The server repeats the
@@ -290,9 +335,9 @@ impl HeartbeatClient {
             }
         };
         match crate::managed::apply_update(update, config, &token, self.api.http()).await {
-            crate::managed::UpdateOutcome::Staged { version } => {
-                tracing::info!(%version, "new build installed; stopping so it can be started");
-                Some(LoopOutcome::Updated { version })
+            crate::managed::UpdateOutcome::Queued { version } => {
+                tracing::info!(%version, "signed update queued for the native package supervisor");
+                None
             }
             crate::managed::UpdateOutcome::Refused(reason) => {
                 // A refusal is a decision, not a fault: it is logged once per
@@ -330,6 +375,7 @@ mod contract_tests {
 
     fn test_client(server_uri: String, key_path: PathBuf) -> HeartbeatClient {
         let config = Config {
+            updates: Default::default(),
             server_url: server_uri,
             provisioning_key_file: key_path.clone(),
             state_dir: std::env::temp_dir(),
@@ -372,6 +418,53 @@ mod contract_tests {
             "status": "idle",
             "online": true
         })
+    }
+
+    #[tokio::test]
+    async fn explicit_v2_capability_is_shared_and_missing_capability_restores_v1() {
+        let server = MockServer::start().await;
+        mount_exchange(&server).await;
+        let mut body = agent_info_body();
+        body["inventory_schema_version"] = serde_json::json!(2);
+        Mock::given(method("POST"))
+            .and(path(REGISTER_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(HEARTBEAT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(agent_info_body()))
+            .mount(&server)
+            .await;
+        let key = write_temp_key("capability");
+        let client = test_client(server.uri(), key.clone());
+        let cloned = client.clone();
+        assert_eq!(cloned.inventory_schema_version(), 1);
+        client
+            .register("agent_test", "host", "0.4.0", &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(cloned.inventory_schema_version(), 2);
+        cloned
+            .heartbeat("agent_test", HeartbeatStatus::Idle, None, None)
+            .await
+            .unwrap();
+        assert_eq!(client.inventory_schema_version(), 1);
+        let requests = server.received_requests().await.unwrap();
+        let registration: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|request| request.url.path() == REGISTER_PATH)
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        assert_eq!(
+            registration["inventory_schema_versions"],
+            serde_json::json!([1, 2])
+        );
+        assert_eq!(registration["signed_updates"], true);
+        fs::remove_file(key).ok();
     }
 
     #[tokio::test]
@@ -454,6 +547,7 @@ mod managed_contract_tests {
         ));
         fs::write(&key_path, "bootstrap-key").unwrap();
         let config = Config {
+            updates: Default::default(),
             server_url: server.uri(),
             provisioning_key_file: key_path.clone(),
             state_dir: std::env::temp_dir(),

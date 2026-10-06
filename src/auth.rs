@@ -174,6 +174,7 @@ mod contract_tests {
             allow_insecure_updates: false,
             inventory_full_refresh_interval: Duration::from_secs(86_400),
             max_spool_entries: 200,
+            updates: Default::default(),
         }
     }
 

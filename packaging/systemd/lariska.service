@@ -18,7 +18,8 @@ Group=lariska
 # Filesystem layout. ConfigurationDirectory/StateDirectory create and own
 # /etc/lariska and /var/lib/lariska respectively (0750, owned by User/Group
 # above) on service start — no manual mkdir/chown needed.
-ConfigurationDirectory=lariska
+# Configuration and release trust keys are installed root:lariska, 0640.
+# The endpoint must not be able to edit the privileged updater's trust policy.
 StateDirectory=lariska
 UMask=0027
 

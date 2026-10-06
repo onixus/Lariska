@@ -380,6 +380,8 @@ fn newest_pending_digest(spool: &Spool) -> Option<String> {
 /// from the full parsed request body.
 fn content_digest(snapshot: &InventorySnapshot) -> String {
     let payload = serde_json::json!({
+        "schema_version": snapshot.schema_version,
+        "sources": snapshot.sources.iter().map(|source| serde_json::json!({"source": source.source, "status": source.status, "collector_version": source.collector_version, "diagnostic_code": source.diagnostic_code})).collect::<Vec<_>>(),
         "hostname": snapshot.hostname,
         "os_family": snapshot.os_family,
         "os_name": snapshot.os_name,
@@ -422,9 +424,27 @@ mod digest_tests {
                 architecture: None,
                 source: crate::model::SoftwareSource::Dpkg,
                 install_location: None,
+                ..SoftwareEntry::default()
             }],
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn digest_observes_source_degradation_but_ignores_collector_clock() {
+        let mut original = snapshot("snap", "2026-07-24T08:00:00Z");
+        original.schema_version = 2;
+        original.sources = vec![crate::model::CollectionSource::new(
+            crate::model::SoftwareSource::Dpkg,
+            crate::model::CollectionStatus::Complete,
+            None,
+        )];
+        let mut later = original.clone();
+        later.sources[0].collected_at = "2026-10-06T10:00:00Z".into();
+        later.sources[0].last_complete_at = Some("2026-10-06T10:00:00Z".into());
+        assert_eq!(content_digest(&original), content_digest(&later));
+        later.sources[0].status = crate::model::CollectionStatus::Failed;
+        assert_ne!(content_digest(&original), content_digest(&later));
     }
 
     #[test]
@@ -446,6 +466,7 @@ mod digest_tests {
             architecture: None,
             source: crate::model::SoftwareSource::Dpkg,
             install_location: None,
+            ..SoftwareEntry::default()
         });
 
         assert_ne!(content_digest(&a), content_digest(&b));
@@ -495,6 +516,7 @@ mod contract_tests {
             allow_insecure_updates: false,
             inventory_full_refresh_interval: Duration::from_secs(86_400),
             max_spool_entries: 200,
+            updates: Default::default(),
         };
         let api = ApiClient::new(&config).expect("api client should build");
         let auth = AuthClient::new(api.clone(), key_path, "agent_test".to_string());
@@ -543,6 +565,7 @@ mod contract_tests {
                 architecture: None,
                 source: crate::model::SoftwareSource::Dpkg,
                 install_location: None,
+                ..SoftwareEntry::default()
             }],
             Vec::new(),
         )
