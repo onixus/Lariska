@@ -862,6 +862,10 @@ impl SharedUpdateDir {
 #[cfg(not(unix))]
 struct SharedUpdateDir {
     path: PathBuf,
+    /// The state and mailbox directories stay open without write/delete
+    /// sharing, so the endpoint cannot rename either one or turn it into a
+    /// junction while privileged code resolves names beneath it.
+    _pins: Vec<File>,
 }
 #[cfg(not(unix))]
 impl SharedUpdateDir {
@@ -870,13 +874,11 @@ impl SharedUpdateDir {
         if create {
             fs::create_dir_all(&path).map_err(|e| e.to_string())?;
         }
-        if !fs::symlink_metadata(&path)
-            .map_err(|e| e.to_string())?
-            .is_dir()
-        {
-            return Err("shared update directory must not be a symlink".into());
+        let mut pins = Vec::new();
+        for directory in [config.state_dir.as_path(), path.as_path()] {
+            pins.extend(pin_directory(directory)?);
         }
-        Ok(Self { path })
+        Ok(Self { path, _pins: pins })
     }
     fn remove(&self, name: &str) -> Result<(), String> {
         match fs::remove_file(self.path.join(name)) {
@@ -891,6 +893,42 @@ impl SharedUpdateDir {
     fn write<T: Serialize>(&self, name: &str, value: &T, _public: bool) -> Result<(), String> {
         atomic_json(&self.path.join(name), value)
     }
+}
+#[cfg(windows)]
+fn pin_directory(path: &Path) -> Result<Option<File>, String> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_LIST_DIRECTORY: u32 = 0x1;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let file = OpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|e| format!("cannot pin {}: {e}", path.display()))?;
+    let attributes = file
+        .metadata()
+        .map_err(|e| e.to_string())?
+        .file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err("shared update directories must not be reparse points".into());
+    }
+    Ok(Some(file))
+}
+#[cfg(not(any(unix, windows)))]
+fn pin_directory(path: &Path) -> Result<Option<File>, String> {
+    if !fs::symlink_metadata(path)
+        .map_err(|e| e.to_string())?
+        .is_dir()
+    {
+        return Err("shared update directory must not be a symlink".into());
+    }
+    Ok(None)
 }
 pub fn validate_nonce(nonce: &str) -> Result<(), String> {
     if nonce.len() != 32

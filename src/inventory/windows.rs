@@ -92,7 +92,8 @@ fn collect_sync() -> CollectorResult {
         }
     }
 
-    complete &= collect_user_scope(&mut entries, &mut warnings);
+    let (user_complete, inactive_profiles) = collect_user_scope(&mut entries, &mut warnings);
+    complete &= user_complete;
     let registry_complete = complete;
     let updates_complete = collect_updates(&hklm, &mut entries, &mut warnings);
     complete &= updates_complete;
@@ -102,20 +103,28 @@ fn collect_sync() -> CollectorResult {
         warnings.push("no entries found under either uninstall registry view".to_string());
     }
 
-    let source_state = |source, healthy| {
-        let status = if healthy {
+    // Inactive profiles are a coverage gap, not a failed read: the snapshot is
+    // still authoritative for v1, while v2 keeps registry sources Partial so a
+    // logout does not manufacture removals of per-user installs.
+    let source_state = |source, healthy: bool, gap: bool| {
+        let status = if healthy && !gap {
             CollectionStatus::Complete
         } else if entries.iter().any(|entry| entry.source == source) {
             CollectionStatus::Partial
         } else {
             CollectionStatus::Failed
         };
-        CollectionSource::new(source, status, (!healthy).then_some("collection_failed"))
+        let code = if !healthy {
+            Some("collection_failed")
+        } else {
+            gap.then_some("inactive_user_profile")
+        };
+        CollectionSource::new(source, status, code)
     };
     let sources = vec![
-        source_state(SoftwareSource::Winreg, registry_complete),
-        source_state(SoftwareSource::Msi, registry_complete),
-        source_state(SoftwareSource::Kb, updates_complete),
+        source_state(SoftwareSource::Winreg, registry_complete, inactive_profiles),
+        source_state(SoftwareSource::Msi, registry_complete, inactive_profiles),
+        source_state(SoftwareSource::Kb, updates_complete, false),
     ];
     CollectorResult {
         entries,
@@ -137,10 +146,15 @@ fn collect_sync() -> CollectorResult {
 /// passed over in silence, so the gap is in the snapshot and not only in this
 /// comment. Mounting every profile's `NTUSER.DAT` is the alternative, and is not
 /// something a background inventory agent should be doing to a machine.
-fn collect_user_scope(entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<String>) -> bool {
+/// Returns `(complete, inactive_profiles)`.
+fn collect_user_scope(
+    entries: &mut Vec<SoftwareEntry>,
+    warnings: &mut Vec<String>,
+) -> (bool, bool) {
     let users = RegKey::predef(HKEY_USERS);
     let mut profiles = BTreeSet::new();
     let mut complete = true;
+    let mut inactive_profiles = false;
 
     for name in users.enum_keys() {
         let name = match name {
@@ -198,7 +212,7 @@ fn collect_user_scope(entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<Strin
             for profile in profile_list.enum_keys() {
                 match profile {
                     Ok(sid) if is_user_profile_sid(&sid) && !profiles.contains(&sid) => {
-                        complete = false;
+                        inactive_profiles = true;
                         warnings.push("an inactive user profile was not collected".to_string());
                     }
                     Ok(_) => {}
@@ -216,7 +230,7 @@ fn collect_user_scope(entries: &mut Vec<SoftwareEntry>, warnings: &mut Vec<Strin
         }
     }
 
-    complete
+    (complete, inactive_profiles)
 }
 
 /// Whether a `HKEY_USERS` subkey is a real user's profile.

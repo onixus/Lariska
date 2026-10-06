@@ -243,6 +243,18 @@ fn accept_request_with(
     if manifest.version == previous.manifest.version {
         return Err("the requested version is already installed".into());
     }
+    // A release that already failed its health window would otherwise be
+    // re-queued after every rollback restart and loop indefinitely.
+    if config.updates.emergency_version.as_deref() != Some(manifest.version.as_str())
+        && update::read_ledger(root)?.history.iter().any(|record| {
+            record.outcome == "rolled_back"
+                && record.reason != "interrupted_before_install"
+                && record.version == manifest.version
+                && record.sequence == manifest.sequence
+        })
+    {
+        return Err("the requested release was already rolled back".into());
+    }
     operations.verify_signature(config, &manifest, &dest.join("artifact"))?;
     // Reserve the transaction identity durably before the ledger or installer.
     // A stale endpoint-owned ready directory must never re-install a completed
@@ -1734,6 +1746,20 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn rolled_back_release_is_refused_under_a_fresh_nonce() {
+        let (root, config, mut journal) = fixture();
+        let request = request(&root, &config);
+        let ops = operations(&root, true);
+        accept_request_with(&config, &root, &request, &mut journal, &ops).unwrap_err();
+        let requeued = request.with_file_name("fedcba9876543210fedcba9876543210");
+        fs::rename(&request, &requeued).unwrap();
+        let error = accept_request_with(&config, &root, &requeued, &mut journal, &ops).unwrap_err();
+        assert!(error.contains("already rolled back"), "{error}");
+        assert_eq!(ops.installs.get(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn rolled_back_request_cannot_replay_after_supervisor_restart() {
         let (root, config, mut journal) = fixture();

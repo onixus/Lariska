@@ -137,6 +137,11 @@ async fn run_async(
         &labels,
     )
     .await?;
+    // An authenticated registration is the first server round trip; waiting for
+    // the first heartbeat tick could miss the health deadline on long intervals.
+    if let Err(error) = crate::update::ack_health(&config) {
+        tracing::warn!(%error, "could not acknowledge update health");
+    }
 
     tracing::info!(agent_id = %identity.agent_id, "Lariska Endpoint Agent started");
 

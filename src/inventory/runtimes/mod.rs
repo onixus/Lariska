@@ -40,6 +40,8 @@ pub(crate) fn child_dirs(
         match std::fs::metadata(&path) {
             Ok(metadata) if metadata.is_dir() => dirs.push(path),
             Ok(_) => {}
+            // A dangling symlink is not an unreadable directory.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => result.mark_failed("directory_unreadable"),
         }
     }
