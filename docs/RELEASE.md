@@ -46,14 +46,18 @@ Managed updates now require a signed native package manifest, a locally provisio
 
 The release workflow keeps GitHub releases draft and now waits for signed deb/RPM/MSI/pkg builds. Validate the native lifecycle workflow for the current commit before publishing a release. Self-signed native artifacts need explicitly provisioned local certificate trust/pins and are not notarized. Archive downloads remain useful for manual installation, but their checksum alone does not authorize remote native updates.
 
-The manual path remains supported, and is the one to use when the console is
-not involved — replace the binary and restart the service:
+Archive installations can be upgraded manually: verify the downloaded archive
+against its `.sha256`, extract it into a staging directory, replace the binary
+and restart the service. Native installations use signed native packages and
+the protected update/rollback procedure described above.
 
 ### Linux (systemd)
 
 ```bash
+mkdir -p lariska-update
+tar -xzf lariska-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz -C lariska-update
 systemctl stop lariska
-install -m 755 lariska-vX.Y.Z-x86_64-unknown-linux-gnu/lariska /usr/bin/lariska
+install -m 755 lariska-update/lariska /usr/bin/lariska
 systemctl start lariska
 ```
 
@@ -65,16 +69,21 @@ new version adds a setting you want to opt into.
 ### macOS (launchd)
 
 ```bash
+mkdir -p lariska-update
+tar -xzf lariska-vX.Y.Z-aarch64-apple-darwin.tar.gz -C lariska-update
 launchctl unload /Library/LaunchDaemons/com.shapoclyack.lariska.plist
-install -m 755 lariska-vX.Y.Z-*-apple-darwin/lariska /usr/local/bin/lariska
+install -m 755 lariska-update/lariska /usr/local/bin/lariska
 launchctl load /Library/LaunchDaemons/com.shapoclyack.lariska.plist
 ```
+
+For Intel macOS, use the `x86_64-apple-darwin` archive.
 
 ### Windows (Service)
 
 ```bat
+powershell -NoProfile -Command "Expand-Archive -LiteralPath 'lariska-vX.Y.Z-x86_64-pc-windows-msvc.zip' -DestinationPath 'lariska-update'"
 sc.exe stop Lariska
-copy /Y lariska-vX.Y.Z-x86_64-pc-windows-msvc\lariska.exe "C:\Program Files\Lariska\lariska.exe"
+copy /Y lariska-update\lariska.exe "C:\Program Files\Lariska\lariska.exe"
 sc.exe start Lariska
 ```
 
