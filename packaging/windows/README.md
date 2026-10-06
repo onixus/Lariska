@@ -4,13 +4,7 @@ Lariska registers as a native Windows Service via the `--winservice` entry
 point (`src/service.rs`, `windows_scm` module) — no third-party wrapper
 (NSSM, WinSW, etc.) is required.
 
-**Verification status:** unverified against a real Service Control Manager.
-The binary cross-compiles and links for `x86_64-pc-windows-gnu`, and clippy is
-clean for that target, but install/start/stop has not yet been observed on
-Windows hardware, and `install-lariska.cmd` has never been executed — there is
-no Windows host in the environment that wrote it, and `sc.exe`/`icacls` have no
-stand-in elsewhere. Treat everything in this file as a claim about code until
-it is observed on a real machine.
+Version 0.5.0 includes a signed MSI with an unprivileged LocalService endpoint and an independent SYSTEM recovery task. Use [Signed native updates](../../docs/SIGNED_UPDATES.md) for certificate trust, protected enrollment and rollback seeding. The native lifecycle workflow exercises real SCM install, update and failed-health rollback on Windows runners; confirm a successful run for the release commit. The batch installer below is the legacy archive path and does not provision the native watchdog.
 
 ## Expected layout
 

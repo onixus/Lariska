@@ -67,7 +67,7 @@ Do not delete identity as a routine troubleshooting step. Doing so creates a new
 
 ### Inventory cache
 
-`inventory-cache-v1/` is disposable optimization state. Deleting it while the service is stopped forces a cold collection on the next cycle. The agent also invalidates stale, corrupt, incompatible, or expired entries automatically.
+`inventory-cache-v2/` is disposable optimization state. Deleting it while the service is stopped forces a cold collection on the next cycle. The agent also invalidates stale, corrupt, incompatible, or expired entries automatically.
 
 ### Spool
 
@@ -129,22 +129,11 @@ Invalid settings are rejected atomically. The agent continues using the previous
 
 ## Update behavior
 
-The current self-update path:
+Install a native package, provision administrator-owned trust and seed the signed package matching the installed version before accepting managed updates. The unprivileged endpoint streams a bounded package and verifies its Ed25519 manifest; the independent privileged watchdog verifies again and installs through dpkg/RPM, Windows Installer or macOS Installer.
 
-- refuses a foreign target triple;
-- requires HTTPS unless the local insecure-update override is enabled;
-- verifies the published SHA-256;
-- stages a new executable and retains the previous one;
-- exits so the service supervisor can start the new build.
+A matching-version authenticated registration or heartbeat acknowledges health. Missing health restores the cached previous package, preserving identity and spool. Protected transaction history and the anti-rollback floor survive watchdog restart. Inspect the journal and service logs when an update is refused; server policy cannot override trust or authorize a downgrade.
 
-Current limits:
-
-- release artifacts/manifests are not yet cryptographically signed by an embedded trust key;
-- download is not yet the final streaming/declared-size design;
-- package-managed Linux installation may not permit the service account to replace `/usr/bin/lariska`;
-- automatic post-restart health rollback is not complete.
-
-For production fleets, prefer controlled native package deployment until the signed updater milestone is finished.
+See [Signed native updates](../docs/SIGNED_UPDATES.md) for paths, local policy, seed commands and emergency recovery. Archive installations must migrate to native packaging before enabling this update path.
 
 ## Backup and migration
 

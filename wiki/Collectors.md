@@ -8,7 +8,7 @@ Every collector returns:
 - bounded warnings;
 - a completeness flag.
 
-Entries from a failed collector may still be useful for local diagnostics, but the daemon publishes only when the combined result is complete. This conservative v1 rule prevents a missing source from being interpreted as software removal.
+Schema v2 reports completeness independently per source; Shapoclyack retains previous effective inventory for degraded sources while healthy sources advance. The v1 fallback publishes only when the combined result is complete, preventing a missing source from being interpreted as software removal. See [Inventory v2](../docs/INVENTORY_V2.md).
 
 ## Platform coverage
 
@@ -68,7 +68,7 @@ Runtime collectors run in a controlled blocking context and deliberately avoid r
 
 ## Persistent cache
 
-The cache lives under `state_dir/inventory-cache-v1/` and stores separate documents for:
+The cache lives under `state_dir/inventory-cache-v2/` and stores separate documents for:
 
 - platform inventory;
 - Python;
@@ -95,30 +95,22 @@ Lariska currently normalizes:
 - surrounding and repeated whitespace;
 - optional empty fields;
 - common architecture aliases such as `amd64`/`x64` → `x86_64` and `arm64` → `aarch64`;
-- source names into the schema-v1 source enum;
+- source names into the inventory source enum;
 - deterministic ordering;
 - duplicate identifiers and software comparison keys.
 
-When schema v1 encounters multiple versions with the same product comparison key, it retains the naturally newer version and emits a warning about the dropped version. This is safer than arbitrary lexical ordering but is not a substitute for installation identity.
+When schema v1 encounters multiple versions with the same product comparison key, it retains the naturally newer version and emits a warning about the dropped version. Negotiated schema v2 instead deduplicates by installation identity and preserves side-by-side installations.
 
 ## Completeness examples
 
-| Situation | Diagnostic output | Daemon submission |
+| Situation | Schema v1 | Negotiated schema v2 |
 | --- | --- | --- |
-| Homebrew is not installed | Other sources, no failure | Allowed |
-| `dpkg-query` times out | Partial entries plus warning | Blocked |
-| One Windows uninstall entry cannot be opened | Remaining entries plus warning | Blocked |
-| No user profiles are loaded on a Windows server | System entries plus coverage warning | Allowed |
-| Runtime metadata file exceeds its limit | File skipped | Depends on collector-level error policy; warnings remain bounded |
-| Cache document is corrupt | Cache ignored, fresh collection attempted | Allowed only if fresh result completes |
+| Homebrew is not installed | Other sources can publish | Source is `not_applicable` |
+| `dpkg-query` times out | Incomplete cycle blocked | Degraded source preserved on server |
+| Windows registry entry cannot be read or a profile hive is unloaded | Incomplete cycle blocked | Registry/MSI source degraded; CBS independent |
+| Runtime metadata is unreadable or oversized | Incomplete cycle blocked | Runtime source degraded |
+| Cache document is corrupt | Fresh collection attempted | Fresh collection attempted; status reported |
 
-## Planned v2 behavior
+## Schema v2 behavior
 
-Schema v2 will replace the all-or-nothing snapshot rule with per-source status:
-
-- `complete`;
-- `partial`;
-- `failed`;
-- `not_applicable`.
-
-Shapoclyack will then carry forward the last complete set for degraded sources while accepting healthy source updates. Removal events will be legal only for a source that completed authoritatively.
+Sources report `complete`, `partial`, `failed` or `not_applicable`, with bounded diagnostics and retained last-complete timestamps. Compatible Shapoclyack carries forward effective inventory for degraded sources while accepting healthy source updates. Only a complete source observation authorizes removals. See [Inventory v2](../docs/INVENTORY_V2.md).

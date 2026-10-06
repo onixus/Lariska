@@ -17,29 +17,15 @@ The executable milestone plan is maintained in [WORKPLAN_RU.md](../WORKPLAN_RU.m
 - locally validated managed intervals/log levels;
 - native service definitions and basic release artifacts.
 
-## P0: correctness and update trust
+## P0 completed in 0.5.0
 
-### Inventory schema v2
+- Negotiated inventory v2 with endpoint-scoped installation identities and mixed v1/v2 fleets.
+- Per-source completeness and retained last-complete timestamps; compatible Shapoclyack carries degraded sources forward and prevents false removals.
+- Bounded streaming, locally trusted signed manifests, anti-rollback and replay protection.
+- Independent native watchdog with authenticated health acknowledgement and automatic previous-package rollback.
+- Native install/update/failed-health recovery tests on seven platform/package combinations.
 
-- separate product identity from installation identity;
-- preserve side-by-side versions;
-- add package IDs, scope, and privacy-safe instance evidence;
-- support mixed v1/v2 fleets.
-
-### Per-source completeness
-
-- report `complete`, `partial`, `failed`, and `not_applicable` per source;
-- carry forward the last complete set for degraded sources;
-- allow healthy sources to advance independently;
-- suppress removal events unless the source completed.
-
-### Signed recoverable updater
-
-- stream to disk under declared and hard size limits;
-- verify signed release manifests with embedded trust;
-- add anti-rollback rules;
-- install through platform-native mechanisms;
-- require post-restart health and roll back automatically.
+See [Inventory v2](../docs/INVENTORY_V2.md) and [Signed native updates](../docs/SIGNED_UPDATES.md). Deploy the compatible server before enabling v2 in the fleet.
 
 ## P1: measurable endpoint impact
 
@@ -58,14 +44,11 @@ The executable milestone plan is maintained in [WORKPLAN_RU.md](../WORKPLAN_RU.m
 - additional opt-in runtime ecosystems;
 - coordinated Shapoclyack advisory/matching support.
 
-## P1: production packaging
+## P1: remaining production packaging
 
-- verified deb/RPM build and install tests;
-- signed MSI;
-- signed/notarized macOS package;
-- package-owned update path;
-- install/upgrade/rollback/uninstall matrix;
-- provenance/attestation in release workflow.
+- Public-CA signing and macOS notarization; current MSI/PKG use explicitly trusted self-signed certificates.
+- Release provenance/attestation and reproducibility.
+- Extended uninstall and long-duration soak evidence beyond the native lifecycle checks.
 
 ## P2: transport efficiency
 
@@ -82,13 +65,9 @@ The executable milestone plan is maintained in [WORKPLAN_RU.md](../WORKPLAN_RU.m
 
 ## Release direction
 
-### 0.4.x
+### 0.5.0
 
-Target: schema-v2 groundwork, source completeness contract, and collection budgets/telemetry.
-
-### 0.5.x
-
-Target: signed streaming updater, native package ownership, and health rollback.
+Delivered: inventory v2, per-source completeness, signed native packages and independent health rollback. Collection budgets, telemetry and published performance baselines remain planned.
 
 ### 0.6.x
 
