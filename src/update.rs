@@ -8,6 +8,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+mod windows;
+
 pub const HARD_MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
 const MAX_LEDGER_BYTES: u64 = 256 * 1024;
@@ -629,7 +632,8 @@ struct HealthAck {
     version: String,
     at: u64,
 }
-/// Called only after a successful heartbeat. Startup alone is not health.
+/// Called after authenticated registration or a successful heartbeat.
+/// Starting the process alone does not establish health.
 pub fn ack_health(config: &Config) -> Result<(), String> {
     let shared = match SharedUpdateDir::open(config, false) {
         Ok(dir) => dir,
@@ -871,13 +875,12 @@ struct SharedUpdateDir {
 impl SharedUpdateDir {
     fn open(config: &Config, create: bool) -> Result<Self, String> {
         let path = config.state_dir.join("update");
+        let mut pins = Vec::new();
+        pin_shared_directory(&config.state_dir, &mut pins)?;
         if create {
             fs::create_dir_all(&path).map_err(|e| e.to_string())?;
         }
-        let mut pins = Vec::new();
-        for directory in [config.state_dir.as_path(), path.as_path()] {
-            pins.extend(pin_directory(directory)?);
-        }
+        pin_shared_directory(&path, &mut pins)?;
         Ok(Self { path, _pins: pins })
     }
     fn remove(&self, name: &str) -> Result<(), String> {
@@ -894,22 +897,45 @@ impl SharedUpdateDir {
         atomic_json(&self.path.join(name), value)
     }
 }
+#[cfg(not(unix))]
+fn pin_shared_directory(path: &Path, pins: &mut Vec<File>) -> Result<(), String> {
+    if let Some(directory) = pin_directory(path)? {
+        #[cfg(windows)]
+        {
+            // Attribute-only handles can set a reparse point despite sharing
+            // restrictions. A held, undeletable child keeps the directory
+            // nonempty. Create it relative to the held directory, then recheck
+            // that directory before any mailbox names are resolved by path.
+            let guard = windows::pin_directory_guard(&directory)?;
+            validate_pinned_directory(&directory)?;
+            pins.push(guard);
+        }
+        pins.push(directory);
+    }
+    Ok(())
+}
 #[cfg(windows)]
 fn pin_directory(path: &Path) -> Result<Option<File>, String> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::fs::OpenOptionsExt;
     const FILE_LIST_DIRECTORY: u32 = 0x1;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_SHARE_READ: u32 = 0x1;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     let file = OpenOptions::new()
         .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .map_err(|e| format!("cannot pin {}: {e}", path.display()))?;
+    validate_pinned_directory(&file)?;
+    Ok(Some(file))
+}
+#[cfg(windows)]
+fn validate_pinned_directory(file: &File) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     let attributes = file
         .metadata()
         .map_err(|e| e.to_string())?
@@ -918,7 +944,7 @@ fn pin_directory(path: &Path) -> Result<Option<File>, String> {
     {
         return Err("shared update directories must not be reparse points".into());
     }
-    Ok(Some(file))
+    Ok(())
 }
 #[cfg(not(any(unix, windows)))]
 fn pin_directory(path: &Path) -> Result<Option<File>, String> {
@@ -1007,8 +1033,21 @@ pub fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         let mut file = create_private_file(&temp)?;
         file.write_all(&bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
-        drop(file);
-        replace_file(&temp, path)?;
+        #[cfg(windows)]
+        {
+            // An absolute rename reopens the parent for FILE_ADD_FILE and
+            // conflicts with its write-denying pin. A native basename rename
+            // updates the held file in its existing parent without reopening
+            // that directory or resolving a mutable temporary name.
+            let name = path.file_name().ok_or("file has no name")?;
+            rename_windows_file(&file, name)?;
+            file.sync_all().map_err(|e| e.to_string())?;
+        }
+        #[cfg(not(windows))]
+        {
+            drop(file);
+            replace_file(&temp, path)?;
+        }
         sync_dir(parent)
     })();
     if result.is_err() {
@@ -1016,25 +1055,86 @@ pub fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     }
     result
 }
+#[cfg(windows)]
+fn rename_windows_file(file: &File, name: &std::ffi::OsStr) -> Result<(), String> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct RenameInfo {
+        replace_if_exists: u32,
+        root_directory: *mut c_void,
+        file_name_length: u32,
+        file_name: [u16; 1],
+    }
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: usize,
+        information: usize,
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSetInformationFile(
+            file: *mut c_void,
+            status: *mut IoStatusBlock,
+            info: *const c_void,
+            length: u32,
+            class: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+    let name: Vec<u16> = name.encode_wide().collect();
+    if name.is_empty() || name.iter().any(|&c| matches!(c, 0 | 0x2f | 0x5c | 0x3a)) {
+        return Err("atomic publication requires a simple file name".into());
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(2)
+        .ok_or("file name length overflow")?;
+    let length = std::mem::size_of::<RenameInfo>()
+        .checked_add(name_bytes)
+        .ok_or("rename buffer length overflow")?;
+    let mut buffer = vec![0usize; length.div_ceil(std::mem::size_of::<usize>())];
+    // usize storage supplies the native pointer alignment required by this
+    // variable-length structure. The zeroed tail includes a NUL terminator.
+    let info = buffer.as_mut_ptr().cast::<RenameInfo>();
+    unsafe {
+        (*info).replace_if_exists = 1;
+        (*info).root_directory = std::ptr::null_mut();
+        (*info).file_name_length =
+            u32::try_from(name_bytes).map_err(|_| "file name is too long")?;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).file_name).cast::<u16>(),
+            name.len(),
+        );
+    }
+    let mut io_status = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    // Unlike SetFileInformationByHandle, NtSetInformationFile leaves a simple
+    // basename relative to the source's parent rather than the process cwd.
+    let status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut io_status,
+            info.cast::<c_void>(),
+            u32::try_from(length).map_err(|_| "rename buffer is too large")?,
+            10, // FileRenameInformation
+        )
+    };
+    if status < 0 {
+        return Err(std::io::Error::from_raw_os_error(unsafe {
+            RtlNtStatusToDosError(status) as i32
+        })
+        .to_string());
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
 fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
-        }
-        let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-        let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 1 | 8) } == 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(from, to).map_err(|e| e.to_string())
-    }
+    fs::rename(from, to).map_err(|e| e.to_string())
 }
 pub fn sync_dir(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
@@ -1046,8 +1146,8 @@ pub fn sync_dir(path: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
         // Win32 does not support FlushFileBuffers on directory handles.
-        // Every durable publication uses MoveFileExW(MOVEFILE_WRITE_THROUGH)
-        // after FlushFileBuffers on the complete file. This check makes the
+        // Every durable publication uses a FILE_FLAG_WRITE_THROUGH file and
+        // FlushFileBuffers before and after its native rename. This check makes the
         // platform distinction explicit without issuing an invalid flush.
         let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         if !metadata.is_dir() {
@@ -1067,7 +1167,10 @@ fn create_private_file(path: &Path) -> Result<File, String> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x80000000);
+        options
+            .access_mode(0x4000_0000 | 0x0001_0000) // GENERIC_WRITE | DELETE
+            .share_mode(0x1) // Retain the exact temporary directory entry.
+            .custom_flags(0x8000_0000); // FILE_FLAG_WRITE_THROUGH
     }
     #[cfg(unix)]
     {
@@ -1404,6 +1507,94 @@ mod tests {
         let manifest = signed(&config, b"package").manifest;
         assert!(commit_pending(&config, &manifest, &random_nonce(), &dir).is_err());
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_shared_mailbox_publishes_under_nested_pins_and_blocks_directory_swaps() {
+        let dir = dir();
+        let config = fixture_config(&dir);
+        let shared = SharedUpdateDir::open(&config, true).unwrap();
+        let nested = SharedUpdateDir::open(&config, false).unwrap();
+        shared.write("health.json", &"first", false).unwrap();
+        assert_eq!(nested.read::<String>("health.json").unwrap(), "first");
+        nested.write("health.json", &"replacement", false).unwrap();
+        assert_eq!(shared.read::<String>("health.json").unwrap(), "replacement");
+        shared.remove("health.json").unwrap();
+        assert!(!dir.join("update/health.json").exists());
+
+        let mailbox = dir.join("update");
+        let moved_mailbox = dir.join("swapped-update");
+        let moved_state = dir.with_extension("swapped-state");
+        assert_eq!(
+            fs::rename(&mailbox, &moved_mailbox)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32)
+        );
+        assert_eq!(
+            fs::rename(&dir, &moved_state).unwrap_err().raw_os_error(),
+            Some(32)
+        );
+        drop(nested);
+        assert_eq!(
+            fs::rename(&mailbox, &moved_mailbox)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32)
+        );
+        drop(shared);
+        fs::rename(&mailbox, &moved_mailbox).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_publication_uses_source_parent_and_cleans_failed_replacements() {
+        let dir = dir();
+        let target_name = format!("lariska-publication-{}.json", random_nonce());
+        let target = dir.join(&target_name);
+        let pin = pin_directory(&dir).unwrap().unwrap();
+        atomic_json(&target, &"first").unwrap();
+        atomic_json(&target, &"second").unwrap();
+        assert_eq!(
+            read_json::<String>(&target, MAX_MANIFEST_BYTES).unwrap(),
+            "second"
+        );
+        assert!(!std::env::current_dir().unwrap().join(target_name).exists());
+
+        let blocked = dir.join("blocked.json");
+        fs::create_dir(&blocked).unwrap();
+        assert!(atomic_json(&blocked, &"must not replace a directory").is_err());
+        assert!(blocked.is_dir());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        drop(pin);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_temporary_entry_cannot_be_replaced_before_publication() {
+        let dir = dir();
+        let temporary = dir.join("temporary");
+        let mut file = create_private_file(&temporary).unwrap();
+        file.write_all(b"verified content").unwrap();
+        assert_eq!(
+            fs::rename(&temporary, dir.join("attacker-copy"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32)
+        );
+        assert_eq!(
+            fs::remove_file(&temporary).unwrap_err().raw_os_error(),
+            Some(32)
+        );
+        rename_windows_file(&file, std::ffi::OsStr::new("published")).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert!(!temporary.exists());
+        assert_eq!(
+            fs::read(dir.join("published")).unwrap(),
+            b"verified content"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

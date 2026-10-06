@@ -72,7 +72,7 @@ def install(artifact):
     else:
         run('/usr/bin/rpm', '-U', '--replacepkgs', artifact)
 
-observed = {'agent_ids': set(), 'registered_versions': [], 'inventories': 0, 'heartbeats': 0}
+observed = {'agent_ids': set(), 'registered_versions': [], 'inventories': 0, 'heartbeats': 0, 'failed_health_responses': {'register': 0, 'heartbeat': 0}}
 desired = {'version': None, 'fail_health': False}
 registered = {}
 class Handler(BaseHTTPRequestHandler):
@@ -108,10 +108,17 @@ class Handler(BaseHTTPRequestHandler):
             registered[agent_id] = request['version']
             observed['agent_ids'].add(agent_id)
             observed['registered_versions'].append(request['version'])
+            # Registration and heartbeat both acknowledge health. Record the
+            # installed version before rejecting it so supervisor recovery is
+            # tested without allowing registration to mark the bad release healthy.
+            if desired['fail_health'] and request['version'] == '0.4.2':
+                observed['failed_health_responses']['register'] += 1
+                return self.reply(503, {'detail': 'Deliberate native health failure'})
             return self.reply(200, info)
         if self.path == '/api/v1/agent/heartbeat':
             observed['heartbeats'] += 1
             if desired['fail_health'] and registered.get(agent_id) == '0.4.2':
+                observed['failed_health_responses']['heartbeat'] += 1
                 return self.reply(503, {'detail': 'Deliberate native health failure'})
             version = desired['version']
             if version and registered.get(agent_id) != version:
@@ -209,6 +216,10 @@ native_state_dir = {quote(private)}
     wait_for('automatic native rollback', lambda: any(item['version'] == '0.4.2' and item['outcome'] == 'rolled_back' for item in ledger().get('history', [])))
     assert run(executable, '--version').stdout.strip() == '0.4.1'
     wait_for('recovered agent registration', lambda: observed['registered_versions'][-1] == '0.4.1')
+    assert observed['failed_health_responses']['register'] > 0, observed
+    rollback = next(item for item in ledger()['history'] if item['version'] == '0.4.2' and item['outcome'] == 'rolled_back')
+    assert rollback['reason'] == 'healthy_heartbeat_timeout', rollback
+    assert not any(item['version'] == '0.4.2' and item['outcome'] == 'healthy' for item in ledger().get('history', [])), ledger()
     assert len(observed['agent_ids']) == 1, observed
     assert hashlib.sha256(stable.read_bytes()).hexdigest() == stable_hash
     assert ledger().get('pending') is None

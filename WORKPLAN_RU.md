@@ -110,7 +110,7 @@ Lariska должна быть production-ready endpoint-агентом Shapoclya
 - Windows использовать signed MSI/service updater;
 - macOS использовать signed package; по выбору владельца текущий P0 использует самоподписанный installer-сертификат и явное локальное доверие, без Apple notarization;
 - после restart требовать health acknowledgement;
-- автоматически восстанавливать previous build при отсутствии healthy heartbeat;
+- автоматически восстанавливать previous build при отсутствии успешной authenticated registration или heartbeat;
 - сохранять bounded update history и причину rollback.
 
 Критерии приёмки:
