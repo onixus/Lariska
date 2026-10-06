@@ -138,11 +138,28 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Flatten artifacts
+      - name: Assemble release assets
+        shell: python
         run: |
-          mkdir -p release
-          find artifacts -type f -exec cp {} release/ \;
-          ls -la release
+          from pathlib import Path
+          import shutil
+
+          destination = Path("release")
+          destination.mkdir()
+          suffixes = (".tar.gz", ".zip", ".deb", ".rpm", ".msi", ".pkg", ".sha256", ".manifest.json")
+          for artifact in Path("artifacts").rglob("*"):
+              if not artifact.is_file():
+                  continue
+              if artifact.name != "lariska.cdx.json" and not artifact.name.endswith(suffixes):
+                  continue
+              target = destination / artifact.name
+              if target.exists():
+                  raise SystemExit(f"Duplicate release asset: {artifact.name}")
+              shutil.copyfile(artifact, target)
+          assets = list(destination.iterdir())
+          if len(assets) != 32:
+              raise SystemExit(f"Expected 32 release assets, found {len(assets)}")
+          print("Assembled 32 release assets; CI logs and WiX debug symbols excluded")
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
