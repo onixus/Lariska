@@ -95,7 +95,7 @@ log_level = "info"
 ## Текущие ограничения
 
 - [Schema v2](docs/INVENTORY_V2.md) сохраняет отдельные installation instances и полноту по источникам. Требуется развёртывание совместимого Shapoclyack; старый сервер обслуживается через v1.
-- Shapoclyack хранит один пакет на version/target triple для managed updates: для каждой Linux-архитектуры требуется выбрать DEB либо RPM. См. [ограничения native updates](docs/SIGNED_UPDATES.md).
+- Миграция Shapoclyack 0081 хранит варианты DEB/RPM раздельно. Для выбора Linux-пакета серверу нужна однозначная принятая инвентаризация пакетной базы; см. [условия native updates](docs/SIGNED_UPDATES.md).
 - По HTTP отправляется полный JSON snapshot. Локальный spool сжат zstd, но wire compression и delta submission пока не включены.
 - Windows user-scope collector видит только загруженные пользовательские hives. Агент намеренно не монтирует профили вышедших из системы пользователей.
 - Пока не поддержаны Snap, Flatpak, macOS package receipts, MSIX/AppX и ряд runtime-экосистем.

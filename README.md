@@ -97,7 +97,7 @@ For systemd, launchd, Windows SCM installation, file locations, and verification
 These are current engineering boundaries, not marketing punctuation marks:
 
 - [Inventory v2](docs/INVENTORY_V2.md) preserves installation instances and per-source completeness. A companion Shapoclyack deployment is required; older servers use v1.
-- Managed delivery currently stores one package per version/target triple in Shapoclyack; choose DEB or RPM per Linux target. See [native update limits](docs/SIGNED_UPDATES.md).
+- Shapoclyack migration 0081 stores DEB/RPM variants separately. Linux update selection requires unambiguous accepted package inventory; see [native update prerequisites](docs/SIGNED_UPDATES.md).
 - HTTP inventory transport sends full JSON snapshots. Local spool data is zstd-compressed, but wire compression and delta submission are not yet enabled.
 - Windows per-user inventory covers loaded user hives. Lariska deliberately does not mount every signed-out user profile.
 - Snap, Flatpak, macOS package receipts, MSIX/AppX, and several language ecosystems are not collected yet.
