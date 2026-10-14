@@ -133,3 +133,20 @@ cargo build --release
 GitHub Actions validates formatting, strict Clippy, tests on Linux, Windows, and macOS, dependency and license policy, secret scanning, the APEX Architecture Contract, and the shared Shapoclyack inventory fixture. A declarative [Jenkinsfile](Jenkinsfile) is included for local CI deployments.
 
 Changes that alter the inventory contract must update both repositories' fixture and document backward compatibility. The machine at the other end deserves slightly more consideration than “the JSON compiled.”
+
+### Agent client certificates
+
+HTTPS deployments automatically enroll a client certificate before registration
+using `POST /api/v1/agent/certificate` with `agent_kind=endpoint`. A deployment
+without an issuer responds 404 and continues token-only operation. Deploy a
+certificate-capable build everywhere before setting Shapoclyack mTLS to `required`.
+
+The key is generated locally. Key, certificate and renewal deadline live in one
+atomically replaced `client-identity.json` file in `state_dir`; Unix permissions
+are 0600 and Windows inherits the administrator-managed state-directory ACL.
+Renewal presents the existing valid certificate. Every request checks actual X.509
+validity and never presents an expired certificate. Enrollment failures back off
+for five minutes. A certificate refusal (`missing`, `expired`, `revoked`) triggers
+one enrollment retry; locked enrollment requires an operator to reset it. TLS CA
+trust still comes from `tls_ca_file` or system roots, never from the enrollment
+response. Protect the state directory and its backups as private-key material.

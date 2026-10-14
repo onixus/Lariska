@@ -334,7 +334,14 @@ impl HeartbeatClient {
                 return None;
             }
         };
-        match crate::managed::apply_update(update, config, &token, self.api.http()).await {
+        let http = match self.api.http().await {
+            Ok(http) => http,
+            Err(error) => {
+                tracing::warn!(%error, "cannot load client certificate");
+                return None;
+            }
+        };
+        match crate::managed::apply_update(update, config, &token, &http).await {
             crate::managed::UpdateOutcome::Queued { version } => {
                 tracing::info!(%version, "signed update queued for the native package supervisor");
                 None

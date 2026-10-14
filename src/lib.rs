@@ -14,3 +14,5 @@ pub mod qos;
 pub mod service;
 pub mod telemetry;
 pub mod update;
+
+pub mod mtls;
