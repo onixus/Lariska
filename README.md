@@ -146,7 +146,12 @@ atomically replaced `client-identity.json` file in `state_dir`; Unix permissions
 are 0600 and Windows inherits the administrator-managed state-directory ACL.
 Renewal presents the existing valid certificate. Every request checks actual X.509
 validity and never presents an expired certificate. Enrollment failures back off
-for five minutes. A certificate refusal (`missing`, `expired`, `revoked`) triggers
+for five minutes; renewal failures continue using a still-valid current identity.
+An absent or expired identity blocks protected requests while enrollment retries.
+Before issuance, the pending key and CSR are synced privately in
+`client-enrollment.json`. After a lost response or restart, the same CSR retrieves
+its already issued public certificate via `/api/v1/agent/certificate/recover`;
+this route does not issue a new key or bypass revocation locks. A certificate refusal (`missing`, `expired`, `revoked`) triggers
 one enrollment retry; locked enrollment requires an operator to reset it. TLS CA
 trust still comes from `tls_ca_file` or system roots, never from the enrollment
 response. Protect the state directory and its backups as private-key material.

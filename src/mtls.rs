@@ -11,11 +11,21 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 struct Bundle {
     key: String,
     certificate: String,
+    #[serde(default)]
+    ca_certificate: String,
     renew_after: String,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Pending {
+    key: String,
+    csr: String,
+    server_url: String,
 }
 #[derive(Deserialize)]
 struct Issued {
     certificate: String,
+    #[serde(default)]
+    ca_certificate: String,
     renew_after: String,
 }
 
@@ -23,6 +33,7 @@ pub struct State {
     bundle: Option<Bundle>,
     unavailable: bool,
     retry_at: i64,
+    pending: Option<Pending>,
 }
 impl State {
     pub fn load(config: &Config) -> Result<Self, ApiError> {
@@ -35,7 +46,20 @@ impl State {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(fatal(e)),
         };
+        let pending = match fs::read(config.state_dir.join("client-enrollment.json")) {
+            Ok(bytes) => {
+                let pending: Pending = serde_json::from_slice(&bytes).map_err(fatal)?;
+                if pending.server_url != config.server_url {
+                    return Err(fatal("pending enrollment belongs to a different server"));
+                }
+                KeyPair::from_pem(&pending.key).map_err(fatal)?;
+                Some(pending)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(fatal(e)),
+        };
         Ok(Self {
+            pending,
             bundle,
             unavailable: false,
             retry_at: 0,
@@ -61,38 +85,80 @@ impl State {
         if !due {
             return self.client(config);
         }
+        let usable = self
+            .bundle
+            .as_ref()
+            .is_some_and(|b| valid_now(b).unwrap_or(false));
         if now < self.retry_at {
+            if usable {
+                return self.client(config);
+            }
             return Err(ApiError::Transient(
                 "certificate enrollment is backing off".into(),
             ));
         }
         self.retry_at = now + 300;
-        let key = KeyPair::generate().map_err(fatal)?;
-        let csr = CertificateParams::new(Vec::<String>::new())
-            .map_err(fatal)?
-            .serialize_request(&key)
-            .map_err(fatal)?
-            .pem()
-            .map_err(fatal)?;
-        let response = self
-            .client(config)?
-            .post(format!(
-                "{}/api/v1/agent/certificate",
-                config.server_url.trim_end_matches('/')
-            ))
-            .bearer_auth(token)
-            .json(&serde_json::json!({"csr": csr, "agent_kind": "endpoint"}))
-            .send()
-            .await
-            .map_err(|error| crate::api::classify_transport_error(&error))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND && self.bundle.is_none() {
-            self.unavailable = true;
-            return self.client(config);
+        match self.enroll(config, token).await {
+            Ok(client) => Ok(client),
+            Err(ApiError::Auth) => {
+                self.retry_at = 0;
+                Err(ApiError::Auth)
+            }
+            Err(error) if usable => {
+                tracing::warn!(%error, "certificate renewal deferred; current identity remains valid");
+                self.client(config)
+            }
+            Err(error) => Err(error),
         }
-        let issued: Issued = crate::api::classify_response(response).await?;
+    }
+    async fn enroll(&mut self, config: &Config, token: &str) -> Result<Client, ApiError> {
+        let was_pending = self.pending.is_some();
+        let pending = if let Some(pending) = &self.pending {
+            pending.clone()
+        } else {
+            let key = KeyPair::generate().map_err(fatal)?;
+            let csr = CertificateParams::new(Vec::<String>::new())
+                .map_err(fatal)?
+                .serialize_request(&key)
+                .map_err(fatal)?
+                .pem()
+                .map_err(fatal)?;
+            let pending = Pending {
+                key: key.serialize_pem(),
+                csr,
+                server_url: config.server_url.clone(),
+            };
+            // Sync the private key before issuance can become durable at the API.
+            persist_named(&config.state_dir, "client-enrollment.json", &pending)?;
+            self.pending = Some(pending.clone());
+            pending
+        };
+        let mut issued = None;
+        if was_pending {
+            let response = self
+                .request_certificate(config, token, "certificate/recover", &pending.csr)
+                .await?;
+            if response.status() != reqwest::StatusCode::NOT_FOUND {
+                issued = Some(crate::api::classify_response::<Issued>(response).await?);
+            }
+        }
+        let issued = match issued {
+            Some(issued) => issued,
+            None => {
+                let response = self
+                    .request_certificate(config, token, "certificate", &pending.csr)
+                    .await?;
+                if response.status() == reqwest::StatusCode::NOT_FOUND && self.bundle.is_none() {
+                    self.unavailable = true;
+                    return self.client(config);
+                }
+                crate::api::classify_response::<Issued>(response).await?
+            }
+        };
         let bundle = Bundle {
-            key: key.serialize_pem(),
+            key: pending.key,
             certificate: issued.certificate,
+            ca_certificate: issued.ca_certificate,
             renew_after: issued.renew_after,
         };
         validate(&bundle)?;
@@ -103,9 +169,35 @@ impl State {
         }
         let client = build(config, Some(&bundle))?;
         persist(&config.state_dir, &bundle)?;
+        // Publishing succeeded. If removing pending fails, a restart safely
+        // retrieves this same issued public certificate rather than rotating.
+        fs::remove_file(config.state_dir.join("client-enrollment.json")).map_err(fatal)?;
+        #[cfg(unix)]
+        fs::File::open(&config.state_dir)
+            .and_then(|f| f.sync_all())
+            .map_err(fatal)?;
+        self.pending = None;
         self.bundle = Some(bundle);
         self.retry_at = 0;
         Ok(client)
+    }
+    async fn request_certificate(
+        &self,
+        config: &Config,
+        token: &str,
+        path: &str,
+        csr: &str,
+    ) -> Result<reqwest::Response, ApiError> {
+        self.client(config)?
+            .post(format!(
+                "{}/api/v1/agent/{path}",
+                config.server_url.trim_end_matches('/')
+            ))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"csr": csr, "agent_kind": "endpoint"}))
+            .send()
+            .await
+            .map_err(|error| crate::api::classify_transport_error(&error))
     }
     pub fn recover(&mut self) {
         self.bundle = None;
@@ -154,15 +246,20 @@ fn build(config: &Config, bundle: Option<&Bundle>) -> Result<Client, ApiError> {
     }
     if let Some(b) = bundle {
         builder = builder.identity(
-            reqwest::Identity::from_pem(format!("{}\n{}", b.key, b.certificate).as_bytes())
-                .map_err(fatal)?,
+            reqwest::Identity::from_pem(
+                format!("{}\n{}\n{}", b.key, b.certificate, b.ca_certificate).as_bytes(),
+            )
+            .map_err(fatal)?,
         );
     }
     builder.build().map_err(fatal)
 }
 fn persist(dir: &Path, bundle: &Bundle) -> Result<(), ApiError> {
+    persist_named(dir, "client-identity.json", bundle)
+}
+fn persist_named(dir: &Path, name: &str, value: &impl Serialize) -> Result<(), ApiError> {
     fs::create_dir_all(dir).map_err(fatal)?;
-    let path = dir.join("client-identity.json");
+    let path = dir.join(name);
     let temp = dir.join(format!(".client-identity-{}.tmp", rand::random::<u64>()));
     let result = (|| {
         let mut options = fs::OpenOptions::new();
@@ -173,7 +270,7 @@ fn persist(dir: &Path, bundle: &Bundle) -> Result<(), ApiError> {
             options.mode(0o600);
         }
         let mut file = options.open(&temp).map_err(fatal)?;
-        file.write_all(&serde_json::to_vec(bundle).map_err(fatal)?)
+        file.write_all(&serde_json::to_vec(value).map_err(fatal)?)
             .map_err(fatal)?;
         file.sync_all().map_err(fatal)?;
         replace(&temp, &path).map_err(fatal)?;
@@ -221,6 +318,7 @@ mod tests {
         Bundle {
             key: key.serialize_pem(),
             certificate: cert.pem(),
+            ca_certificate: String::new(),
             renew_after: (params.not_before + time::Duration::hours(1))
                 .format(&Rfc3339)
                 .unwrap(),
