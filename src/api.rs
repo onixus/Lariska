@@ -40,6 +40,8 @@ pub enum ApiError {
 pub struct ApiClient {
     http: Client,
     base_url: String,
+    mtls: Option<std::sync::Arc<tokio::sync::Mutex<crate::mtls::State>>>,
+    config: Option<Config>,
 }
 
 impl fmt::Debug for ApiClient {
@@ -72,6 +74,10 @@ impl ApiClient {
             .map_err(|error| ApiError::Fatal(format!("failed to build http client: {error}")))?;
 
         Ok(Self {
+            mtls: Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::mtls::State::load(config)?,
+            ))),
+            config: Some(config.clone()),
             http,
             base_url: config.server_url.trim_end_matches('/').to_string(),
         })
@@ -81,8 +87,37 @@ impl ApiClient {
     /// fetching an offered build (#358). Shared rather than a second client so
     /// the download inherits the same TLS trust -- including the internal CA in
     /// `tls_ca_file` -- as every other call the agent makes.
-    pub fn http(&self) -> &Client {
-        &self.http
+    pub async fn http(&self) -> Result<Client, ApiError> {
+        if let (Some(state), Some(config)) = (&self.mtls, &self.config) {
+            state.lock().await.client(config)
+        } else {
+            Ok(self.http.clone())
+        }
+    }
+
+    async fn authenticated_http(&self, token: Option<&str>) -> Result<Client, ApiError> {
+        if let (Some(state), Some(config), Some(token)) = (&self.mtls, &self.config, token) {
+            state.lock().await.ensure(config, token).await
+        } else {
+            self.http().await
+        }
+    }
+
+    async fn recover_certificate(&self, response: &reqwest::Response, token: Option<&str>) -> bool {
+        let reason = response
+            .headers()
+            .get("X-Client-Cert-Error")
+            .and_then(|v| v.to_str().ok());
+        if response.status() == StatusCode::FORBIDDEN
+            && token.is_some()
+            && matches!(reason, Some("missing" | "revoked" | "expired"))
+        {
+            if let Some(state) = &self.mtls {
+                state.lock().await.recover();
+                return true;
+            }
+        }
+        false
     }
 
     /// POSTs a JSON body and classifies the response. `idempotency_key`, when
@@ -101,21 +136,29 @@ impl ApiClient {
         B: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        let url = format!("{}{path}", self.base_url);
-        let mut request = self.http.post(&url).json(body);
-        if let Some(token) = bearer_token {
-            request = request.bearer_auth(token);
+        for attempt in 0..2 {
+            let url = format!("{}{path}", self.base_url);
+            let mut request = self
+                .authenticated_http(bearer_token)
+                .await?
+                .post(&url)
+                .json(body);
+            if let Some(token) = bearer_token {
+                request = request.bearer_auth(token);
+            }
+            if let Some(key) = idempotency_key {
+                request = request.header("Idempotency-Key", key);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|error| classify_transport_error(&error))?;
+            if attempt == 0 && self.recover_certificate(&response, bearer_token).await {
+                continue;
+            }
+            return classify_response(response).await;
         }
-        if let Some(key) = idempotency_key {
-            request = request.header("Idempotency-Key", key);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|error| classify_transport_error(&error))?;
-
-        classify_response(response).await
+        unreachable!()
     }
 
     /// POSTs a zstd-compressed JSON body with `Content-Encoding: zstd`.
@@ -130,36 +173,39 @@ impl ApiClient {
         B: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        let url = format!("{}{path}", self.base_url);
         let raw_json = serde_json::to_vec(body)
             .map_err(|error| ApiError::Fatal(format!("failed to serialize request: {error}")))?;
         let compressed = zstd::encode_all(&raw_json[..], 3)
             .map_err(|error| ApiError::Fatal(format!("failed to compress request: {error}")))?;
-
-        let mut request = self
-            .http
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Content-Encoding", "zstd")
-            .body(compressed);
-
-        if let Some(token) = bearer_token {
-            request = request.bearer_auth(token);
+        for attempt in 0..2 {
+            let url = format!("{}{path}", self.base_url);
+            let mut request = self
+                .authenticated_http(bearer_token)
+                .await?
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Content-Encoding", "zstd")
+                .body(compressed.clone());
+            if let Some(token) = bearer_token {
+                request = request.bearer_auth(token);
+            }
+            if let Some(key) = idempotency_key {
+                request = request.header("Idempotency-Key", key);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|error| classify_transport_error(&error))?;
+            if attempt == 0 && self.recover_certificate(&response, bearer_token).await {
+                continue;
+            }
+            return classify_response(response).await;
         }
-        if let Some(key) = idempotency_key {
-            request = request.header("Idempotency-Key", key);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|error| classify_transport_error(&error))?;
-
-        classify_response(response).await
+        unreachable!()
     }
 }
 
-fn classify_transport_error(error: &reqwest::Error) -> ApiError {
+pub(crate) fn classify_transport_error(error: &reqwest::Error) -> ApiError {
     let described = describe_transport_error(error);
     if error.is_timeout() || error.is_connect() || error.is_request() {
         ApiError::Transient(described)
@@ -312,7 +358,7 @@ async fn read_response_body_limited(
     Ok(body)
 }
 
-async fn classify_response<R: DeserializeOwned>(
+pub(crate) async fn classify_response<R: DeserializeOwned>(
     mut response: reqwest::Response,
 ) -> Result<R, ApiError> {
     let status = response.status();
@@ -391,6 +437,8 @@ mod tests {
 
         let client = ApiClient {
             http: Client::new(),
+            mtls: None,
+            config: None,
             base_url: server.uri(),
         };
         let result: Result<serde_json::Value, ApiError> =
@@ -415,6 +463,8 @@ mod tests {
 
         let client = ApiClient {
             http: Client::new(),
+            mtls: None,
+            config: None,
             base_url: server.uri(),
         };
         let result: Result<serde_json::Value, ApiError> =
